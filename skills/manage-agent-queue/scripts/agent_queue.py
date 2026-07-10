@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Manage a shared local queue for cooperating agents."""
 
+import copy
 import json
 import os
 import re
@@ -10,6 +11,8 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = 1
+MAX_ID_SEQUENCE = 999_999
+MAX_JSON_METADATA_DEPTH = 64
 STORED_STATUSES = {
     "pending",
     "leased",
@@ -17,6 +20,40 @@ STORED_STATUSES = {
     "failed",
     "blocked",
     "cancelled",
+}
+TASK_ID_PATTERN = re.compile(r"T-(\d{6})", flags=re.ASCII)
+WORKFLOW_ID_PATTERN = re.compile(r"W-(\d{6})", flags=re.ASCII)
+TASK_FIELDS = {
+    "id",
+    "workflow_id",
+    "role",
+    "title",
+    "description",
+    "status",
+    "priority",
+    "depends_on",
+    "resources",
+    "labels",
+    "attempts",
+    "max_attempts",
+    "available_at",
+    "claim",
+    "result",
+    "last_error",
+    "created_at",
+    "updated_at",
+}
+TASK_CREATION_FIELDS = {
+    "id",
+    "workflow_id",
+    "role",
+    "title",
+    "description",
+    "priority",
+    "depends_on",
+    "resources",
+    "labels",
+    "max_attempts",
 }
 
 
@@ -47,6 +84,441 @@ def fixed_config():
         "lock_timeout_seconds": 5,
         "stale_lock_seconds": 30,
     }
+
+
+def allocate_id(state, kind):
+    """Allocate the next monotonic task or workflow identifier."""
+    fields = {
+        "task": ("next_task_sequence", "T"),
+        "workflow": ("next_workflow_sequence", "W"),
+    }
+    if kind not in fields:
+        raise InvariantError("id kind must be task or workflow")
+    sequence_field, prefix = fields[kind]
+    sequence = state[sequence_field]
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
+        raise InvariantError(f"{sequence_field} must be a positive integer")
+    if sequence > MAX_ID_SEQUENCE:
+        raise InvariantError(f"{kind} id sequence exhausted at {prefix}-999999")
+    state[sequence_field] += 1
+    return f"{prefix}-{sequence:06d}"
+
+
+def reserve_task_id(state, explicit_id=None):
+    """Reserve an explicit task ID or allocate the next task ID."""
+    if explicit_id is None:
+        return allocate_id(state, "task")
+    if not isinstance(explicit_id, str):
+        raise InvariantError("task id must be between T-000001 and T-999999")
+    match = TASK_ID_PATTERN.fullmatch(explicit_id)
+    if match is None or int(match.group(1)) == 0:
+        raise InvariantError("task id must be between T-000001 and T-999999")
+    sequence = int(match.group(1))
+    state["next_task_sequence"] = max(
+        state["next_task_sequence"], sequence + 1
+    )
+    return explicit_id
+
+
+def _task_id_sequence(task_id):
+    if not isinstance(task_id, str):
+        raise InvariantError("task id must be between T-000001 and T-999999")
+    match = TASK_ID_PATTERN.fullmatch(task_id)
+    if match is None or int(match.group(1)) == 0:
+        raise InvariantError("task id must be between T-000001 and T-999999")
+    return int(match.group(1))
+
+
+def _workflow_id_sequence(workflow_id):
+    if not isinstance(workflow_id, str):
+        raise InvariantError("task workflow_id must be a string or null")
+    match = WORKFLOW_ID_PATTERN.fullmatch(workflow_id)
+    if match is None or int(match.group(1)) == 0:
+        raise InvariantError(
+            "task workflow_id must be between W-000001 and W-999999"
+        )
+    return int(match.group(1))
+
+
+def _reserve_batch_ids(state, raw_tasks):
+    """Reserve all new explicit IDs against the pre-batch queue history."""
+    starting_task_sequence = state["next_task_sequence"]
+    starting_workflow_sequence = state["next_workflow_sequence"]
+    explicit_task_ids = set()
+    existing_workflow_ids = {
+        task["workflow_id"]
+        for task in state["tasks"].values()
+        if task["workflow_id"] is not None
+    }
+    new_workflow_ids = set()
+
+    for raw in raw_tasks:
+        if not isinstance(raw, dict):
+            continue
+        explicit_task_id = raw.get("id")
+        if explicit_task_id is not None:
+            sequence = _task_id_sequence(explicit_task_id)
+            if (
+                explicit_task_id in state["tasks"]
+                or explicit_task_id in explicit_task_ids
+            ):
+                raise InvariantError(f"duplicate task id: {explicit_task_id}")
+            if sequence < starting_task_sequence:
+                raise InvariantError(
+                    f"historical task id cannot be reused: {explicit_task_id}"
+                )
+            explicit_task_ids.add(explicit_task_id)
+
+        workflow_id = raw.get("workflow_id")
+        if workflow_id is None:
+            continue
+        sequence = _workflow_id_sequence(workflow_id)
+        if workflow_id in existing_workflow_ids:
+            continue
+        if sequence < starting_workflow_sequence:
+            raise InvariantError(
+                f"historical workflow id cannot be reused: {workflow_id}"
+            )
+        new_workflow_ids.add(workflow_id)
+
+    if new_workflow_ids:
+        state["next_workflow_sequence"] = max(
+            starting_workflow_sequence,
+            max(
+                _workflow_id_sequence(workflow_id)
+                for workflow_id in new_workflow_ids
+            )
+            + 1,
+        )
+    return explicit_task_ids
+
+
+def _assign_batch_task_ids(state, raw_tasks, explicit_task_ids):
+    """Assign generated IDs from the starting cursor around explicit reservations."""
+    starting_sequence = state["next_task_sequence"]
+    reserved_sequences = {
+        _task_id_sequence(task_id) for task_id in explicit_task_ids
+    }
+    generated_sequence = starting_sequence
+    prepared_tasks = []
+    for raw in raw_tasks:
+        if not isinstance(raw, dict) or raw.get("id") is not None:
+            prepared_tasks.append(raw)
+            continue
+        while generated_sequence in reserved_sequences:
+            generated_sequence += 1
+        if generated_sequence > MAX_ID_SEQUENCE:
+            raise InvariantError("task id sequence exhausted at T-999999")
+        prepared = dict(raw)
+        prepared["id"] = f"T-{generated_sequence:06d}"
+        prepared_tasks.append(prepared)
+        reserved_sequences.add(generated_sequence)
+        generated_sequence += 1
+
+    if reserved_sequences:
+        state["next_task_sequence"] = max(reserved_sequences) + 1
+    return prepared_tasks
+
+
+def _validate_timestamp(value, field):
+    if not isinstance(value, str) or re.fullmatch(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+        value,
+        flags=re.ASCII,
+    ) is None:
+        raise InvariantError(f"{field} must match %Y-%m-%dT%H:%M:%SZ")
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise InvariantError(
+            f"{field} must match %Y-%m-%dT%H:%M:%SZ"
+        ) from error
+
+
+def _deduplicated_string_list(raw, field):
+    if not isinstance(raw, list):
+        raise InvariantError(f"{field} must be a list")
+    if any(not isinstance(value, str) for value in raw):
+        raise InvariantError(f"{field} values must be strings")
+    return list(dict.fromkeys(raw))
+
+
+def normalize_task(state, raw):
+    """Create a canonical pending task from generic task input."""
+    if not isinstance(raw, dict):
+        raise InvariantError("task must be an object")
+    if any(not isinstance(field, str) for field in raw):
+        raise InvariantError("task creation input must use string field names")
+    unknown_fields = sorted(set(raw).difference(TASK_CREATION_FIELDS))
+    if unknown_fields:
+        raise InvariantError(
+            f"unknown task creation fields: {', '.join(unknown_fields)}"
+        )
+
+    title = raw.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise InvariantError("task title must be a non-blank string")
+    description = raw.get("description", "")
+    if not isinstance(description, str):
+        raise InvariantError("task description must be a string")
+
+    priority = raw.get("priority", 0)
+    if not isinstance(priority, int) or isinstance(priority, bool):
+        raise InvariantError("task priority must be an integer")
+    max_attempts = raw.get(
+        "max_attempts", state["config"]["default_max_attempts"]
+    )
+    if (
+        not isinstance(max_attempts, int)
+        or isinstance(max_attempts, bool)
+        or max_attempts <= 0
+    ):
+        raise InvariantError("task max_attempts must be a positive integer")
+
+    workflow_id = raw.get("workflow_id")
+    if workflow_id is not None and not isinstance(workflow_id, str):
+        raise InvariantError("task workflow_id must be a string or null")
+    if workflow_id is not None:
+        match = WORKFLOW_ID_PATTERN.fullmatch(workflow_id)
+        if match is None or int(match.group(1)) == 0:
+            raise InvariantError(
+                "task workflow_id must be between W-000001 and W-999999"
+            )
+        state["next_workflow_sequence"] = max(
+            state["next_workflow_sequence"], int(match.group(1)) + 1
+        )
+    role = raw.get("role")
+    if role is not None and not isinstance(role, str):
+        raise InvariantError("task role must be a string or null")
+
+    depends_on = _deduplicated_string_list(
+        raw.get("depends_on", []), "task depends_on"
+    )
+    resources = _deduplicated_string_list(
+        raw.get("resources", []), "task resources"
+    )
+    labels = _deduplicated_string_list(raw.get("labels", []), "task labels")
+    task_id = reserve_task_id(state, raw.get("id"))
+    now = utc_now()
+    task = {
+        "id": task_id,
+        "workflow_id": workflow_id,
+        "role": role,
+        "title": title.strip(),
+        "description": description,
+        "status": "pending",
+        "priority": priority,
+        "depends_on": depends_on,
+        "resources": resources,
+        "labels": labels,
+        "attempts": 0,
+        "max_attempts": max_attempts,
+        "available_at": None,
+        "claim": None,
+        "result": None,
+        "last_error": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    validate_task(task, expected_id=task_id)
+    return task
+
+
+def _json_validation_error(value):
+    """Return why metadata is unsafe JSON, using bounded iterative traversal."""
+    active_containers = set()
+    stack = [("visit", value, 0)]
+    while stack:
+        action, item, depth = stack.pop()
+        if action == "leave":
+            active_containers.remove(item)
+            continue
+        if item is None or isinstance(item, (bool, str, int)):
+            continue
+        if isinstance(item, float):
+            try:
+                json.dumps(item, allow_nan=False)
+            except ValueError:
+                return "must contain JSON values"
+            continue
+        if not isinstance(item, (list, dict)):
+            return "must contain JSON values"
+        if depth > MAX_JSON_METADATA_DEPTH:
+            return f"exceeds maximum depth {MAX_JSON_METADATA_DEPTH}"
+
+        container_id = id(item)
+        if container_id in active_containers:
+            return "contains a circular reference"
+        active_containers.add(container_id)
+        stack.append(("leave", container_id, depth))
+        if isinstance(item, dict):
+            if any(not isinstance(key, str) for key in item):
+                return "must contain JSON values"
+            children = item.values()
+        else:
+            children = item
+        stack.extend(
+            ("visit", child, depth + 1) for child in reversed(list(children))
+        )
+    return None
+
+
+def validate_task(task, expected_id=None):
+    """Validate one stored task's exact canonical schema."""
+    if not isinstance(task, dict):
+        raise InvariantError("task must be an object")
+    if any(not isinstance(field, str) for field in task):
+        raise InvariantError("task field names must be strings")
+    missing_fields = sorted(TASK_FIELDS.difference(task))
+    extra_fields = sorted(set(task).difference(TASK_FIELDS))
+    if missing_fields or extra_fields:
+        details = []
+        if missing_fields:
+            details.append(f"missing: {', '.join(missing_fields)}")
+        if extra_fields:
+            details.append(f"unexpected: {', '.join(extra_fields)}")
+        raise InvariantError(f"task fields mismatch ({'; '.join(details)})")
+
+    task_id = task["id"]
+    task_id_match = (
+        TASK_ID_PATTERN.fullmatch(task_id) if isinstance(task_id, str) else None
+    )
+    if task_id_match is None or int(task_id_match.group(1)) == 0:
+        raise InvariantError("task id must be between T-000001 and T-999999")
+    if expected_id is not None and task_id != expected_id:
+        raise InvariantError(
+            f"tasks.{expected_id}.id must equal dictionary key, got {task_id}"
+        )
+
+    for field in ("workflow_id", "role"):
+        value = task[field]
+        if value is not None and not isinstance(value, str):
+            raise InvariantError(f"task {field} must be a string or null")
+    workflow_id = task["workflow_id"]
+    if workflow_id is not None:
+        workflow_id_match = WORKFLOW_ID_PATTERN.fullmatch(workflow_id)
+        if workflow_id_match is None or int(workflow_id_match.group(1)) == 0:
+            raise InvariantError(
+                "task workflow_id must be between W-000001 and W-999999"
+            )
+    if not isinstance(task["title"], str) or not task["title"].strip():
+        raise InvariantError("task title must be a non-blank string")
+    if not isinstance(task["description"], str):
+        raise InvariantError("task description must be a string")
+    if (
+        not isinstance(task["status"], str)
+        or task["status"] not in STORED_STATUSES
+    ):
+        raise InvariantError("task status must be a stored status")
+    if not isinstance(task["priority"], int) or isinstance(task["priority"], bool):
+        raise InvariantError("task priority must be an integer")
+
+    for field in ("depends_on", "resources", "labels"):
+        values = task[field]
+        canonical = _deduplicated_string_list(values, f"task {field}")
+        if values != canonical:
+            raise InvariantError(f"task {field} must not contain duplicates")
+
+    attempts = task["attempts"]
+    if (
+        not isinstance(attempts, int)
+        or isinstance(attempts, bool)
+        or attempts < 0
+    ):
+        raise InvariantError("task attempts must be a nonnegative integer")
+    max_attempts = task["max_attempts"]
+    if (
+        not isinstance(max_attempts, int)
+        or isinstance(max_attempts, bool)
+        or max_attempts <= 0
+    ):
+        raise InvariantError("task max_attempts must be a positive integer")
+    if attempts > max_attempts:
+        raise InvariantError("task attempts must not exceed max_attempts")
+
+    available_at = task["available_at"]
+    if available_at is not None:
+        _validate_timestamp(available_at, "task available_at")
+    for field in ("claim", "result", "last_error"):
+        value = task[field]
+        if value is not None and not isinstance(value, dict):
+            raise InvariantError(f"task {field} must be an object or null")
+        if value is not None:
+            json_error = _json_validation_error(value)
+            if json_error is not None:
+                raise InvariantError(f"task {field} {json_error}")
+    _validate_timestamp(task["created_at"], "task created_at")
+    _validate_timestamp(task["updated_at"], "task updated_at")
+    if task["updated_at"] < task["created_at"]:
+        raise InvariantError("task updated_at must not precede created_at")
+    return task
+
+
+def validate_graph(tasks):
+    """Validate that task dependencies exist and form a directed acyclic graph."""
+    dependents = {task_id: [] for task_id in tasks}
+    indegrees = {}
+    for task_id, task in tasks.items():
+        indegrees[task_id] = len(task["depends_on"])
+        for dependency in task["depends_on"]:
+            if dependency == task_id:
+                raise InvariantError(
+                    f"tasks.{task_id}.depends_on cannot include itself"
+                )
+            if dependency not in tasks:
+                raise InvariantError(
+                    f"missing dependency {dependency} in tasks.{task_id}.depends_on"
+                )
+            dependents[dependency].append(task_id)
+
+    ready = [task_id for task_id, degree in indegrees.items() if degree == 0]
+    visited_count = 0
+    ready_index = 0
+    while ready_index < len(ready):
+        task_id = ready[ready_index]
+        ready_index += 1
+        visited_count += 1
+        for dependent in dependents[task_id]:
+            indegrees[dependent] -= 1
+            if indegrees[dependent] == 0:
+                ready.append(dependent)
+
+    if visited_count != len(tasks):
+        cyclic_task = next(
+            task_id for task_id, degree in indegrees.items() if degree > 0
+        )
+        raise InvariantError(
+            f"dependency cycle includes tasks.{cyclic_task}.depends_on"
+        )
+
+
+def add_task_batch(state, raw_tasks):
+    """Validate and atomically append a nonempty batch of generic tasks."""
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        raise InvariantError("raw_tasks must be a nonempty list")
+    candidate = copy.deepcopy(state)
+    validate_state(candidate)
+    explicit_task_ids = _reserve_batch_ids(candidate, raw_tasks)
+    prepared_tasks = _assign_batch_task_ids(
+        candidate, raw_tasks, explicit_task_ids
+    )
+    created_ids = []
+    for raw in prepared_tasks:
+        task = normalize_task(candidate, raw)
+        task_id = task["id"]
+        if task_id in candidate["tasks"]:
+            raise InvariantError(f"duplicate task id: {task_id}")
+        candidate["tasks"][task_id] = task
+        created_ids.append(task_id)
+    validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+    return [copy.deepcopy(state["tasks"][task_id]) for task_id in created_ids]
+
+
+def add_task(state, raw):
+    """Validate and atomically append one generic task."""
+    return add_task_batch(state, [raw])[0]
 
 
 def new_state(queue_id, config):
@@ -124,6 +596,11 @@ def validate_state(state):
         value = state[field]
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise InvariantError(f"{field} must be a positive integer")
+        if (
+            field in ("next_task_sequence", "next_workflow_sequence")
+            and value > MAX_ID_SEQUENCE + 1
+        ):
+            raise InvariantError(f"{field} exceeds its six-digit id range")
 
     for field in ("created_at", "updated_at"):
         value = state[field]
@@ -167,6 +644,35 @@ def validate_state(state):
             or value <= 0
         ):
             raise InvariantError(f"config.{key} must be a positive integer")
+
+    maximum_task_sequence = 0
+    maximum_workflow_sequence = 0
+    maximum_task_id = None
+    maximum_workflow_id = None
+    for task_id, task in state["tasks"].items():
+        validate_task(task, expected_id=task_id)
+        task_sequence = int(TASK_ID_PATTERN.fullmatch(task_id).group(1))
+        if task_sequence > maximum_task_sequence:
+            maximum_task_sequence = task_sequence
+            maximum_task_id = task_id
+        workflow_id = task["workflow_id"]
+        if workflow_id is not None:
+            workflow_sequence = int(
+                WORKFLOW_ID_PATTERN.fullmatch(workflow_id).group(1)
+            )
+            if workflow_sequence > maximum_workflow_sequence:
+                maximum_workflow_sequence = workflow_sequence
+                maximum_workflow_id = workflow_id
+    if state["next_task_sequence"] <= maximum_task_sequence:
+        raise InvariantError(
+            f"next_task_sequence must be greater than stored task {maximum_task_id}"
+        )
+    if state["next_workflow_sequence"] <= maximum_workflow_sequence:
+        raise InvariantError(
+            "next_workflow_sequence must be greater than stored workflow "
+            f"{maximum_workflow_id}"
+        )
+    validate_graph(state["tasks"])
 
     return state
 
