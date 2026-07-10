@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Agent Queue"
+  short_description: "Coordinate agents with a safe shared task queue"
+  default_prompt: "Use $manage-agent-queue to coordinate this work across agents with dependencies, leases, and status tracking."
