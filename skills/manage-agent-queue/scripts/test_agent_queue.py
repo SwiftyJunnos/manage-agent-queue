@@ -723,5 +723,547 @@ class TaskGraphTests(unittest.TestCase):
             aq.validate_state(self.state)
 
 
+class StatusProjectionTests(unittest.TestCase):
+    NOW = "2026-07-10T06:00:00Z"
+
+    def setUp(self):
+        self.state = aq.new_state("demo", aq.fixed_config())
+
+    def add(self, title, **fields):
+        created = aq.add_task(self.state, {"title": title, **fields})
+        return self.state["tasks"][created["id"]]
+
+    def test_completed_dependency_makes_pending_task_ready(self):
+        dependency = self.add("Dependency")
+        dependency["status"] = "completed"
+        task = self.add("Ready", depends_on=[dependency["id"]])
+
+        self.assertEqual([], aq.dependency_blockers(self.state, task))
+        self.assertEqual("ready", aq.derive_state(self.state, task, self.NOW))
+
+    def test_unfinished_dependencies_are_ordered_blockers(self):
+        first = self.add("First")
+        completed = self.add("Completed")
+        completed["status"] = "completed"
+        third = self.add("Third")
+        third["status"] = "leased"
+        task = self.add(
+            "Waiting",
+            depends_on=[third["id"], completed["id"], first["id"]],
+        )
+
+        self.assertEqual(
+            [third["id"], first["id"]],
+            aq.dependency_blockers(self.state, task),
+        )
+        self.assertEqual(
+            "waiting_dependency", aq.derive_state(self.state, task, self.NOW)
+        )
+
+    def test_dependency_failure_precedes_retry_and_resource_conflict(self):
+        failed = self.add("Failed dependency")
+        failed["status"] = "failed"
+        leased = self.add("Lease holder", resources=["repo"])
+        leased["status"] = "leased"
+        task = self.add(
+            "Blocked",
+            depends_on=[failed["id"]],
+            resources=["repo"],
+        )
+        task["available_at"] = "2026-07-10T07:00:00Z"
+
+        self.assertEqual(
+            "dependency_failed", aq.derive_state(self.state, task, self.NOW)
+        )
+        row = next(
+            row
+            for row in aq.status_rows(self.state, self.NOW)
+            if row["id"] == task["id"]
+        )
+        self.assertEqual(failed["id"], row["blocked_by"])
+
+    def test_future_availability_waits_after_dependencies_complete(self):
+        dependency = self.add("Dependency")
+        dependency["status"] = "completed"
+        task = self.add("Retry", depends_on=[dependency["id"]])
+        task["available_at"] = "2026-07-10T06:00:01Z"
+
+        self.assertEqual(
+            "waiting_retry", aq.derive_state(self.state, task, self.NOW)
+        )
+
+    def test_resource_conflict_lists_active_leases_and_excludes_self(self):
+        first = self.add("First lease", resources=["repo", "db"])
+        first["status"] = "leased"
+        second = self.add("Second lease", resources=["repo"])
+        second["status"] = "leased"
+        second["claim"] = {"expires_at": "2026-07-10T05:59:59Z"}
+        task = self.add("Contender", resources=["repo"])
+
+        self.assertEqual(
+            {"repo": [first["id"]], "db": [first["id"]]},
+            aq.leased_resources(self.state, now=self.NOW),
+        )
+        self.assertEqual(
+            {},
+            aq.leased_resources(
+                self.state, excluding=first["id"], now=self.NOW
+            ),
+        )
+        self.assertEqual(
+            "resource_conflict", aq.derive_state(self.state, task, self.NOW)
+        )
+        row = next(
+            row
+            for row in aq.status_rows(self.state, self.NOW)
+            if row["id"] == task["id"]
+        )
+        self.assertEqual(first["id"], row["blocked_by"])
+
+    def test_nonpending_stored_statuses_display_unchanged(self):
+        for status in (
+            "completed",
+            "failed",
+            "blocked",
+            "cancelled",
+            "leased",
+        ):
+            with self.subTest(status=status):
+                task = self.add(status)
+                task["status"] = status
+                task["available_at"] = "2026-07-10T07:00:00Z"
+                self.assertEqual(
+                    status, aq.derive_state(self.state, task, self.NOW)
+                )
+
+    def test_status_rows_sort_by_task_id_not_priority(self):
+        first = self.add("First", priority=-10)
+        second = self.add("Second", priority=100)
+        third = self.add("Third", priority=0)
+
+        self.assertEqual(
+            [first["id"], second["id"], third["id"]],
+            [row["id"] for row in aq.status_rows(self.state, self.NOW)],
+        )
+
+    def test_status_rows_builds_active_lease_resource_map_once(self):
+        holder = self.add("Holder", resources=["repo"])
+        holder["status"] = "leased"
+        contenders = [
+            self.add(f"Contender {number}", resources=["repo"])
+            for number in range(5)
+        ]
+
+        with mock.patch.object(
+            aq, "leased_resources", wraps=aq.leased_resources
+        ) as build_resource_map:
+            rows = aq.status_rows(self.state, self.NOW)
+
+        self.assertEqual(1, build_resource_map.call_count)
+        rows_by_id = {row["id"]: row for row in rows}
+        for contender in contenders:
+            self.assertEqual(
+                "resource_conflict", rows_by_id[contender["id"]]["state"]
+            )
+            self.assertEqual(
+                holder["id"], rows_by_id[contender["id"]]["blocked_by"]
+            )
+
+    def test_status_rows_applies_cheap_filters_before_deriving_state(self):
+        target = self.add("Target", workflow_id="W-000003")
+        for number in range(4):
+            self.add(f"Filtered {number}", workflow_id="W-000004")
+
+        with mock.patch.object(
+            aq,
+            "_derive_state_with_resources",
+            create=True,
+            return_value="ready",
+        ) as derive:
+            rows = aq.status_rows(
+                self.state, self.NOW, workflow="W-000003"
+            )
+
+        self.assertEqual([target["id"]], [row["id"] for row in rows])
+        self.assertEqual(1, derive.call_count)
+
+    def test_status_filters_select_the_same_task(self):
+        target = self.add(
+            "Target",
+            workflow_id="W-000003",
+            role="reviewer",
+            labels=["queue", "python", "safe"],
+        )
+        target["claim"] = {"agent_id": "agent-7"}
+        other = self.add(
+            "Other",
+            workflow_id="W-000004",
+            role="builder",
+            labels=["queue"],
+        )
+        other["available_at"] = "2026-07-10T07:00:00Z"
+        expected = [target["id"]]
+
+        filters = (
+            {"workflow": "W-000003"},
+            {"assignee": "agent-7"},
+            {"role": "reviewer"},
+            {"labels": ["queue", "python"]},
+            {"state_filter": "ready"},
+            {"state_filter": "pending", "assignee": "agent-7"},
+        )
+        for selected_filter in filters:
+            with self.subTest(selected_filter=selected_filter):
+                self.assertEqual(
+                    expected,
+                    [
+                        row["id"]
+                        for row in aq.status_rows(
+                            self.state, self.NOW, **selected_filter
+                        )
+                    ],
+                )
+
+    def test_tsv_has_exact_header_values_and_one_physical_line_per_task(self):
+        dependency = self.add("Dependency", resources=["file:dep"])
+        dependency["status"] = "leased"
+        dependency["claim"] = {
+            "agent_id": "dep-agent",
+            "expires_at": "2026-07-10T07:00:00Z",
+        }
+        task = self.add(
+            "Back\\slash\tLine\r\nNext",
+            workflow_id="W-000003",
+            role="review",
+            priority=4,
+            depends_on=[dependency["id"]],
+            resources=["file:code"],
+            max_attempts=5,
+        )
+        task["attempts"] = 2
+        task["claim"] = {
+            "agent_id": "agent-owner",
+            "expires_at": "2026-07-10T08:00:00Z",
+        }
+        self.state["revision"] = 9
+        expected = (
+            "# queue_revision: 9\n"
+            "id\tworkflow\trole\tstate\tpriority\tassignee\tlease_until\t"
+            "attempts\tdepends_on\tblocked_by\tresources\ttitle\n"
+            "T-000001\t\t\tleased\t0\tdep-agent\t2026-07-10T07:00:00Z\t"
+            "0/3\t\t\tfile:dep\tDependency\n"
+            "T-000002\tW-000003\treview\twaiting_dependency\t4\tagent-owner\t"
+            "2026-07-10T08:00:00Z\t2/5\tT-000001\tT-000001\tfile:code\t"
+            "Back\\\\slash\\tLine\\r\\nNext\n"
+        )
+
+        rendered = aq.render_tsv(self.state, self.NOW)
+
+        self.assertEqual(expected, rendered)
+        self.assertEqual(4, len(rendered.splitlines()))
+        rows = aq.status_rows(self.state, self.NOW)
+        table = aq.format_terminal_table(rows)
+        self.assertIn("lease_until", table)
+        self.assertIn("T-000002", table)
+
+    def test_status_projection_redacts_tokens_results_and_errors(self):
+        task = self.add("Secret-bearing task")
+        task["claim"] = {
+            "agent_id": "agent-1",
+            "expires_at": "2026-07-10T07:00:00Z",
+            "lease_token": "TOP-SECRET-TOKEN",
+        }
+        task["result"] = {"arbitrary_result": "RESULT-SECRET"}
+        task["last_error"] = {"arbitrary_error": "ERROR-SECRET"}
+
+        rows = aq.status_rows(self.state, self.NOW)
+        rendered = aq.render_tsv(self.state, self.NOW)
+
+        self.assertEqual(
+            {
+                "id",
+                "workflow",
+                "role",
+                "state",
+                "priority",
+                "assignee",
+                "lease_until",
+                "attempts",
+                "depends_on",
+                "blocked_by",
+                "resources",
+                "title",
+            },
+            set(rows[0]),
+        )
+        for secret in (
+            "lease_token",
+            "TOP-SECRET-TOKEN",
+            "arbitrary_result",
+            "RESULT-SECRET",
+            "arbitrary_error",
+            "ERROR-SECRET",
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, repr(rows))
+                self.assertNotIn(secret, rendered)
+
+    def test_empty_render_matches_existing_empty_projection_bytes(self):
+        self.state["revision"] = 7
+
+        self.assertEqual(
+            aq.render_empty_tsv(7), aq.render_tsv(self.state, self.NOW)
+        )
+
+    def test_empty_terminal_table_still_has_headings_without_ansi(self):
+        table = aq.format_terminal_table([])
+
+        self.assertIn("id", table)
+        self.assertIn("lease_until", table)
+        self.assertNotIn("\x1b", table)
+
+    def test_terminal_table_escapes_user_control_codes(self):
+        task = self.add("\x1b[31mred\x1b[0m\x9bunsafe")
+        rows = aq.status_rows(self.state, self.NOW)
+
+        table = aq.format_terminal_table(rows)
+
+        self.assertNotIn("\x1b", table)
+        self.assertNotIn("\x9b", table)
+        self.assertIn("\\u001B[31mred\\u001B[0m\\u009Bunsafe", table)
+        self.assertEqual(task["id"], rows[0]["id"])
+
+    def test_shared_display_escaping_covers_separators_and_bidi_controls(self):
+        controls = (
+            ("\v", "\\u000B"),
+            ("\f", "\\u000C"),
+            ("\x1c", "\\u001C"),
+            ("\x85", "\\u0085"),
+            ("\u2028", "\\u2028"),
+            ("\u2029", "\\u2029"),
+            ("\x1b", "\\u001B"),
+            ("\x9b", "\\u009B"),
+            ("\u061c", "\\u061C"),
+            ("\u200e", "\\u200E"),
+            ("\u200f", "\\u200F"),
+            ("\u202a", "\\u202A"),
+            ("\u202b", "\\u202B"),
+            ("\u202c", "\\u202C"),
+            ("\u202d", "\\u202D"),
+            ("\u202e", "\\u202E"),
+            ("\u2066", "\\u2066"),
+            ("\u2067", "\\u2067"),
+            ("\u2068", "\\u2068"),
+            ("\u2069", "\\u2069"),
+        )
+        raw = "slash\\\t\r\n" + "".join(
+            character for character, _ in controls
+        )
+        expected = "slash\\\\\\t\\r\\n" + "".join(
+            escaped for _, escaped in controls
+        )
+        task = self.add(raw)
+
+        rendered = aq.render_tsv(self.state, self.NOW)
+        table = aq.format_terminal_table(
+            aq.status_rows(self.state, self.NOW)
+        )
+
+        self.assertEqual(expected, aq.escape_tsv(raw))
+        self.assertIn(expected, rendered)
+        self.assertIn(expected, table)
+        self.assertEqual(3, len(rendered.splitlines()))
+        for character, _ in controls:
+            with self.subTest(codepoint=f"U+{ord(character):04X}"):
+                self.assertNotIn(character, rendered)
+                self.assertNotIn(character, table)
+        self.assertEqual(task["id"], self.state["tasks"][task["id"]]["id"])
+
+    def test_terminal_table_aligns_wide_emoji_and_combining_text(self):
+        self.add("Korean", role="검토")
+        self.add("Emoji", role="🙂")
+        self.add("Combining", role="e\u0301")
+
+        table = aq.format_terminal_table(
+            aq.status_rows(self.state, self.NOW)
+        )
+        lines = table.splitlines()
+        state_offsets = [
+            aq.display_width(line[: line.index("ready")])
+            for line in lines[2:]
+        ]
+
+        self.assertEqual([state_offsets[0]] * 3, state_offsets)
+        self.assertEqual(2, aq.display_width("한"))
+        self.assertEqual(2, aq.display_width("🙂"))
+        self.assertEqual(1, aq.display_width("e\u0301"))
+        self.assertEqual(0, aq.display_width("\x1b"))
+
+    def test_display_width_treats_common_emoji_sequences_as_one_cluster(self):
+        cases = (
+            ("👍🏽", 2),
+            ("1️⃣", 2),
+            ("👩‍💻", 2),
+            ("🇰🇷", 2),
+        )
+
+        for value, expected_width in cases:
+            with self.subTest(value=value):
+                self.assertEqual(expected_width, aq.display_width(value))
+
+    def test_terminal_table_places_column_after_zwj_emoji_at_literal_cell(self):
+        self.add("ZWJ row", role="👩‍💻")
+
+        table = aq.format_terminal_table(
+            aq.status_rows(self.state, self.NOW)
+        )
+        row = table.splitlines()[2]
+        prefix_before_state = row[: row.index("ready")]
+        literal_cell_position = len(
+            prefix_before_state.replace("👩‍💻", "XX")
+        )
+
+        self.assertEqual(26, literal_cell_position)
+        self.assertTrue(prefix_before_state.endswith("👩‍💻    "))
+
+    def test_display_width_promotes_vs16_emoji_presentation(self):
+        cases = (
+            ("❤️", 2),
+            ("✈️", 2),
+            ("☺️", 2),
+            ("☀️", 2),
+            ("❤︎", 1),
+        )
+
+        for value, expected_width in cases:
+            with self.subTest(value=value):
+                self.assertEqual(expected_width, aq.display_width(value))
+
+    def test_terminal_table_places_column_after_vs16_emoji_at_literal_cell(self):
+        self.add("VS16 row", role="❤️")
+
+        table = aq.format_terminal_table(
+            aq.status_rows(self.state, self.NOW)
+        )
+        row = table.splitlines()[2]
+        prefix_before_state = row[: row.index("ready")]
+        literal_cell_position = len(prefix_before_state.replace("❤️", "XX"))
+
+        self.assertEqual(26, literal_cell_position)
+        self.assertTrue(prefix_before_state.endswith("❤️    "))
+
+    def test_display_width_normalizes_and_limits_emoji_joining(self):
+        cases = (
+            ("가", 2),
+            ("A\u200dB", 2),
+            ("A\ufe0f", 1),
+        )
+
+        for value, expected_width in cases:
+            with self.subTest(value=value):
+                self.assertEqual(expected_width, aq.display_width(value))
+
+    def test_terminal_table_places_columns_after_literal_cluster_widths(self):
+        roles = ("가", "A\u200dB", "A\ufe0f")
+        replacements = (("가", "XX"), ("A\u200dB", "XX"), ("A\ufe0f", "X"))
+        expected_suffixes = ("가    ", "A\u200dB    ", "A\ufe0f     ")
+        for number, role in enumerate(roles):
+            self.add(f"Literal row {number}", role=role)
+
+        table = aq.format_terminal_table(
+            aq.status_rows(self.state, self.NOW)
+        )
+        prefixes = [
+            row[: row.index("ready")] for row in table.splitlines()[2:]
+        ]
+
+        for prefix, replacement, expected_suffix in zip(
+            prefixes, replacements, expected_suffixes
+        ):
+            with self.subTest(expected_suffix=expected_suffix):
+                literal_cell_position = len(
+                    prefix.replace(replacement[0], replacement[1])
+                )
+                self.assertEqual(26, literal_cell_position)
+                self.assertTrue(prefix.endswith(expected_suffix))
+
+    def test_display_width_promotes_standard_bmp_emoji_vs_bases(self):
+        cases = (
+            ("©️", 2),
+            ("®️", 2),
+            ("™️", 2),
+            ("↔️", 2),
+            ("▶️", 2),
+            ("◼️", 2),
+            ("Ⓜ️", 2),
+            ("★️", 1),
+        )
+
+        for value, expected_width in cases:
+            with self.subTest(value=value):
+                self.assertEqual(expected_width, aq.display_width(value))
+
+    def test_terminal_table_places_column_after_bmp_emoji_at_literal_cell(self):
+        self.add("BMP VS row", role="©️")
+
+        table = aq.format_terminal_table(
+            aq.status_rows(self.state, self.NOW)
+        )
+        row = table.splitlines()[2]
+        prefix_before_state = row[: row.index("ready")]
+        literal_cell_position = len(prefix_before_state.replace("©️", "XX"))
+
+        self.assertEqual(26, literal_cell_position)
+        self.assertTrue(prefix_before_state.endswith("©️    "))
+
+    def test_display_width_does_not_join_variation_only_bases(self):
+        cases = (
+            ("1\u200d2", 2),
+            ("©\u200d®", 2),
+            ("↔\u200d↕", 2),
+            ("👨‍👩‍👧‍👦", 2),
+            ("🏳️‍🌈", 2),
+        )
+
+        for value, expected_width in cases:
+            with self.subTest(value=value):
+                self.assertEqual(expected_width, aq.display_width(value))
+
+    def test_terminal_table_keeps_variation_only_join_bases_separate(self):
+        roles = ("1\u200d2", "©\u200d®", "↔\u200d↕")
+        for number, role in enumerate(roles):
+            self.add(f"Separate ZWJ row {number}", role=role)
+
+        table = aq.format_terminal_table(
+            aq.status_rows(self.state, self.NOW)
+        )
+        prefixes = [
+            row[: row.index("ready")] for row in table.splitlines()[2:]
+        ]
+
+        for prefix, role in zip(prefixes, roles):
+            with self.subTest(role=role):
+                literal_cell_position = len(prefix.replace(role, "XX"))
+                self.assertEqual(26, literal_cell_position)
+                self.assertTrue(prefix.endswith(f"{role}    "))
+
+    def test_validation_rejects_invalid_available_at_and_visible_claim_fields(self):
+        task = self.add("Stored")
+        cases = (
+            ("available_at", "2026-07-10T06:00:00+00:00", "available_at"),
+            ("claim", {"agent_id": ""}, "agent_id"),
+            ("claim", {"agent_id": 7}, "agent_id"),
+            ("claim", {"expires_at": "tomorrow"}, "expires_at"),
+            ("claim", {"expires_at": None}, "expires_at"),
+        )
+
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                candidate = json.loads(json.dumps(self.state))
+                candidate["tasks"][task["id"]][field] = value
+                with self.assertRaisesRegex(aq.InvariantError, message):
+                    aq.validate_state(candidate)
+
+
 if __name__ == "__main__":
     unittest.main()

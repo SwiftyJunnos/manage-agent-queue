@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,6 +56,203 @@ TASK_CREATION_FIELDS = {
     "labels",
     "max_attempts",
 }
+TSV_COLUMNS = (
+    "id",
+    "workflow",
+    "role",
+    "state",
+    "priority",
+    "assignee",
+    "lease_until",
+    "attempts",
+    "depends_on",
+    "blocked_by",
+    "resources",
+    "title",
+)
+# BMP bases from Unicode's emoji-variation-sequences data, plus the supported
+# supplementary emoji span. Source chart:
+# https://www.unicode.org/emoji/charts-16.0/emoji-variants.html
+EMOJI_VARIATION_BASE_RANGES = (
+    (0x0030, 0x0039),
+    (0x2194, 0x2199),
+    (0x21A9, 0x21AA),
+    (0x231A, 0x231B),
+    (0x23E9, 0x23F3),
+    (0x23F8, 0x23FA),
+    (0x25AA, 0x25AB),
+    (0x25FB, 0x25FE),
+    (0x2600, 0x2604),
+    (0x2614, 0x2615),
+    (0x2622, 0x2623),
+    (0x262E, 0x262F),
+    (0x2638, 0x263A),
+    (0x2648, 0x2653),
+    (0x265F, 0x2660),
+    (0x2665, 0x2666),
+    (0x267E, 0x267F),
+    (0x2692, 0x2697),
+    (0x269B, 0x269C),
+    (0x26A0, 0x26A1),
+    (0x26AA, 0x26AB),
+    (0x26B0, 0x26B1),
+    (0x26BD, 0x26BE),
+    (0x26C4, 0x26C5),
+    (0x26CE, 0x26CF),
+    (0x26D3, 0x26D4),
+    (0x26E9, 0x26EA),
+    (0x26F0, 0x26F5),
+    (0x26F7, 0x26FA),
+    (0x2708, 0x270D),
+    (0x2733, 0x2734),
+    (0x2753, 0x2755),
+    (0x2795, 0x2797),
+    (0x2934, 0x2935),
+    (0x2B05, 0x2B07),
+    (0x2B1B, 0x2B1C),
+    (0x1F000, 0x1FAFF),
+)
+EMOJI_VARIATION_BASE_CODEPOINTS = frozenset(
+    {
+        0x0023,
+        0x002A,
+        0x00A9,
+        0x00AE,
+        0x203C,
+        0x2049,
+        0x2122,
+        0x2139,
+        0x2328,
+        0x23CF,
+        0x24C2,
+        0x25B6,
+        0x25C0,
+        0x260E,
+        0x2611,
+        0x2618,
+        0x261D,
+        0x2620,
+        0x2626,
+        0x262A,
+        0x2640,
+        0x2642,
+        0x2663,
+        0x2668,
+        0x267B,
+        0x2699,
+        0x26A7,
+        0x26C8,
+        0x26D1,
+        0x26FD,
+        0x2702,
+        0x2705,
+        0x270F,
+        0x2712,
+        0x2714,
+        0x2716,
+        0x271D,
+        0x2721,
+        0x2728,
+        0x2744,
+        0x2747,
+        0x274C,
+        0x274E,
+        0x2757,
+        0x2763,
+        0x2764,
+        0x27A1,
+        0x27B0,
+        0x27BF,
+        0x2B50,
+        0x2B55,
+        0x3030,
+        0x303D,
+        0x3297,
+        0x3299,
+    }
+)
+# Coalesced Unicode 16 Extended_Pictographic property ranges. Source:
+# https://www.unicode.org/Public/16.0.0/ucd/emoji/emoji-data.txt
+EXTENDED_PICTOGRAPHIC_RANGES = (
+    (0x00A9, 0x00A9),
+    (0x00AE, 0x00AE),
+    (0x203C, 0x203C),
+    (0x2049, 0x2049),
+    (0x2122, 0x2122),
+    (0x2139, 0x2139),
+    (0x2194, 0x2199),
+    (0x21A9, 0x21AA),
+    (0x231A, 0x231B),
+    (0x2328, 0x2328),
+    (0x2388, 0x2388),
+    (0x23CF, 0x23CF),
+    (0x23E9, 0x23F3),
+    (0x23F8, 0x23FA),
+    (0x24C2, 0x24C2),
+    (0x25AA, 0x25AB),
+    (0x25B6, 0x25B6),
+    (0x25C0, 0x25C0),
+    (0x25FB, 0x25FE),
+    (0x2600, 0x2605),
+    (0x2607, 0x2612),
+    (0x2614, 0x2685),
+    (0x2690, 0x2705),
+    (0x2708, 0x2712),
+    (0x2714, 0x2714),
+    (0x2716, 0x2716),
+    (0x271D, 0x271D),
+    (0x2721, 0x2721),
+    (0x2728, 0x2728),
+    (0x2733, 0x2734),
+    (0x2744, 0x2744),
+    (0x2747, 0x2747),
+    (0x274C, 0x274C),
+    (0x274E, 0x274E),
+    (0x2753, 0x2755),
+    (0x2757, 0x2757),
+    (0x2763, 0x2767),
+    (0x2795, 0x2797),
+    (0x27A1, 0x27A1),
+    (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF),
+    (0x2934, 0x2935),
+    (0x2B05, 0x2B07),
+    (0x2B1B, 0x2B1C),
+    (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55),
+    (0x3030, 0x3030),
+    (0x303D, 0x303D),
+    (0x3297, 0x3297),
+    (0x3299, 0x3299),
+    (0x1F000, 0x1F0FF),
+    (0x1F10D, 0x1F10F),
+    (0x1F12F, 0x1F12F),
+    (0x1F16C, 0x1F171),
+    (0x1F17E, 0x1F17F),
+    (0x1F18E, 0x1F18E),
+    (0x1F191, 0x1F19A),
+    (0x1F1AD, 0x1F1E5),
+    (0x1F201, 0x1F20F),
+    (0x1F21A, 0x1F21A),
+    (0x1F22F, 0x1F22F),
+    (0x1F232, 0x1F23A),
+    (0x1F23C, 0x1F23F),
+    (0x1F249, 0x1F3FA),
+    (0x1F400, 0x1F53D),
+    (0x1F546, 0x1F64F),
+    (0x1F680, 0x1F6FF),
+    (0x1F774, 0x1F77F),
+    (0x1F7D5, 0x1F7FF),
+    (0x1F80C, 0x1F80F),
+    (0x1F848, 0x1F84F),
+    (0x1F85A, 0x1F85F),
+    (0x1F888, 0x1F88F),
+    (0x1F8AE, 0x1F8FF),
+    (0x1F90C, 0x1F93A),
+    (0x1F93C, 0x1F945),
+    (0x1F947, 0x1FAFF),
+    (0x1FC00, 0x1FFFD),
+)
 
 
 class QueueError(Exception):
@@ -233,6 +431,14 @@ def _validate_timestamp(value, field):
         raise InvariantError(
             f"{field} must match %Y-%m-%dT%H:%M:%SZ"
         ) from error
+
+
+def _is_valid_timestamp(value):
+    try:
+        _validate_timestamp(value, "timestamp")
+    except InvariantError:
+        return False
+    return True
 
 
 def _deduplicated_string_list(raw, field):
@@ -447,6 +653,13 @@ def validate_task(task, expected_id=None):
             json_error = _json_validation_error(value)
             if json_error is not None:
                 raise InvariantError(f"task {field} {json_error}")
+    claim = task["claim"]
+    if claim is not None and "agent_id" in claim:
+        agent_id = claim["agent_id"]
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise InvariantError("task claim.agent_id must be a non-blank string")
+    if claim is not None and "expires_at" in claim:
+        _validate_timestamp(claim["expires_at"], "task claim.expires_at")
     _validate_timestamp(task["created_at"], "task created_at")
     _validate_timestamp(task["updated_at"], "task updated_at")
     if task["updated_at"] < task["created_at"]:
@@ -723,12 +936,329 @@ def write_json(path, state):
     atomic_write_text(path, text)
 
 
+def dependency_blockers(state, task):
+    """Return dependency IDs that have not completed, preserving task order."""
+    return [
+        dependency_id
+        for dependency_id in task["depends_on"]
+        if state["tasks"][dependency_id]["status"] != "completed"
+    ]
+
+
+def leased_resources(state, excluding=None, now=None):
+    """Map resources to active leased task IDs without exposing claim data."""
+    now = utc_now() if now is None else now
+    resources = {}
+    for task_id in sorted(state["tasks"]):
+        task = state["tasks"][task_id]
+        if task_id == excluding or task["status"] != "leased":
+            continue
+        claim = task["claim"]
+        expires_at = claim.get("expires_at") if isinstance(claim, dict) else None
+        if _is_valid_timestamp(expires_at) and expires_at <= now:
+            continue
+        for resource in task["resources"]:
+            resources.setdefault(resource, []).append(task_id)
+    return resources
+
+
+def _resource_conflicts(task, active_resources):
+    return sorted(
+        {
+            task_id
+            for resource in task["resources"]
+            for task_id in active_resources.get(resource, [])
+            if task_id != task["id"]
+        }
+    )
+
+
+def _derive_state_with_resources(state, task, now, active_resources):
+    if task["status"] != "pending":
+        return task["status"]
+
+    dependencies = [
+        state["tasks"][dependency_id]
+        for dependency_id in task["depends_on"]
+    ]
+    if any(
+        dependency["status"] in {"failed", "blocked", "cancelled"}
+        for dependency in dependencies
+    ):
+        return "dependency_failed"
+    if dependency_blockers(state, task):
+        return "waiting_dependency"
+    if task["available_at"] is not None and task["available_at"] > now:
+        return "waiting_retry"
+    if _resource_conflicts(task, active_resources):
+        return "resource_conflict"
+    return "ready"
+
+
+def derive_state(state, task, now):
+    """Derive the display state for a task using fixed readiness precedence."""
+    active_resources = leased_resources(state, now=now)
+    return _derive_state_with_resources(state, task, now, active_resources)
+
+
+def status_rows(
+    state,
+    now,
+    workflow=None,
+    assignee=None,
+    role=None,
+    labels=None,
+    state_filter=None,
+):
+    """Return redacted, stable task rows for status displays."""
+    validate_state(state)
+    _validate_timestamp(now, "now")
+    required_labels = set(labels or [])
+    active_resources = leased_resources(state, now=now)
+    rows = []
+    for task_id in sorted(state["tasks"]):
+        task = state["tasks"][task_id]
+        claim = task["claim"] if isinstance(task["claim"], dict) else {}
+        task_assignee = claim.get("agent_id", "")
+        if workflow is not None and task["workflow_id"] != workflow:
+            continue
+        if assignee is not None and task_assignee != assignee:
+            continue
+        if role is not None and task["role"] != role:
+            continue
+        if not required_labels.issubset(task["labels"]):
+            continue
+        derived = _derive_state_with_resources(
+            state, task, now, active_resources
+        )
+        if (
+            state_filter is not None
+            and state_filter not in {task["status"], derived}
+        ):
+            continue
+
+        if derived in {"dependency_failed", "waiting_dependency"}:
+            blocked_by = dependency_blockers(state, task)
+        elif derived == "resource_conflict":
+            blocked_by = _resource_conflicts(task, active_resources)
+        else:
+            blocked_by = []
+        rows.append(
+            {
+                "id": task_id,
+                "workflow": task["workflow_id"] or "",
+                "role": task["role"] or "",
+                "state": derived,
+                "priority": task["priority"],
+                "assignee": task_assignee,
+                "lease_until": claim.get("expires_at", ""),
+                "attempts": f'{task["attempts"]}/{task["max_attempts"]}',
+                "depends_on": ",".join(task["depends_on"]),
+                "blocked_by": ",".join(blocked_by),
+                "resources": ",".join(task["resources"]),
+                "title": task["title"],
+            }
+        )
+    return rows
+
+
+def escape_tsv(value):
+    """Escape a value for stable, visible TSV and terminal display."""
+    escapes = {
+        "\\": "\\\\",
+        "\t": "\\t",
+        "\r": "\\r",
+        "\n": "\\n",
+    }
+    result = []
+    for character in str(value):
+        if character in escapes:
+            result.append(escapes[character])
+        elif (
+            unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+            and character != "\u200d"
+        ):
+            result.append(f"\\u{ord(character):04X}")
+        else:
+            result.append(character)
+    return "".join(result)
+
+
+def render_tsv(
+    state,
+    now,
+    workflow=None,
+    assignee=None,
+    role=None,
+    labels=None,
+    state_filter=None,
+):
+    """Render a complete one-line-per-task TSV status projection."""
+    rows = status_rows(
+        state,
+        now,
+        workflow=workflow,
+        assignee=assignee,
+        role=role,
+        labels=labels,
+        state_filter=state_filter,
+    )
+    lines = [
+        f'# queue_revision: {state["revision"]}',
+        "\t".join(TSV_COLUMNS),
+    ]
+    lines.extend(
+        "\t".join(escape_tsv(row[column]) for column in TSV_COLUMNS)
+        for row in rows
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _is_regional_indicator(character):
+    return "\U0001f1e6" <= character <= "\U0001f1ff"
+
+
+def _is_variation_selector(character):
+    return (
+        "\ufe00" <= character <= "\ufe0f"
+        or "\U000e0100" <= character <= "\U000e01ef"
+    )
+
+
+def _is_emoji_modifier(character):
+    return "\U0001f3fb" <= character <= "\U0001f3ff"
+
+
+def _codepoint_in_ranges(codepoint, ranges):
+    return any(start <= codepoint <= end for start, end in ranges)
+
+
+def _is_emoji_variation_base(character):
+    """Return whether one character is in the supported emoji base ranges."""
+    codepoint = ord(character)
+    return (
+        codepoint in EMOJI_VARIATION_BASE_CODEPOINTS
+        or _codepoint_in_ranges(codepoint, EMOJI_VARIATION_BASE_RANGES)
+    )
+
+
+def _is_extended_pictographic(character):
+    return _codepoint_in_ranges(ord(character), EXTENDED_PICTOGRAPHIC_RANGES)
+
+
+def _is_zwj_joinable_pictograph(character):
+    # Legacy text symbols below U+2300 are Extended_Pictographic but do not form
+    # supported terminal emoji ZWJ clusters in this deliberately small heuristic.
+    return ord(character) >= 0x2300 and _is_extended_pictographic(character)
+
+
+def _is_cluster_attachment(character):
+    return (
+        unicodedata.category(character).startswith("M")
+        or _is_variation_selector(character)
+        or _is_emoji_modifier(character)
+    )
+
+
+def _base_display_width(character):
+    category = unicodedata.category(character)
+    if category.startswith("C") or category in {"Zl", "Zp"}:
+        return 0
+    return 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+
+
+def display_width(value):
+    """Return terminal cells with small stdlib-only emoji cluster handling."""
+    characters = unicodedata.normalize("NFC", str(value))
+    width = 0
+    index = 0
+    while index < len(characters):
+        character = characters[index]
+        if _is_regional_indicator(character):
+            run_end = index + 1
+            while (
+                run_end < len(characters)
+                and _is_regional_indicator(characters[run_end])
+            ):
+                run_end += 1
+            width += ((run_end - index + 1) // 2) * 2
+            index = run_end
+            continue
+        if _is_cluster_attachment(character) or character == "\u200d":
+            index += 1
+            continue
+
+        cluster_width = _base_display_width(character)
+        cluster_accepts_vs16 = _is_emoji_variation_base(character)
+        cluster_accepts_keycap = character in "#*0123456789"
+        cluster_joins_zwj = _is_zwj_joinable_pictograph(character)
+        index += 1
+        while index < len(characters):
+            while (
+                index < len(characters)
+                and _is_cluster_attachment(characters[index])
+            ):
+                if characters[index] == "\ufe0f" and cluster_accepts_vs16:
+                    cluster_width = max(cluster_width, 2)
+                if characters[index] == "\u20e3" and cluster_accepts_keycap:
+                    cluster_width = max(cluster_width, 2)
+                index += 1
+            if index >= len(characters) or characters[index] != "\u200d":
+                break
+            index += 1
+            if index >= len(characters):
+                break
+            if (
+                not cluster_joins_zwj
+                or not _is_zwj_joinable_pictograph(characters[index])
+            ):
+                break
+            cluster_width = max(
+                cluster_width, _base_display_width(characters[index])
+            )
+            index += 1
+        width += cluster_width
+    return width
+
+
+def _pad_display(value, width):
+    return value + " " * (width - display_width(value))
+
+
+def format_terminal_table(rows):
+    """Format status rows as a small dependency-free aligned table."""
+    display_rows = [
+        [escape_tsv(row[column]) for column in TSV_COLUMNS] for row in rows
+    ]
+    widths = [
+        max(
+            [
+                display_width(column),
+                *(display_width(row[index]) for row in display_rows),
+            ]
+        )
+        for index, column in enumerate(TSV_COLUMNS)
+    ]
+    lines = [
+        "  ".join(
+            _pad_display(column, widths[index])
+            for index, column in enumerate(TSV_COLUMNS)
+        ),
+        "  ".join("-" * width for width in widths),
+    ]
+    lines.extend(
+        "  ".join(
+            _pad_display(value, widths[index])
+            for index, value in enumerate(row)
+        )
+        for row in display_rows
+    )
+    return "\n".join(lines)
+
+
 def render_empty_tsv(revision):
     """Render an empty queue projection for the given revision."""
-    header = (
-        "id\tworkflow\trole\tstate\tpriority\tassignee\tlease_until\tattempts\t"
-        "depends_on\tblocked_by\tresources\ttitle"
-    )
+    header = "\t".join(TSV_COLUMNS)
     return f"# queue_revision: {revision}\n{header}\n"
 
 
