@@ -678,14 +678,86 @@ class TaskGraphTests(unittest.TestCase):
         with self.assertRaisesRegex(aq.InvariantError, "task field names"):
             aq.validate_state(self.state)
 
-    def test_validate_state_accepts_structured_result_and_error_metadata(self):
+    def test_validate_state_accepts_canonical_completed_result_and_error(self):
         created = aq.add_task(self.state, {"title": "Stored"})
         task = self.state["tasks"][created["id"]]
-        task["available_at"] = "2026-07-10T06:01:00Z"
+        task["status"] = "completed"
         task["result"] = {"summary": "done", "artifacts": ["report.txt"]}
-        task["last_error"] = {"message": "retry", "terminal": False}
+        task["last_error"] = {
+            "message": "earlier retry",
+            "at": "2026-07-10T06:00:00Z",
+        }
 
         self.assertIs(self.state, aq.validate_state(self.state))
+
+    def test_validate_state_rejects_malformed_lifecycle_combinations(self):
+        created = aq.add_task(self.state, {"title": "Stored"})
+        cases = (
+            ({"result": {"summary": "done", "artifacts": []}}, "result.*completed"),
+            ({"status": "completed", "result": None}, "completed.*result"),
+            (
+                {
+                    "status": "completed",
+                    "result": {"summary": "done", "artifacts": [], "extra": 1},
+                },
+                "result.*keys",
+            ),
+            (
+                {
+                    "status": "completed",
+                    "result": {"summary": 1, "artifacts": []},
+                },
+                "result.*summary",
+            ),
+            (
+                {
+                    "status": "completed",
+                    "result": {"summary": "done", "artifacts": [""]},
+                },
+                "result.*artifacts",
+            ),
+            ({"last_error": {"message": "bad"}}, "last_error.*keys"),
+            (
+                {
+                    "last_error": {
+                        "message": "blocked",
+                        "at": "2026-07-10T06:00:00Z",
+                        "kind": "other",
+                    }
+                },
+                "last_error.*kind",
+            ),
+            ({"status": "failed"}, "failed.*last_error"),
+            (
+                {
+                    "status": "failed",
+                    "last_error": {
+                        "message": "blocked before failure",
+                        "at": "2026-07-10T06:00:00Z",
+                        "kind": "blocked",
+                    },
+                },
+                "failed.*kind",
+            ),
+            (
+                {
+                    "status": "failed",
+                    "last_error": {
+                        "message": "failed",
+                        "at": "2026-07-10T06:00:00Z",
+                    },
+                    "available_at": "2026-07-10T06:00:00Z",
+                },
+                "available_at",
+            ),
+            ({"status": "leased", "attempts": 1, "claim": canonical_claim(), "available_at": "2026-07-10T06:00:00Z"}, "available_at"),
+        )
+        for updates, message in cases:
+            with self.subTest(updates=updates):
+                candidate = copy.deepcopy(self.state)
+                candidate["tasks"][created["id"]].update(updates)
+                with self.assertRaisesRegex(aq.InvariantError, message):
+                    aq.validate_state(candidate)
 
     def test_validate_state_rejects_non_json_future_metadata(self):
         created = aq.add_task(self.state, {"title": "Stored"})
@@ -973,6 +1045,16 @@ class ClaimTaskTests(unittest.TestCase):
         self.assertEqual(3, raised.exception.exit_code)
         self.assertEqual(before, json.dumps(self.state, sort_keys=True))
 
+    def test_claim_skips_task_updated_after_now_without_mutation(self):
+        task = self.add("Future update")
+        task["updated_at"] = "2026-07-10T06:00:01Z"
+        before = json.dumps(self.state, sort_keys=True)
+
+        with self.assertRaises(aq.NoTaskAvailable):
+            aq.claim_task(self.state, "agent-1", now=self.NOW)
+
+        self.assertEqual(before, json.dumps(self.state, sort_keys=True))
+
     def test_validate_state_rejects_malformed_claim_contracts(self):
         task = self.add("Stored")
         valid = canonical_claim()
@@ -1120,6 +1202,43 @@ class ClaimTaskTests(unittest.TestCase):
 
         self.assertIs(self.state, aq.validate_state(self.state))
 
+    def test_validate_state_rejects_descending_event_timestamps(self):
+        self.add("First")
+        self.add("Second")
+        aq.claim_task(self.state, "agent-1", now=self.NOW)
+        aq.claim_task(
+            self.state, "agent-2", now="2026-07-10T06:00:01Z"
+        )
+        candidate = copy.deepcopy(self.state)
+        candidate["events"][1]["at"] = "2026-07-10T05:59:59Z"
+
+        with self.assertRaisesRegex(aq.InvariantError, "event.*at.*nondecreasing"):
+            aq.validate_state(candidate)
+
+    def test_append_event_rejects_backdated_time_atomically(self):
+        task = self.add("Ready")
+        aq.append_event(
+            self.state,
+            "task.first",
+            "operator",
+            task["id"],
+            {},
+            self.NOW,
+        )
+        before = json.dumps(self.state, sort_keys=True)
+
+        with self.assertRaisesRegex(aq.InvariantError, "now.*event"):
+            aq.append_event(
+                self.state,
+                "task.second",
+                "operator",
+                task["id"],
+                {},
+                "2026-07-10T05:59:59Z",
+            )
+
+        self.assertEqual(before, json.dumps(self.state, sort_keys=True))
+
     def test_expired_lease_does_not_block_but_owner_remains_leased(self):
         owner = self.add("Expired owner", resources=["repo"])
         owner.update(
@@ -1176,6 +1295,618 @@ class ClaimTaskTests(unittest.TestCase):
         self.assertNotIn("lease_token", public)
 
 
+class LifecycleTransitionTests(unittest.TestCase):
+    CREATED = "2026-07-10T05:00:00Z"
+    NOW = "2026-07-10T06:00:00Z"
+
+    def setUp(self):
+        self.clock = mock.patch.object(aq, "utc_now", return_value=self.CREATED)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.state = aq.new_state("demo", aq.fixed_config())
+
+    def add(self, title="Task", **fields):
+        created = aq.add_task(self.state, {"title": title, **fields})
+        return self.state["tasks"][created["id"]]
+
+    def claim(self, agent="agent-1", now=None, **task_fields):
+        task_fields.setdefault("priority", 1000)
+        task = self.add(**task_fields)
+        with mock.patch.object(aq.secrets, "token_urlsafe", return_value="SECRET"):
+            result = aq.claim_task(
+                self.state, agent, now=now or self.NOW, lease_seconds=60
+            )
+        return task, result["lease_token"]
+
+    def assert_atomic_error(self, error, pattern, callable_):
+        before = json.dumps(self.state, sort_keys=True)
+        with self.assertRaisesRegex(error, pattern):
+            callable_()
+        self.assertEqual(before, json.dumps(self.state, sort_keys=True))
+
+    def test_lease_error_fences_wrong_missing_inactive_and_expired_workers(self):
+        self.assertTrue(issubclass(aq.LeaseError, aq.QueueError))
+        self.assertEqual(5, aq.LeaseError.exit_code)
+        task, token = self.claim()
+        cases = (
+            ("agent-2", token, self.NOW, "agent"),
+            ("agent-1", "WRONG", self.NOW, "token"),
+            ("agent-1", token, "2026-07-10T06:01:00Z", "expired"),
+        )
+        for agent, candidate_token, now, message in cases:
+            with self.subTest(message=message):
+                self.assert_atomic_error(
+                    aq.LeaseError,
+                    message,
+                    lambda: aq.require_lease(
+                        self.state, task["id"], agent, candidate_token, now
+                    ),
+                )
+        self.assert_atomic_error(
+            aq.LeaseError,
+            "not found",
+            lambda: aq.require_lease(
+                self.state, "T-999999", "agent-1", token, self.NOW
+            ),
+        )
+        self.state["tasks"][task["id"]].update({"status": "pending", "claim": None})
+        self.assert_atomic_error(
+            aq.LeaseError,
+            "not leased",
+            lambda: aq.require_lease(
+                self.state, task["id"], "agent-1", token, self.NOW
+            ),
+        )
+
+    def test_require_lease_reports_corrupt_state_as_lease_error(self):
+        task, token = self.claim()
+        self.state["config"]["default_lease_seconds"] = 0
+        self.assert_atomic_error(
+            aq.LeaseError,
+            "invalid queue state.*config",
+            lambda: aq.require_lease(
+                self.state, task["id"], "agent-1", token, self.NOW
+            ),
+        )
+
+    def test_require_lease_returns_a_detached_task(self):
+        task, token = self.claim()
+
+        returned = aq.require_lease(
+            self.state, task["id"], "agent-1", token, self.NOW
+        )
+        returned["title"] = "mutated"
+        returned["claim"]["lease_token"] = "mutated-token"
+
+        stored = self.state["tasks"][task["id"]]
+        self.assertEqual("Task", stored["title"])
+        self.assertEqual(token, stored["claim"]["lease_token"])
+
+    def test_heartbeat_extends_from_now_and_redacts_token(self):
+        task, token = self.claim()
+        returned = aq.heartbeat_task(
+            self.state,
+            task["id"],
+            "agent-1",
+            token,
+            lease_seconds=90,
+            now="2026-07-10T06:00:30Z",
+        )
+        stored = self.state["tasks"][task["id"]]
+        self.assertEqual("2026-07-10T06:00:30Z", stored["claim"]["heartbeat_at"])
+        self.assertEqual("2026-07-10T06:02:00Z", stored["claim"]["expires_at"])
+        self.assertEqual(1, stored["attempts"])
+        self.assertIsNot(stored, returned)
+        event = self.state["events"][-1]
+        self.assertEqual("task.heartbeat", event["type"])
+        self.assertEqual({"lease_seconds": 90}, event["details"])
+        self.assertNotIn(token, repr(event))
+
+    def test_heartbeat_invalid_duration_and_overflow_are_atomic(self):
+        task, token = self.claim()
+        self.state["tasks"][task["id"]]["claim"].update(
+            {
+                "heartbeat_at": "9999-12-31T23:59:57Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+            }
+        )
+        for seconds, now, message in (
+            (0, "9999-12-31T23:59:58Z", "lease_seconds"),
+            (True, "9999-12-31T23:59:58Z", "lease_seconds"),
+            (2, "9999-12-31T23:59:58Z", "addition"),
+        ):
+            with self.subTest(seconds=seconds):
+                self.assert_atomic_error(
+                    aq.InvariantError,
+                    message,
+                    lambda: aq.heartbeat_task(
+                        self.state,
+                        task["id"],
+                        "agent-1",
+                        token,
+                        lease_seconds=seconds,
+                        now=now,
+                    ),
+                )
+
+    def test_worker_transitions_reject_backdated_now_as_lease_error(self):
+        task, token = self.claim()
+        calls = (
+            lambda: aq.heartbeat_task(
+                self.state,
+                task["id"],
+                "agent-1",
+                token,
+                now="2026-07-10T05:59:59Z",
+            ),
+            lambda: aq.complete_task(
+                self.state,
+                task["id"],
+                "agent-1",
+                token,
+                summary="done",
+                artifacts=[],
+                now="2026-07-10T05:59:59Z",
+            ),
+            lambda: aq.fail_task(
+                self.state,
+                task["id"],
+                "agent-1",
+                token,
+                message="failed",
+                now="2026-07-10T05:59:59Z",
+            ),
+            lambda: aq.release_task(
+                self.state,
+                task["id"],
+                "agent-1",
+                token,
+                now="2026-07-10T05:59:59Z",
+            ),
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                self.assert_atomic_error(
+                    aq.LeaseError, "now.*earlier", call
+                )
+
+    def test_complete_sets_exact_result_event_and_detached_return(self):
+        task, token = self.claim()
+        returned = aq.complete_task(
+            self.state,
+            task["id"],
+            "agent-1",
+            token,
+            summary="Finished",
+            artifacts=["a.txt", "b.json"],
+            now="2026-07-10T06:00:30Z",
+        )
+        stored = self.state["tasks"][task["id"]]
+        self.assertEqual("completed", stored["status"])
+        self.assertEqual(
+            {"summary": "Finished", "artifacts": ["a.txt", "b.json"]},
+            stored["result"],
+        )
+        self.assertIsNone(stored["claim"])
+        self.assertIsNone(stored["available_at"])
+        self.assertIsNot(stored, returned)
+        self.assertEqual(
+            {"artifact_count": 2}, self.state["events"][-1]["details"]
+        )
+        self.assertNotIn(token, repr(self.state["events"][-1]))
+
+    def test_complete_validates_payload_before_lease_and_is_atomic(self):
+        task, _ = self.claim()
+        cases = (
+            ({"summary": "", "artifacts": []}, "summary"),
+            ({"summary": "ok", "artifacts": "a"}, "artifacts"),
+            ({"summary": "ok", "artifacts": [""]}, "artifacts"),
+            ({"summary": "ok", "artifacts": [1]}, "artifacts"),
+        )
+        for payload, message in cases:
+            with self.subTest(payload=payload):
+                self.assert_atomic_error(
+                    aq.InvariantError,
+                    message,
+                    lambda: aq.complete_task(
+                        self.state,
+                        task["id"],
+                        "wrong-agent",
+                        "wrong-token",
+                        now=self.NOW,
+                        **payload,
+                    ),
+                )
+
+    def test_fail_retries_with_backoff_then_exhausts_or_terminates(self):
+        retry_task, retry_token = self.claim(max_attempts=2)
+        returned = aq.fail_task(
+            self.state,
+            retry_task["id"],
+            "agent-1",
+            retry_token,
+            message="retry me",
+            now=self.NOW,
+        )
+        self.assertEqual("pending", returned["status"])
+        self.assertEqual("2026-07-10T06:00:30Z", returned["available_at"])
+        self.assertEqual(
+            {"message": "retry me", "at": self.NOW}, returned["last_error"]
+        )
+        self.assertEqual(
+            {"terminal": False, "status": "pending"},
+            self.state["events"][-1]["details"],
+        )
+
+        exhausted, exhausted_token = self.claim(max_attempts=1)
+        final = aq.fail_task(
+            self.state,
+            exhausted["id"],
+            "agent-1",
+            exhausted_token,
+            message="final",
+            now=self.NOW,
+        )
+        self.assertEqual("failed", final["status"])
+        self.assertIsNone(final["available_at"])
+
+        terminal, terminal_token = self.claim(max_attempts=3)
+        stopped = aq.fail_task(
+            self.state,
+            terminal["id"],
+            "agent-1",
+            terminal_token,
+            message="stop",
+            terminal=True,
+            now=self.NOW,
+        )
+        self.assertEqual("failed", stopped["status"])
+        self.assertEqual(1, stopped["attempts"])
+        self.assertEqual(True, self.state["events"][-1]["details"]["terminal"])
+
+    def test_release_returns_pending_immediately_and_retains_attempt(self):
+        task, token = self.claim()
+        released = aq.release_task(
+            self.state, task["id"], "agent-1", token, now=self.NOW
+        )
+        self.assertEqual("pending", released["status"])
+        self.assertEqual(self.NOW, released["available_at"])
+        self.assertEqual(1, released["attempts"])
+        self.assertIsNone(released["claim"])
+        self.assertEqual("task.released", self.state["events"][-1]["type"])
+
+    def test_sweep_expired_is_deterministic_retry_aware_and_secret_free(self):
+        first, first_token = self.claim(max_attempts=2)
+        second, second_token = self.claim(max_attempts=1)
+        third, third_token = self.claim(max_attempts=2)
+        self.state["tasks"][first["id"]]["claim"].update(
+            {
+                "claimed_at": "2026-07-10T05:59:00Z",
+                "heartbeat_at": "2026-07-10T05:59:59Z",
+                "expires_at": self.NOW,
+            }
+        )
+        self.state["tasks"][second["id"]]["claim"].update(
+            {
+                "claimed_at": "2026-07-10T05:58:00Z",
+                "heartbeat_at": "2026-07-10T05:59:58Z",
+                "expires_at": "2026-07-10T05:59:59Z",
+            }
+        )
+        self.state["tasks"][third["id"]]["claim"]["expires_at"] = "2026-07-10T06:00:01Z"
+        unexpired_before = copy.deepcopy(self.state["tasks"][third["id"]])
+
+        changed = aq.sweep_expired(self.state, now=self.NOW)
+
+        self.assertEqual([first["id"], second["id"]], changed)
+        self.assertEqual("pending", self.state["tasks"][first["id"]]["status"])
+        self.assertEqual("failed", self.state["tasks"][second["id"]]["status"])
+        self.assertEqual(unexpired_before, self.state["tasks"][third["id"]])
+        events = self.state["events"][-2:]
+        self.assertEqual([first["id"], second["id"]], [event["task_id"] for event in events])
+        self.assertEqual(1, len({event["revision"] for event in events}))
+        self.assertEqual(
+            [
+                {"status": "pending", "attempt": 1},
+                {"status": "failed", "attempt": 1},
+            ],
+            [event["details"] for event in events],
+        )
+        for token in (first_token, second_token, third_token):
+            self.assertNotIn(token, repr(events))
+
+    def test_sweep_validates_and_copies_queue_once_for_many_expirations(self):
+        for index in range(8):
+            task = self.add(f"Expired {index}", max_attempts=2)
+            task["status"] = "leased"
+            task["attempts"] = 1
+            task["claim"] = canonical_claim(
+                agent_id=f"agent-{index}",
+                lease_token=f"secret-{index}",
+                claimed_at="2026-07-10T05:30:00Z",
+                heartbeat_at="2026-07-10T05:59:00Z",
+                expires_at=self.NOW,
+            )
+
+        real_deepcopy = copy.deepcopy
+        queue_copy_count = 0
+
+        def tracking_deepcopy(value):
+            nonlocal queue_copy_count
+            if isinstance(value, dict) and "schema_version" in value:
+                queue_copy_count += 1
+            return real_deepcopy(value)
+
+        with mock.patch.object(
+            aq, "validate_state", wraps=aq.validate_state
+        ) as validate, mock.patch.object(
+            aq.copy, "deepcopy", side_effect=tracking_deepcopy
+        ):
+            changed = aq.sweep_expired(self.state, now=self.NOW)
+
+        self.assertEqual(8, len(changed))
+        self.assertEqual(2, validate.call_count)
+        self.assertEqual(1, queue_copy_count)
+
+    def test_sweep_large_batch_preserves_id_order_and_retry_outcomes(self):
+        expected_ids = []
+        for index in range(24):
+            task = self.add(
+                f"Expired {index}", max_attempts=1 if index % 2 else 2
+            )
+            task["status"] = "leased"
+            task["attempts"] = 1
+            task["claim"] = canonical_claim(
+                agent_id=f"agent-{index}",
+                lease_token=f"secret-{index}",
+                claimed_at="2026-07-10T05:30:00Z",
+                heartbeat_at="2026-07-10T05:59:00Z",
+                expires_at=self.NOW,
+            )
+            expected_ids.append(task["id"])
+
+        changed = aq.sweep_expired(self.state, now=self.NOW)
+
+        self.assertEqual(expected_ids, changed)
+        events = self.state["events"]
+        self.assertEqual(expected_ids, [event["task_id"] for event in events])
+        self.assertEqual(list(range(1, 25)), [event["seq"] for event in events])
+        self.assertEqual(1, len({event["revision"] for event in events}))
+        self.assertEqual(
+            ["pending" if index % 2 == 0 else "failed" for index in range(24)],
+            [self.state["tasks"][task_id]["status"] for task_id in expected_ids],
+        )
+
+    def test_stale_worker_is_fenced_after_sweep_and_reclaim(self):
+        task, stale_token = self.claim(max_attempts=2)
+        self.state["tasks"][task["id"]]["claim"].update(
+            {
+                "claimed_at": "2026-07-10T05:59:00Z",
+                "heartbeat_at": "2026-07-10T05:59:59Z",
+                "expires_at": self.NOW,
+            }
+        )
+        aq.sweep_expired(self.state, now=self.NOW)
+        with mock.patch.object(aq.secrets, "token_urlsafe", return_value="NEW"):
+            reclaimed = aq.claim_task(
+                self.state,
+                "agent-2",
+                now="2026-07-10T06:00:30Z",
+                lease_seconds=60,
+            )
+        self.assert_atomic_error(
+            aq.LeaseError,
+            "agent|token",
+            lambda: aq.complete_task(
+                self.state,
+                task["id"],
+                "agent-1",
+                stale_token,
+                summary="stale",
+                artifacts=[],
+                now="2026-07-10T06:00:31Z",
+            ),
+        )
+        completed = aq.complete_task(
+            self.state,
+            task["id"],
+            "agent-2",
+            reclaimed["lease_token"],
+            summary="fresh",
+            artifacts=[],
+            now="2026-07-10T06:00:31Z",
+        )
+        self.assertEqual("completed", completed["status"])
+
+    def test_manual_retry_preserves_attempts_and_error_and_validates_source(self):
+        task, token = self.claim(max_attempts=1)
+        aq.fail_task(
+            self.state, task["id"], "agent-1", token, message="failed", now=self.NOW
+        )
+        retried = aq.retry_task(
+            self.state, task["id"], additional_attempts=2, now=self.NOW
+        )
+        self.assertEqual("pending", retried["status"])
+        self.assertEqual(1, retried["attempts"])
+        self.assertEqual(3, retried["max_attempts"])
+        self.assertEqual({"message": "failed", "at": self.NOW}, retried["last_error"])
+        self.assertEqual(
+            {"additional_attempts": 2}, self.state["events"][-1]["details"]
+        )
+        for value in (0, True):
+            self.assert_atomic_error(
+                aq.InvariantError,
+                "additional_attempts",
+                lambda value=value: aq.retry_task(
+                    self.state, task["id"], additional_attempts=value, now=self.NOW
+                ),
+            )
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "failed",
+            lambda: aq.retry_task(self.state, task["id"], now=self.NOW),
+        )
+
+    def test_block_unblock_cancel_allowed_transitions_and_events(self):
+        task = self.add()
+        task["attempts"] = 1
+        blocked = aq.block_task(self.state, task["id"], "needs input", now=self.NOW)
+        self.assertEqual("blocked", blocked["status"])
+        self.assertEqual(1, blocked["attempts"])
+        blocked_error = {
+            "message": "needs input",
+            "at": self.NOW,
+            "kind": "blocked",
+        }
+        self.assertEqual(blocked_error, blocked["last_error"])
+        self.assertEqual({"reason": "needs input"}, self.state["events"][-1]["details"])
+        unblocked = aq.unblock_task(self.state, task["id"], now=self.NOW)
+        self.assertEqual("pending", unblocked["status"])
+        self.assertEqual(blocked_error, unblocked["last_error"])
+        self.assertEqual(self.NOW, unblocked["available_at"])
+        cancelled = aq.cancel_task(self.state, task["id"], now=self.NOW)
+        self.assertEqual("cancelled", cancelled["status"])
+        self.assertIsNone(cancelled["available_at"])
+        self.assertEqual(
+            ["task.blocked", "task.unblocked", "task.cancelled"],
+            [event["type"] for event in self.state["events"][-3:]],
+        )
+
+    def test_admin_disallowed_transitions_and_invalid_reasons_are_atomic(self):
+        task = self.add()
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "reason",
+            lambda: aq.block_task(self.state, task["id"], "", now=self.NOW),
+        )
+        aq.block_task(self.state, task["id"], "wait", now=self.NOW)
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "pending",
+            lambda: aq.block_task(self.state, task["id"], "again", now=self.NOW),
+        )
+        aq.unblock_task(self.state, task["id"], now=self.NOW)
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "blocked",
+            lambda: aq.unblock_task(self.state, task["id"], now=self.NOW),
+        )
+        task2, token = self.claim()
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "cannot cancel|status",
+            lambda: aq.cancel_task(self.state, task2["id"], now=self.NOW),
+        )
+        aq.complete_task(
+            self.state,
+            task2["id"],
+            "agent-1",
+            token,
+            summary="done",
+            artifacts=[],
+            now=self.NOW,
+        )
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "cannot cancel|status",
+            lambda: aq.cancel_task(self.state, task2["id"], now=self.NOW),
+        )
+
+    def test_admin_transitions_reject_backdated_now_atomically(self):
+        backdated = "2026-07-10T06:00:29Z"
+        future = "2026-07-10T06:00:30Z"
+
+        retry_task, retry_token = self.claim(max_attempts=1)
+        aq.fail_task(
+            self.state,
+            retry_task["id"],
+            "agent-1",
+            retry_token,
+            message="failed",
+            now=self.NOW,
+        )
+        self.state["tasks"][retry_task["id"]]["updated_at"] = future
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "now.*updated_at",
+            lambda: aq.retry_task(
+                self.state, retry_task["id"], now=backdated
+            ),
+        )
+
+        self.state = aq.new_state("demo", aq.fixed_config())
+        pending = self.add()
+        pending["updated_at"] = future
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "now.*updated_at",
+            lambda: aq.block_task(
+                self.state, pending["id"], "wait", now=backdated
+            ),
+        )
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "now.*updated_at",
+            lambda: aq.cancel_task(self.state, pending["id"], now=backdated),
+        )
+
+        pending["updated_at"] = self.NOW
+        aq.block_task(self.state, pending["id"], "wait", now=self.NOW)
+        self.state["tasks"][pending["id"]]["updated_at"] = future
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "now.*updated_at",
+            lambda: aq.unblock_task(
+                self.state, pending["id"], now=backdated
+            ),
+        )
+
+    def test_sweep_rejects_expired_task_updated_after_now_atomically(self):
+        task, _ = self.claim(max_attempts=2)
+        stored = self.state["tasks"][task["id"]]
+        stored["claim"].update(
+            {
+                "claimed_at": "2026-07-10T05:59:00Z",
+                "heartbeat_at": "2026-07-10T05:59:59Z",
+                "expires_at": self.NOW,
+            }
+        )
+        stored["updated_at"] = "2026-07-10T06:00:01Z"
+
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "now.*updated_at",
+            lambda: aq.sweep_expired(self.state, now=self.NOW),
+        )
+
+    def test_every_transition_rejects_corrupt_state_without_mutation(self):
+        task, token = self.claim()
+        self.state["config"]["default_lease_seconds"] = 0
+        calls = (
+            lambda: aq.heartbeat_task(self.state, task["id"], "agent-1", token, now=self.NOW),
+            lambda: aq.complete_task(self.state, task["id"], "agent-1", token, summary="x", artifacts=[], now=self.NOW),
+            lambda: aq.fail_task(self.state, task["id"], "agent-1", token, message="x", now=self.NOW),
+            lambda: aq.release_task(self.state, task["id"], "agent-1", token, now=self.NOW),
+            lambda: aq.sweep_expired(self.state, now=self.NOW),
+            lambda: aq.retry_task(self.state, task["id"], now=self.NOW),
+            lambda: aq.block_task(self.state, task["id"], "x", now=self.NOW),
+            lambda: aq.unblock_task(self.state, task["id"], now=self.NOW),
+            lambda: aq.cancel_task(self.state, task["id"], now=self.NOW),
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                self.assert_atomic_error(aq.InvariantError, "config", call)
+
+    def test_status_and_tsv_follow_transitions_without_token(self):
+        task, token = self.claim()
+        aq.release_task(self.state, task["id"], "agent-1", token, now=self.NOW)
+        rows = aq.status_rows(self.state, self.NOW)
+        tsv = aq.render_tsv(self.state, self.NOW)
+        self.assertEqual("ready", rows[0]["state"])
+        self.assertEqual("1/3", rows[0]["attempts"])
+        self.assertNotIn(token, repr(rows) + tsv)
+
+
 class StatusProjectionTests(unittest.TestCase):
     NOW = "2026-07-10T06:00:00Z"
 
@@ -1189,6 +1920,7 @@ class StatusProjectionTests(unittest.TestCase):
     def test_completed_dependency_makes_pending_task_ready(self):
         dependency = self.add("Dependency")
         dependency["status"] = "completed"
+        dependency["result"] = {"summary": "done", "artifacts": []}
         task = self.add("Ready", depends_on=[dependency["id"]])
 
         self.assertEqual([], aq.dependency_blockers(self.state, task))
@@ -1198,6 +1930,7 @@ class StatusProjectionTests(unittest.TestCase):
         first = self.add("First")
         completed = self.add("Completed")
         completed["status"] = "completed"
+        completed["result"] = {"summary": "done", "artifacts": []}
         third = self.add("Third")
         third["status"] = "leased"
         third["attempts"] = 1
@@ -1218,6 +1951,7 @@ class StatusProjectionTests(unittest.TestCase):
     def test_dependency_failure_precedes_retry_and_resource_conflict(self):
         failed = self.add("Failed dependency")
         failed["status"] = "failed"
+        failed["last_error"] = {"message": "failed", "at": self.NOW}
         leased = self.add("Lease holder", resources=["repo"])
         leased["status"] = "leased"
         leased["attempts"] = 1
@@ -1242,6 +1976,7 @@ class StatusProjectionTests(unittest.TestCase):
     def test_future_availability_waits_after_dependencies_complete(self):
         dependency = self.add("Dependency")
         dependency["status"] = "completed"
+        dependency["result"] = {"summary": "done", "artifacts": []}
         task = self.add("Retry", depends_on=[dependency["id"]])
         task["available_at"] = "2026-07-10T06:00:01Z"
 
@@ -1295,10 +2030,22 @@ class StatusProjectionTests(unittest.TestCase):
             with self.subTest(status=status):
                 task = self.add(status)
                 task["status"] = status
-                if status == "leased":
+                if status == "completed":
+                    task["result"] = {"summary": "done", "artifacts": []}
+                elif status == "failed":
+                    task["last_error"] = {
+                        "message": "failed",
+                        "at": self.NOW,
+                    }
+                elif status == "blocked":
+                    task["last_error"] = {
+                        "message": "blocked",
+                        "at": self.NOW,
+                        "kind": "blocked",
+                    }
+                elif status == "leased":
                     task["attempts"] = 1
                     task["claim"] = canonical_claim()
-                task["available_at"] = "2026-07-10T07:00:00Z"
                 self.assertEqual(
                     status, aq.derive_state(self.state, task, self.NOW)
                 )
@@ -1435,8 +2182,16 @@ class StatusProjectionTests(unittest.TestCase):
         task["status"] = "leased"
         task["attempts"] = 1
         task["claim"] = canonical_claim(lease_token="TOP-SECRET-TOKEN")
-        task["result"] = {"arbitrary_result": "RESULT-SECRET"}
-        task["last_error"] = {"arbitrary_error": "ERROR-SECRET"}
+        task["last_error"] = {
+            "message": "ERROR-SECRET",
+            "at": self.NOW,
+        }
+        completed = self.add("Completed secret")
+        completed["status"] = "completed"
+        completed["result"] = {
+            "summary": "RESULT-SECRET",
+            "artifacts": [],
+        }
 
         rows = aq.status_rows(self.state, self.NOW)
         rendered = aq.render_tsv(self.state, self.NOW)

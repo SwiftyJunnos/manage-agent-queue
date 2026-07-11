@@ -284,6 +284,10 @@ class NoTaskAvailable(QueueError):
     exit_code = 3
 
 
+class LeaseError(QueueError):
+    exit_code = 5
+
+
 def utc_now():
     """Return the current UTC time with second precision."""
     return (
@@ -718,6 +722,64 @@ def validate_task(task, expected_id=None):
             raise InvariantError("leased task attempts must be at least 1")
     elif claim is not None:
         raise InvariantError("non-leased task claim must be null")
+
+    result = task["result"]
+    if task["status"] == "completed":
+        if result is None:
+            raise InvariantError("completed task result must be an object")
+    elif result is not None:
+        raise InvariantError("task result must be null unless status is completed")
+    if result is not None:
+        if set(result) != {"summary", "artifacts"}:
+            raise InvariantError("task result keys must be summary and artifacts")
+        if not isinstance(result["summary"], str) or not result["summary"]:
+            raise InvariantError("task result.summary must be a nonempty string")
+        artifacts = result["artifacts"]
+        if not isinstance(artifacts, list) or any(
+            not isinstance(artifact, str) or not artifact
+            for artifact in artifacts
+        ):
+            raise InvariantError(
+                "task result.artifacts must be a list of nonempty strings"
+            )
+
+    last_error = task["last_error"]
+    if last_error is not None:
+        allowed_error_fields = {"message", "at", "kind"}
+        if (
+            set(last_error) not in ({"message", "at"}, allowed_error_fields)
+        ):
+            raise InvariantError(
+                "task last_error keys must be message, at, and optional kind"
+            )
+        if (
+            not isinstance(last_error["message"], str)
+            or not last_error["message"]
+        ):
+            raise InvariantError(
+                "task last_error.message must be a nonempty string"
+            )
+        _validate_timestamp(last_error["at"], "task last_error.at")
+        if "kind" in last_error and last_error["kind"] != "blocked":
+            raise InvariantError("task last_error.kind must equal blocked")
+    if task["status"] == "blocked" and (
+        last_error is None or last_error.get("kind") != "blocked"
+    ):
+        raise InvariantError(
+            "blocked task last_error.kind must equal blocked"
+        )
+    if task["status"] == "failed":
+        if last_error is None:
+            raise InvariantError("failed task last_error must be an object")
+        if "kind" in last_error:
+            raise InvariantError(
+                "failed task last_error must not include kind"
+            )
+
+    if task["status"] != "pending" and available_at is not None:
+        raise InvariantError(
+            "task available_at must be null unless status is pending"
+        )
     _validate_timestamp(task["created_at"], "task created_at")
     _validate_timestamp(task["updated_at"], "task updated_at")
     if task["updated_at"] < task["created_at"]:
@@ -947,6 +1009,7 @@ def validate_state(state):
 
     previous_event_sequence = 0
     previous_event_revision = 0
+    previous_event_at = None
     for index, event in enumerate(state["events"]):
         if not isinstance(event, dict):
             raise InvariantError(f"events[{index}] must be an object")
@@ -964,6 +1027,11 @@ def validate_state(state):
             )
         previous_event_sequence = sequence
         _validate_timestamp(event["at"], f"events[{index}].at")
+        if previous_event_at is not None and event["at"] < previous_event_at:
+            raise InvariantError(
+                f"events[{index}].at must be nondecreasing by sequence"
+            )
+        previous_event_at = event["at"]
         for field in ("type", "actor"):
             if (
                 not isinstance(event[field], str)
@@ -1031,13 +1099,16 @@ def _contains_event_lease_token(value):
     return False
 
 
-def append_event(state, event_type, actor, task_id, details, now):
-    """Atomically append one canonical, secret-free queue event."""
-    validate_state(state)
+def _append_event_to_candidate(
+    state, event_type, actor, task_id, details, now
+):
+    """Append a validated event to an already isolated candidate state."""
     for value, field in ((event_type, "event_type"), (actor, "actor")):
         if not isinstance(value, str) or not value.strip():
             raise InvariantError(f"{field} must be a non-blank string")
     _validate_timestamp(now, "now")
+    if state["events"] and now < state["events"][-1]["at"]:
+        raise InvariantError("now must not precede the latest event time")
     if task_id is not None:
         if not isinstance(task_id, str) or not task_id.strip():
             raise InvariantError("task_id must be a non-blank string or null")
@@ -1049,19 +1120,28 @@ def append_event(state, event_type, actor, task_id, details, now):
     if json_error is not None:
         raise InvariantError(f"event details {json_error}")
 
-    candidate = copy.deepcopy(state)
-    sequence = candidate["next_event_sequence"]
+    sequence = state["next_event_sequence"]
     event = {
         "seq": sequence,
         "at": now,
         "type": event_type,
         "actor": actor,
         "task_id": task_id,
-        "revision": candidate["revision"] + 1,
+        "revision": state["revision"] + 1,
         "details": _sanitize_event_details(copy.deepcopy(details)),
     }
-    candidate["next_event_sequence"] += 1
-    candidate["events"].append(event)
+    state["next_event_sequence"] += 1
+    state["events"].append(event)
+    return event
+
+
+def append_event(state, event_type, actor, task_id, details, now):
+    """Atomically append one canonical, secret-free queue event."""
+    validate_state(state)
+    candidate = copy.deepcopy(state)
+    event = _append_event_to_candidate(
+        candidate, event_type, actor, task_id, details, now
+    )
     validate_state(candidate)
     state.clear()
     state.update(candidate)
@@ -1233,6 +1313,8 @@ def claim_task(
             continue
         if task["attempts"] >= task["max_attempts"]:
             continue
+        if task["updated_at"] > now:
+            continue
         if (
             _derive_state_with_resources(
                 state,
@@ -1286,6 +1368,382 @@ def claim_task(
         "lease_token": lease_token,
         "expires_at": expires_at,
     }
+
+
+def _canonical_now(now):
+    now = utc_now() if now is None else now
+    _validate_timestamp(now, "now")
+    return now
+
+
+def _require_monotonic_task_time(task, now, error_type=InvariantError):
+    if now < task["updated_at"]:
+        raise error_type("now must not be earlier than task updated_at")
+
+
+def _require_task(state, task_id):
+    _task_id_sequence(task_id)
+    task = state["tasks"].get(task_id)
+    if task is None:
+        raise InvariantError(f"task not found: {task_id}")
+    return task
+
+
+def _commit_transition(state, candidate, task_id):
+    validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+    return copy.deepcopy(state["tasks"][task_id])
+
+
+def _require_lease_live(state, task_id, agent_id, token, now):
+    """Return a live task only after validating current lease ownership."""
+    try:
+        validate_state(state)
+    except InvariantError as error:
+        raise LeaseError(f"invalid queue state: {error}") from error
+    try:
+        _task_id_sequence(task_id)
+    except InvariantError as error:
+        raise LeaseError("task_id must identify a canonical task") from error
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        raise LeaseError("agent_id must be a non-blank string")
+    if not isinstance(token, str) or not token.strip():
+        raise LeaseError("lease token must be a non-blank string")
+    try:
+        _validate_timestamp(now, "now")
+    except InvariantError as error:
+        raise LeaseError("now must be a canonical UTC timestamp") from error
+
+    task = state["tasks"].get(task_id)
+    if task is None:
+        raise LeaseError(f"task not found: {task_id}")
+    if task["status"] != "leased" or task["claim"] is None:
+        raise LeaseError(f"task is not leased: {task_id}")
+    claim = task["claim"]
+    if claim["agent_id"] != agent_id:
+        raise LeaseError("lease agent does not match")
+    if not secrets.compare_digest(claim["lease_token"], token):
+        raise LeaseError("lease token does not match")
+    _require_monotonic_task_time(task, now, LeaseError)
+    if now < claim["heartbeat_at"]:
+        raise LeaseError("now must not be earlier than claim heartbeat_at")
+    if claim["expires_at"] <= now:
+        raise LeaseError("lease is expired")
+    return task
+
+
+def require_lease(state, task_id, agent_id, token, now):
+    """Return a detached task only when the worker owns a live lease."""
+    return copy.deepcopy(
+        _require_lease_live(state, task_id, agent_id, token, now)
+    )
+
+
+def heartbeat_task(
+    state,
+    task_id,
+    agent_id,
+    token,
+    lease_seconds=None,
+    now=None,
+):
+    """Extend a live worker lease from the current time."""
+    validate_state(state)
+    now = _canonical_now(now)
+    if lease_seconds is None:
+        lease_seconds = state["config"]["default_lease_seconds"]
+    if (
+        not isinstance(lease_seconds, int)
+        or isinstance(lease_seconds, bool)
+        or lease_seconds <= 0
+    ):
+        raise InvariantError("lease_seconds must be a positive integer")
+    _require_lease_live(state, task_id, agent_id, token, now)
+    expires_at = add_seconds(now, lease_seconds)
+
+    candidate = copy.deepcopy(state)
+    task = candidate["tasks"][task_id]
+    task["claim"]["heartbeat_at"] = now
+    task["claim"]["expires_at"] = expires_at
+    task["updated_at"] = now
+    append_event(
+        candidate,
+        "task.heartbeat",
+        agent_id,
+        task_id,
+        {"lease_seconds": lease_seconds},
+        now,
+    )
+    return _commit_transition(state, candidate, task_id)
+
+
+def _validate_text(value, field):
+    if not isinstance(value, str) or not value:
+        raise InvariantError(f"{field} must be a nonempty string")
+
+
+def _validate_artifacts(artifacts):
+    if not isinstance(artifacts, list) or any(
+        not isinstance(artifact, str) or not artifact
+        for artifact in artifacts
+    ):
+        raise InvariantError(
+            "artifacts must be a list of nonempty strings"
+        )
+    json_error = _json_validation_error(artifacts)
+    if json_error is not None:
+        raise InvariantError(f"artifacts {json_error}")
+
+
+def complete_task(
+    state,
+    task_id,
+    agent_id,
+    token,
+    summary,
+    artifacts,
+    now=None,
+):
+    """Complete a live leased task with an exact result payload."""
+    validate_state(state)
+    _validate_text(summary, "summary")
+    _validate_artifacts(artifacts)
+    now = _canonical_now(now)
+    _require_lease_live(state, task_id, agent_id, token, now)
+
+    candidate = copy.deepcopy(state)
+    task = candidate["tasks"][task_id]
+    task["status"] = "completed"
+    task["result"] = {
+        "summary": summary,
+        "artifacts": copy.deepcopy(artifacts),
+    }
+    task["claim"] = None
+    task["available_at"] = None
+    task["updated_at"] = now
+    append_event(
+        candidate,
+        "task.completed",
+        agent_id,
+        task_id,
+        {"artifact_count": len(artifacts)},
+        now,
+    )
+    return _commit_transition(state, candidate, task_id)
+
+
+def apply_retry_rule(state, task, message, now):
+    """Apply the queue's retry policy to a failed leased attempt."""
+    task["claim"] = None
+    task["last_error"] = {"message": message, "at": now}
+    if task["attempts"] < task["max_attempts"]:
+        task["status"] = "pending"
+        task["available_at"] = add_seconds(
+            now, state["config"]["retry_backoff_seconds"]
+        )
+    else:
+        task["status"] = "failed"
+        task["available_at"] = None
+    task["updated_at"] = now
+    return task
+
+
+def fail_task(
+    state,
+    task_id,
+    agent_id,
+    token,
+    message,
+    terminal=False,
+    now=None,
+):
+    """Record a worker failure and either retry or terminate the task."""
+    validate_state(state)
+    _validate_text(message, "message")
+    if not isinstance(terminal, bool):
+        raise InvariantError("terminal must be a boolean")
+    now = _canonical_now(now)
+    _require_lease_live(state, task_id, agent_id, token, now)
+
+    candidate = copy.deepcopy(state)
+    task = candidate["tasks"][task_id]
+    if terminal:
+        task["status"] = "failed"
+        task["claim"] = None
+        task["available_at"] = None
+        task["last_error"] = {"message": message, "at": now}
+        task["updated_at"] = now
+    else:
+        apply_retry_rule(candidate, task, message, now)
+    append_event(
+        candidate,
+        "task.failed",
+        agent_id,
+        task_id,
+        {"terminal": terminal, "status": task["status"]},
+        now,
+    )
+    return _commit_transition(state, candidate, task_id)
+
+
+def release_task(state, task_id, agent_id, token, now=None):
+    """Voluntarily return a leased task to immediate pending readiness."""
+    validate_state(state)
+    now = _canonical_now(now)
+    _require_lease_live(state, task_id, agent_id, token, now)
+
+    candidate = copy.deepcopy(state)
+    task = candidate["tasks"][task_id]
+    task["status"] = "pending"
+    task["claim"] = None
+    task["available_at"] = now
+    task["updated_at"] = now
+    append_event(
+        candidate, "task.released", agent_id, task_id, {}, now
+    )
+    return _commit_transition(state, candidate, task_id)
+
+
+def sweep_expired(state, now=None):
+    """Expire every elapsed lease in deterministic task-ID order."""
+    validate_state(state)
+    now = _canonical_now(now)
+    candidate = copy.deepcopy(state)
+    changed = []
+    for task_id in sorted(candidate["tasks"]):
+        task = candidate["tasks"][task_id]
+        if (
+            task["status"] != "leased"
+            or task["claim"]["expires_at"] > now
+        ):
+            continue
+        _require_monotonic_task_time(task, now)
+        apply_retry_rule(candidate, task, "lease expired", now)
+        _append_event_to_candidate(
+            candidate,
+            "task.lease_expired",
+            "system",
+            task_id,
+            {"status": task["status"], "attempt": task["attempts"]},
+            now,
+        )
+        changed.append(task_id)
+    if not changed:
+        return []
+    validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+    return copy.deepcopy(changed)
+
+
+def retry_task(state, task_id, additional_attempts=1, now=None):
+    """Administratively grant more attempts to a failed task."""
+    validate_state(state)
+    if (
+        not isinstance(additional_attempts, int)
+        or isinstance(additional_attempts, bool)
+        or additional_attempts <= 0
+    ):
+        raise InvariantError("additional_attempts must be a positive integer")
+    now = _canonical_now(now)
+    task = _require_task(state, task_id)
+    if task["status"] != "failed":
+        raise InvariantError("only a failed task can be retried")
+    _require_monotonic_task_time(task, now)
+
+    candidate = copy.deepcopy(state)
+    task = candidate["tasks"][task_id]
+    task["max_attempts"] += additional_attempts
+    task["status"] = "pending"
+    task["available_at"] = now
+    task["claim"] = None
+    task["updated_at"] = now
+    append_event(
+        candidate,
+        "task.retried",
+        "operator",
+        task_id,
+        {"additional_attempts": additional_attempts},
+        now,
+    )
+    return _commit_transition(state, candidate, task_id)
+
+
+def block_task(state, task_id, reason, now=None):
+    """Administratively block a pending task with an audit reason."""
+    validate_state(state)
+    _validate_text(reason, "reason")
+    now = _canonical_now(now)
+    task = _require_task(state, task_id)
+    if task["status"] != "pending":
+        raise InvariantError("only a pending task can be blocked")
+    _require_monotonic_task_time(task, now)
+
+    candidate = copy.deepcopy(state)
+    task = candidate["tasks"][task_id]
+    task["status"] = "blocked"
+    task["available_at"] = None
+    task["claim"] = None
+    task["last_error"] = {
+        "message": reason,
+        "at": now,
+        "kind": "blocked",
+    }
+    task["updated_at"] = now
+    append_event(
+        candidate,
+        "task.blocked",
+        "operator",
+        task_id,
+        {"reason": reason},
+        now,
+    )
+    return _commit_transition(state, candidate, task_id)
+
+
+def unblock_task(state, task_id, now=None):
+    """Administratively return a blocked task to immediate readiness."""
+    validate_state(state)
+    now = _canonical_now(now)
+    task = _require_task(state, task_id)
+    if task["status"] != "blocked":
+        raise InvariantError("only a blocked task can be unblocked")
+    _require_monotonic_task_time(task, now)
+
+    candidate = copy.deepcopy(state)
+    task = candidate["tasks"][task_id]
+    task["status"] = "pending"
+    task["available_at"] = now
+    task["claim"] = None
+    task["updated_at"] = now
+    append_event(
+        candidate, "task.unblocked", "operator", task_id, {}, now
+    )
+    return _commit_transition(state, candidate, task_id)
+
+
+def cancel_task(state, task_id, now=None):
+    """Administratively cancel a non-active, non-completed task."""
+    validate_state(state)
+    now = _canonical_now(now)
+    task = _require_task(state, task_id)
+    if task["status"] not in {"pending", "blocked", "failed"}:
+        raise InvariantError(
+            f"cannot cancel task with status {task['status']}"
+        )
+    _require_monotonic_task_time(task, now)
+
+    candidate = copy.deepcopy(state)
+    task = candidate["tasks"][task_id]
+    task["status"] = "cancelled"
+    task["available_at"] = None
+    task["claim"] = None
+    task["updated_at"] = now
+    append_event(
+        candidate, "task.cancelled", "operator", task_id, {}, now
+    )
+    return _commit_transition(state, candidate, task_id)
 
 
 def status_rows(
