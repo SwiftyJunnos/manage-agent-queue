@@ -5,9 +5,10 @@ import copy
 import json
 import os
 import re
+import secrets
 import tempfile
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -55,6 +56,22 @@ TASK_CREATION_FIELDS = {
     "resources",
     "labels",
     "max_attempts",
+}
+CLAIM_FIELDS = {
+    "agent_id",
+    "lease_token",
+    "claimed_at",
+    "heartbeat_at",
+    "expires_at",
+}
+EVENT_FIELDS = {
+    "seq",
+    "at",
+    "type",
+    "actor",
+    "task_id",
+    "revision",
+    "details",
 }
 TSV_COLUMNS = (
     "id",
@@ -263,6 +280,10 @@ class InvariantError(QueueError):
     exit_code = 6
 
 
+class NoTaskAvailable(QueueError):
+    exit_code = 3
+
+
 def utc_now():
     """Return the current UTC time with second precision."""
     return (
@@ -439,6 +460,23 @@ def _is_valid_timestamp(value):
     except InvariantError:
         return False
     return True
+
+
+def add_seconds(timestamp, seconds):
+    """Add a positive number of seconds to a canonical UTC timestamp."""
+    _validate_timestamp(timestamp, "timestamp")
+    if (
+        not isinstance(seconds, int)
+        or isinstance(seconds, bool)
+        or seconds <= 0
+    ):
+        raise InvariantError("seconds must be a positive integer")
+    value = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+    try:
+        result = value + timedelta(seconds=seconds)
+    except OverflowError as error:
+        raise InvariantError("timestamp addition exceeds supported range") from error
+    return result.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _deduplicated_string_list(raw, field):
@@ -654,12 +692,32 @@ def validate_task(task, expected_id=None):
             if json_error is not None:
                 raise InvariantError(f"task {field} {json_error}")
     claim = task["claim"]
-    if claim is not None and "agent_id" in claim:
-        agent_id = claim["agent_id"]
-        if not isinstance(agent_id, str) or not agent_id.strip():
-            raise InvariantError("task claim.agent_id must be a non-blank string")
-    if claim is not None and "expires_at" in claim:
-        _validate_timestamp(claim["expires_at"], "task claim.expires_at")
+    if task["status"] == "leased":
+        if claim is None:
+            raise InvariantError("leased task claim must be an object")
+        missing_claim_fields = sorted(CLAIM_FIELDS.difference(claim))
+        extra_claim_fields = sorted(set(claim).difference(CLAIM_FIELDS))
+        if missing_claim_fields or extra_claim_fields:
+            raise InvariantError("task claim keys must match the lease schema")
+        for field in ("agent_id", "lease_token"):
+            if not isinstance(claim[field], str) or not claim[field].strip():
+                raise InvariantError(
+                    f"task claim.{field} must be a non-blank string"
+                )
+        for field in ("claimed_at", "heartbeat_at", "expires_at"):
+            _validate_timestamp(claim[field], f"task claim.{field}")
+        if claim["claimed_at"] > claim["heartbeat_at"]:
+            raise InvariantError(
+                "task claim.claimed_at must not follow heartbeat_at"
+            )
+        if claim["heartbeat_at"] >= claim["expires_at"]:
+            raise InvariantError(
+                "task claim.heartbeat_at must precede expires_at"
+            )
+        if attempts < 1:
+            raise InvariantError("leased task attempts must be at least 1")
+    elif claim is not None:
+        raise InvariantError("non-leased task claim must be null")
     _validate_timestamp(task["created_at"], "task created_at")
     _validate_timestamp(task["updated_at"], "task updated_at")
     if task["updated_at"] < task["created_at"]:
@@ -887,7 +945,127 @@ def validate_state(state):
         )
     validate_graph(state["tasks"])
 
+    previous_event_sequence = 0
+    previous_event_revision = 0
+    for index, event in enumerate(state["events"]):
+        if not isinstance(event, dict):
+            raise InvariantError(f"events[{index}] must be an object")
+        if set(event) != EVENT_FIELDS:
+            raise InvariantError(f"events[{index}] fields must match event schema")
+        sequence = event["seq"]
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence <= previous_event_sequence
+            or sequence >= state["next_event_sequence"]
+        ):
+            raise InvariantError(
+                f"events[{index}].seq must increase below next_event_sequence"
+            )
+        previous_event_sequence = sequence
+        _validate_timestamp(event["at"], f"events[{index}].at")
+        for field in ("type", "actor"):
+            if (
+                not isinstance(event[field], str)
+                or not event[field].strip()
+            ):
+                raise InvariantError(
+                    f"events[{index}].{field} must be a non-blank string"
+                )
+        task_id = event["task_id"]
+        if task_id is not None:
+            if not isinstance(task_id, str) or not task_id.strip():
+                raise InvariantError(
+                    f"events[{index}].task_id must be a non-blank string or null"
+                )
+            if task_id not in state["tasks"]:
+                raise InvariantError(
+                    f"events[{index}].task_id must reference a stored task"
+                )
+        revision = event["revision"]
+        if (
+            not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision <= 0
+            or revision < previous_event_revision
+            or revision > state["revision"] + 1
+        ):
+            raise InvariantError(
+                f"events[{index}].revision must be nondecreasing between 1 "
+                "and state revision plus 1"
+            )
+        previous_event_revision = revision
+        details = event["details"]
+        if not isinstance(details, dict):
+            raise InvariantError(f"events[{index}].details must be an object")
+        json_error = _json_validation_error(details)
+        if json_error is not None:
+            raise InvariantError(f"events[{index}].details {json_error}")
+        if _contains_event_lease_token(details):
+            raise InvariantError(
+                f"events[{index}].details must not contain lease_token"
+            )
+
     return state
+
+
+def _sanitize_event_details(value):
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_event_details(child)
+            for key, child in value.items()
+            if key != "lease_token"
+        }
+    if isinstance(value, list):
+        return [_sanitize_event_details(child) for child in value]
+    return value
+
+
+def _contains_event_lease_token(value):
+    if isinstance(value, dict):
+        return "lease_token" in value or any(
+            _contains_event_lease_token(child) for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(_contains_event_lease_token(child) for child in value)
+    return False
+
+
+def append_event(state, event_type, actor, task_id, details, now):
+    """Atomically append one canonical, secret-free queue event."""
+    validate_state(state)
+    for value, field in ((event_type, "event_type"), (actor, "actor")):
+        if not isinstance(value, str) or not value.strip():
+            raise InvariantError(f"{field} must be a non-blank string")
+    _validate_timestamp(now, "now")
+    if task_id is not None:
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise InvariantError("task_id must be a non-blank string or null")
+        if task_id not in state["tasks"]:
+            raise InvariantError("task_id must reference a stored task")
+    if not isinstance(details, dict):
+        raise InvariantError("event details must be an object")
+    json_error = _json_validation_error(details)
+    if json_error is not None:
+        raise InvariantError(f"event details {json_error}")
+
+    candidate = copy.deepcopy(state)
+    sequence = candidate["next_event_sequence"]
+    event = {
+        "seq": sequence,
+        "at": now,
+        "type": event_type,
+        "actor": actor,
+        "task_id": task_id,
+        "revision": candidate["revision"] + 1,
+        "details": _sanitize_event_details(copy.deepcopy(details)),
+    }
+    candidate["next_event_sequence"] += 1
+    candidate["events"].append(event)
+    validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+    return copy.deepcopy(event)
 
 
 def atomic_write_text(path, text):
@@ -973,7 +1151,15 @@ def _resource_conflicts(task, active_resources):
     )
 
 
-def _derive_state_with_resources(state, task, now, active_resources):
+def _has_resource_conflict(task, active_resources):
+    return any(
+        active_resources.get(resource) for resource in task["resources"]
+    )
+
+
+def _derive_state_with_resources(
+    state, task, now, active_resources, resource_conflict_probe=None
+):
     if task["status"] != "pending":
         return task["status"]
 
@@ -990,7 +1176,9 @@ def _derive_state_with_resources(state, task, now, active_resources):
         return "waiting_dependency"
     if task["available_at"] is not None and task["available_at"] > now:
         return "waiting_retry"
-    if _resource_conflicts(task, active_resources):
+    if resource_conflict_probe is None:
+        resource_conflict_probe = _resource_conflicts
+    if resource_conflict_probe(task, active_resources):
         return "resource_conflict"
     return "ready"
 
@@ -999,6 +1187,105 @@ def derive_state(state, task, now):
     """Derive the display state for a task using fixed readiness precedence."""
     active_resources = leased_resources(state, now=now)
     return _derive_state_with_resources(state, task, now, active_resources)
+
+
+def claim_task(
+    state,
+    agent_id,
+    now=None,
+    role=None,
+    labels=None,
+    lease_seconds=None,
+):
+    """Claim the highest-priority eligible task with an in-memory lease."""
+    validate_state(state)
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        raise InvariantError("agent_id must be a non-blank string")
+    now = utc_now() if now is None else now
+    _validate_timestamp(now, "now")
+    if role is not None and (
+        not isinstance(role, str) or not role.strip()
+    ):
+        raise InvariantError("role must be a non-blank string or null")
+    if labels is None:
+        required_labels = set()
+    elif isinstance(labels, (list, set)):
+        if any(not isinstance(label, str) for label in labels):
+            raise InvariantError("labels values must be strings")
+        required_labels = set(labels)
+    else:
+        raise InvariantError("labels must be a list or set")
+    if lease_seconds is None:
+        lease_seconds = state["config"]["default_lease_seconds"]
+    if (
+        not isinstance(lease_seconds, int)
+        or isinstance(lease_seconds, bool)
+        or lease_seconds <= 0
+    ):
+        raise InvariantError("lease_seconds must be a positive integer")
+
+    active_resources = leased_resources(state, now=now)
+    eligible = []
+    for task in state["tasks"].values():
+        if role is not None and task["role"] != role:
+            continue
+        if not required_labels.issubset(task["labels"]):
+            continue
+        if task["attempts"] >= task["max_attempts"]:
+            continue
+        if (
+            _derive_state_with_resources(
+                state,
+                task,
+                now,
+                active_resources,
+                resource_conflict_probe=_has_resource_conflict,
+            )
+            != "ready"
+        ):
+            continue
+        eligible.append(task)
+    if not eligible:
+        raise NoTaskAvailable("no task is available")
+
+    selected = min(
+        eligible,
+        key=lambda task: (-task["priority"], _task_id_sequence(task["id"])),
+    )
+    lease_token = secrets.token_urlsafe(32)
+    if not isinstance(lease_token, str) or not lease_token.strip():
+        raise InvariantError("generated lease_token must be a non-blank string")
+    expires_at = add_seconds(now, lease_seconds)
+
+    candidate = copy.deepcopy(state)
+    claimed = candidate["tasks"][selected["id"]]
+    claimed["attempts"] += 1
+    claimed["status"] = "leased"
+    claimed["available_at"] = None
+    claimed["claim"] = {
+        "agent_id": agent_id,
+        "lease_token": lease_token,
+        "claimed_at": now,
+        "heartbeat_at": now,
+        "expires_at": expires_at,
+    }
+    claimed["updated_at"] = now
+    append_event(
+        candidate,
+        "task.claimed",
+        agent_id,
+        claimed["id"],
+        {"lease_seconds": lease_seconds, "attempt": claimed["attempts"]},
+        now,
+    )
+    validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+    return {
+        "task": copy.deepcopy(state["tasks"][claimed["id"]]),
+        "lease_token": lease_token,
+        "expires_at": expires_at,
+    }
 
 
 def status_rows(

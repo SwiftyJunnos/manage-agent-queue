@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the manage-agent-queue CLI."""
 
+import copy
 import json
 import sys
 import tempfile
@@ -13,6 +14,22 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import agent_queue as aq
+
+
+def canonical_claim(
+    agent_id="agent-1",
+    lease_token="test-lease-token",
+    claimed_at="2026-07-10T05:00:00Z",
+    heartbeat_at="2026-07-10T05:00:00Z",
+    expires_at="2026-07-10T07:00:00Z",
+):
+    return {
+        "agent_id": agent_id,
+        "lease_token": lease_token,
+        "claimed_at": claimed_at,
+        "heartbeat_at": heartbeat_at,
+        "expires_at": expires_at,
+    }
 
 
 class QueueStateTests(unittest.TestCase):
@@ -661,11 +678,10 @@ class TaskGraphTests(unittest.TestCase):
         with self.assertRaisesRegex(aq.InvariantError, "task field names"):
             aq.validate_state(self.state)
 
-    def test_validate_state_accepts_structured_future_metadata(self):
+    def test_validate_state_accepts_structured_result_and_error_metadata(self):
         created = aq.add_task(self.state, {"title": "Stored"})
         task = self.state["tasks"][created["id"]]
         task["available_at"] = "2026-07-10T06:01:00Z"
-        task["claim"] = {"worker": "agent-1", "lease_seconds": 30}
         task["result"] = {"summary": "done", "artifacts": ["report.txt"]}
         task["last_error"] = {"message": "retry", "terminal": False}
 
@@ -723,6 +739,443 @@ class TaskGraphTests(unittest.TestCase):
             aq.validate_state(self.state)
 
 
+class ClaimTaskTests(unittest.TestCase):
+    CREATED = "2026-07-10T05:00:00Z"
+    NOW = "2026-07-10T06:00:00Z"
+
+    def setUp(self):
+        self.clock = mock.patch.object(aq, "utc_now", return_value=self.CREATED)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.state = aq.new_state("demo", aq.fixed_config())
+
+    def add(self, title, **fields):
+        created = aq.add_task(self.state, {"title": title, **fields})
+        return self.state["tasks"][created["id"]]
+
+    def test_no_task_available_has_exit_code_three(self):
+        self.assertTrue(issubclass(aq.NoTaskAvailable, aq.QueueError))
+        self.assertEqual(3, aq.NoTaskAvailable.exit_code)
+
+    def test_add_seconds_requires_canonical_time_and_positive_integer(self):
+        self.assertEqual(
+            "2026-07-10T06:15:00Z", aq.add_seconds(self.NOW, 900)
+        )
+        for timestamp, seconds in (
+            ("2026-07-10T06:00:00+00:00", 1),
+            ("9999-12-31T23:59:59Z", 1),
+            (self.NOW, 0),
+            (self.NOW, -1),
+            (self.NOW, True),
+            (self.NOW, 1.5),
+        ):
+            with self.subTest(timestamp=timestamp, seconds=seconds):
+                with self.assertRaises(aq.InvariantError):
+                    aq.add_seconds(timestamp, seconds)
+
+    def test_claim_sorts_by_priority_then_creation_sequence(self):
+        self.add("Low", priority=1)
+        first_high = self.add("First high", priority=9)
+        second_high = self.add("Second high", priority=9)
+
+        first = aq.claim_task(self.state, "agent-1", now=self.NOW)
+        second = aq.claim_task(self.state, "agent-2", now=self.NOW)
+
+        self.assertEqual(first_high["id"], first["task"]["id"])
+        self.assertEqual(second_high["id"], second["task"]["id"])
+
+    def test_claim_applies_dependency_retry_attempt_role_and_label_filters(self):
+        dependency = self.add("Dependency")
+        self.add("Blocked", priority=100, depends_on=[dependency["id"]])
+        retry = self.add("Retry", priority=90)
+        retry["available_at"] = "2026-07-10T06:00:01Z"
+        exhausted = self.add("Exhausted", priority=80, max_attempts=1)
+        exhausted["attempts"] = 1
+        self.add(
+            "Wrong role",
+            priority=70,
+            role="builder",
+            labels=["python", "queue"],
+        )
+        target = self.add(
+            "Target",
+            priority=1,
+            role="reviewer",
+            labels=["python", "queue", "safe"],
+        )
+
+        result = aq.claim_task(
+            self.state,
+            "agent-1",
+            now=self.NOW,
+            role="reviewer",
+            labels={"queue", "python"},
+        )
+
+        self.assertEqual(target["id"], result["task"]["id"])
+
+    def test_resource_conflict_skips_higher_priority_for_disjoint_task(self):
+        holder = self.add("Holder", priority=100, resources=["repo"])
+        aq.claim_task(self.state, "holder", now=self.NOW)
+        conflicting = self.add("Conflict", priority=90, resources=["repo"])
+        disjoint = self.add("Disjoint", priority=10, resources=["db"])
+
+        result = aq.claim_task(self.state, "worker", now=self.NOW)
+
+        self.assertEqual(disjoint["id"], result["task"]["id"])
+        self.assertEqual(
+            "pending", self.state["tasks"][conflicting["id"]]["status"]
+        )
+        self.assertEqual("leased", self.state["tasks"][holder["id"]]["status"])
+        with self.assertRaises(aq.NoTaskAvailable):
+            aq.claim_task(self.state, "worker-2", now=self.NOW)
+
+    def test_claim_eligibility_uses_boolean_resource_conflict_probe(self):
+        self.add("Holder", priority=100, resources=["repo"])
+        aq.claim_task(self.state, "holder", now=self.NOW)
+        for number in range(20):
+            self.add(
+                f"Conflict {number}",
+                priority=100 - number,
+                resources=["repo"],
+            )
+        target = self.add("Disjoint", priority=1, resources=["db"])
+
+        with mock.patch.object(
+            aq,
+            "_resource_conflicts",
+            side_effect=AssertionError("full blocker lists built during claim"),
+        ) as blocker_lists:
+            result = aq.claim_task(self.state, "worker", now=self.NOW)
+
+        self.assertEqual(target["id"], result["task"]["id"])
+        blocker_lists.assert_not_called()
+
+    def test_claim_has_exact_transition_detached_result_and_sanitized_event(self):
+        task = self.add("Claim me")
+        before_revision = self.state["revision"]
+
+        with mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value="TOP-SECRET-TOKEN"
+        ):
+            result = aq.claim_task(
+                self.state,
+                "agent-1",
+                now=self.NOW,
+                lease_seconds=30,
+            )
+
+        stored = self.state["tasks"][task["id"]]
+        self.assertEqual(1, stored["attempts"])
+        self.assertEqual("leased", stored["status"])
+        self.assertIsNone(stored["available_at"])
+        self.assertEqual(self.NOW, stored["updated_at"])
+        self.assertEqual(
+            {
+                "agent_id": "agent-1",
+                "lease_token": "TOP-SECRET-TOKEN",
+                "claimed_at": self.NOW,
+                "heartbeat_at": self.NOW,
+                "expires_at": "2026-07-10T06:00:30Z",
+            },
+            stored["claim"],
+        )
+        self.assertEqual("TOP-SECRET-TOKEN", result["lease_token"])
+        self.assertEqual(stored["claim"]["expires_at"], result["expires_at"])
+        self.assertEqual(stored, result["task"])
+        self.assertIsNot(stored, result["task"])
+        result["task"]["title"] = "mutated"
+        self.assertEqual("Claim me", stored["title"])
+        self.assertEqual(before_revision, self.state["revision"])
+        self.assertEqual(2, self.state["next_event_sequence"])
+        self.assertEqual(
+            {
+                "seq": 1,
+                "at": self.NOW,
+                "type": "task.claimed",
+                "actor": "agent-1",
+                "task_id": task["id"],
+                "revision": before_revision + 1,
+                "details": {"lease_seconds": 30, "attempt": 1},
+            },
+            self.state["events"][0],
+        )
+        status = aq.status_rows(self.state, self.NOW)
+        rendered = aq.render_tsv(self.state, self.NOW)
+        for projection in (repr(self.state["events"]), repr(status), rendered):
+            self.assertNotIn("TOP-SECRET-TOKEN", projection)
+            self.assertNotIn("lease_token", projection)
+
+    def test_append_event_deep_copies_and_recursively_removes_lease_tokens(self):
+        task = self.add("Stored")
+        details = {
+            "attempt": 1,
+            "lease_token": "outer-secret",
+            "nested": [{"lease_token": "inner-secret", "safe": True}],
+        }
+
+        event = aq.append_event(
+            self.state,
+            "task.claimed",
+            "agent-1",
+            task["id"],
+            details,
+            self.NOW,
+        )
+        details["nested"][0]["safe"] = False
+
+        self.assertEqual(
+            {"attempt": 1, "nested": [{"safe": True}]}, event["details"]
+        )
+        self.assertNotIn("secret", repr(self.state["events"]))
+
+        before = json.dumps(self.state, sort_keys=True)
+        with self.assertRaisesRegex(aq.InvariantError, "task_id"):
+            aq.append_event(
+                self.state,
+                "task.claimed",
+                "agent-1",
+                [],
+                {},
+                self.NOW,
+            )
+        self.assertEqual(before, json.dumps(self.state, sort_keys=True))
+
+    def test_invalid_claim_inputs_are_atomic(self):
+        self.add("Ready", role="reviewer", labels=["queue"])
+        cases = (
+            ({"agent_id": ""}, "agent_id"),
+            ({"agent_id": "   "}, "agent_id"),
+            ({"agent_id": 7}, "agent_id"),
+            ({"agent_id": "agent", "role": ""}, "role"),
+            ({"agent_id": "agent", "role": 7}, "role"),
+            ({"agent_id": "agent", "labels": "queue"}, "labels"),
+            ({"agent_id": "agent", "labels": [1]}, "labels"),
+            ({"agent_id": "agent", "lease_seconds": 0}, "lease_seconds"),
+            ({"agent_id": "agent", "lease_seconds": True}, "lease_seconds"),
+            ({"agent_id": "agent", "now": "tomorrow"}, "now"),
+        )
+        for kwargs, message in cases:
+            with self.subTest(kwargs=kwargs):
+                before = json.dumps(self.state, sort_keys=True)
+                with self.assertRaisesRegex(aq.InvariantError, message):
+                    aq.claim_task(self.state, **kwargs)
+                self.assertEqual(before, json.dumps(self.state, sort_keys=True))
+
+    def test_no_candidate_is_exit_three_and_byte_identical(self):
+        task = self.add("Future")
+        task["available_at"] = "2026-07-10T06:00:01Z"
+        before = json.dumps(self.state, sort_keys=True)
+
+        with self.assertRaises(aq.NoTaskAvailable) as raised:
+            aq.claim_task(self.state, "agent-1", now=self.NOW)
+
+        self.assertEqual(3, raised.exception.exit_code)
+        self.assertEqual(before, json.dumps(self.state, sort_keys=True))
+
+    def test_validate_state_rejects_malformed_claim_contracts(self):
+        task = self.add("Stored")
+        valid = canonical_claim()
+        cases = (
+            ("leased without claim", "leased", 1, None, "claim"),
+            ("pending with claim", "pending", 1, valid, "claim"),
+            ("leased zero attempts", "leased", 0, valid, "attempts"),
+            (
+                "claim keys",
+                "leased",
+                1,
+                {**valid, "extra": True},
+                "claim.*keys",
+            ),
+            (
+                "token type",
+                "leased",
+                1,
+                {**valid, "lease_token": 7},
+                "lease_token",
+            ),
+            (
+                "blank token",
+                "leased",
+                1,
+                {**valid, "lease_token": ""},
+                "lease_token",
+            ),
+            (
+                "heartbeat precedes claim",
+                "leased",
+                1,
+                {**valid, "claimed_at": "2026-07-10T05:01:00Z"},
+                "claimed_at.*heartbeat_at",
+            ),
+            (
+                "heartbeat equals expiry",
+                "leased",
+                1,
+                {**valid, "heartbeat_at": valid["expires_at"]},
+                "heartbeat_at.*expires_at",
+            ),
+        )
+        for name, status, attempts, claim, message in cases:
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(self.state)
+                stored = candidate["tasks"][task["id"]]
+                stored.update(
+                    {"status": status, "attempts": attempts, "claim": claim}
+                )
+                with self.assertRaisesRegex(aq.InvariantError, message):
+                    aq.validate_state(candidate)
+
+    def test_validate_state_rejects_invalid_events_and_counters(self):
+        self.add("Ready")
+        aq.claim_task(self.state, "agent-1", now=self.NOW)
+        mutations = (
+            (lambda state: state["events"][0].pop("actor"), "event.*fields"),
+            (lambda state: state["events"][0].update({"seq": True}), "event.*seq"),
+            (lambda state: state["events"][0].update({"at": "now"}), "event.*at"),
+            (
+                lambda state: state["events"][0].update({"task_id": "T-999999"}),
+                "event.*task_id",
+            ),
+            (
+                lambda state: state["events"][0].update({"revision": 0}),
+                "event.*revision",
+            ),
+            (
+                lambda state: state["events"][0].update(
+                    {"details": {"score": float("nan")}}
+                ),
+                "event.*details",
+            ),
+            (
+                lambda state: state["events"][0].update(
+                    {"details": {"lease_token": "persisted-secret"}}
+                ),
+                "event.*details",
+            ),
+            (
+                lambda state: state.update({"next_event_sequence": 1}),
+                "next_event_sequence",
+            ),
+        )
+        for mutate, message in mutations:
+            with self.subTest(message=message):
+                candidate = copy.deepcopy(self.state)
+                mutate(candidate)
+                with self.assertRaisesRegex(aq.InvariantError, message):
+                    aq.validate_state(candidate)
+
+        unordered = copy.deepcopy(self.state)
+        unordered["events"].append(
+            {**copy.deepcopy(unordered["events"][0]), "seq": 1}
+        )
+        unordered["next_event_sequence"] = 3
+        with self.assertRaisesRegex(aq.InvariantError, "event.*seq"):
+            aq.validate_state(unordered)
+
+    def test_validate_state_bounds_and_orders_event_revisions(self):
+        first = self.add("First")
+        second = self.add("Second")
+        third = self.add("Third")
+        aq.append_event(
+            self.state,
+            "task.claimed",
+            "agent-1",
+            first["id"],
+            {"attempt": 1},
+            self.NOW,
+        )
+        self.state["revision"] = 1
+        aq.append_event(
+            self.state,
+            "task.claimed",
+            "agent-2",
+            second["id"],
+            {"attempt": 1},
+            self.NOW,
+        )
+        aq.append_event(
+            self.state,
+            "task.claimed",
+            "agent-3",
+            third["id"],
+            {"attempt": 1},
+            self.NOW,
+        )
+        self.assertEqual(
+            [1, 2, 2],
+            [event["revision"] for event in self.state["events"]],
+        )
+
+        too_new = copy.deepcopy(self.state)
+        too_new["events"][2]["revision"] = too_new["revision"] + 2
+        with self.assertRaisesRegex(aq.InvariantError, "event.*revision"):
+            aq.validate_state(too_new)
+
+        descending = copy.deepcopy(self.state)
+        descending["events"][0]["revision"] = 2
+        descending["events"][1]["revision"] = 1
+        with self.assertRaisesRegex(aq.InvariantError, "event.*revision"):
+            aq.validate_state(descending)
+
+        self.assertIs(self.state, aq.validate_state(self.state))
+
+    def test_expired_lease_does_not_block_but_owner_remains_leased(self):
+        owner = self.add("Expired owner", resources=["repo"])
+        owner.update(
+            {
+                "status": "leased",
+                "attempts": 1,
+                "claim": canonical_claim(
+                    claimed_at="2026-07-10T04:00:00Z",
+                    heartbeat_at="2026-07-10T05:00:00Z",
+                    expires_at="2026-07-10T05:59:59Z",
+                ),
+            }
+        )
+        contender = self.add("Contender", resources=["repo"])
+
+        result = aq.claim_task(self.state, "agent-2", now=self.NOW)
+
+        self.assertEqual(contender["id"], result["task"]["id"])
+        self.assertEqual(
+            "leased", self.state["tasks"][owner["id"]]["status"]
+        )
+
+    def test_sequential_claims_do_not_double_lease_task_or_resource(self):
+        first = self.add("First", priority=10, resources=["repo"])
+        conflict = self.add("Conflict", priority=9, resources=["repo"])
+        second = self.add("Second", priority=1, resources=["db"])
+
+        first_result = aq.claim_task(self.state, "agent-1", now=self.NOW)
+        second_result = aq.claim_task(self.state, "agent-2", now=self.NOW)
+
+        self.assertEqual(first["id"], first_result["task"]["id"])
+        self.assertEqual(second["id"], second_result["task"]["id"])
+        self.assertNotEqual(
+            first_result["task"]["id"], second_result["task"]["id"]
+        )
+        self.assertEqual(
+            "pending", self.state["tasks"][conflict["id"]]["status"]
+        )
+
+    def test_mocked_token_never_leaks_to_event_status_or_tsv(self):
+        self.add("Ready")
+        with mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value="MOCKED-SECRET"
+        ):
+            result = aq.claim_task(self.state, "agent-1", now=self.NOW)
+
+        self.assertEqual("MOCKED-SECRET", result["lease_token"])
+        public = (
+            repr(self.state["events"])
+            + repr(aq.status_rows(self.state, self.NOW))
+            + aq.render_tsv(self.state, self.NOW)
+        )
+        self.assertNotIn("MOCKED-SECRET", public)
+        self.assertNotIn("lease_token", public)
+
+
 class StatusProjectionTests(unittest.TestCase):
     NOW = "2026-07-10T06:00:00Z"
 
@@ -747,6 +1200,8 @@ class StatusProjectionTests(unittest.TestCase):
         completed["status"] = "completed"
         third = self.add("Third")
         third["status"] = "leased"
+        third["attempts"] = 1
+        third["claim"] = canonical_claim()
         task = self.add(
             "Waiting",
             depends_on=[third["id"], completed["id"], first["id"]],
@@ -765,6 +1220,8 @@ class StatusProjectionTests(unittest.TestCase):
         failed["status"] = "failed"
         leased = self.add("Lease holder", resources=["repo"])
         leased["status"] = "leased"
+        leased["attempts"] = 1
+        leased["claim"] = canonical_claim()
         task = self.add(
             "Blocked",
             depends_on=[failed["id"]],
@@ -795,9 +1252,16 @@ class StatusProjectionTests(unittest.TestCase):
     def test_resource_conflict_lists_active_leases_and_excludes_self(self):
         first = self.add("First lease", resources=["repo", "db"])
         first["status"] = "leased"
+        first["attempts"] = 1
+        first["claim"] = canonical_claim()
         second = self.add("Second lease", resources=["repo"])
         second["status"] = "leased"
-        second["claim"] = {"expires_at": "2026-07-10T05:59:59Z"}
+        second["attempts"] = 1
+        second["claim"] = canonical_claim(
+            claimed_at="2026-07-10T04:00:00Z",
+            heartbeat_at="2026-07-10T05:00:00Z",
+            expires_at="2026-07-10T05:59:59Z",
+        )
         task = self.add("Contender", resources=["repo"])
 
         self.assertEqual(
@@ -831,6 +1295,9 @@ class StatusProjectionTests(unittest.TestCase):
             with self.subTest(status=status):
                 task = self.add(status)
                 task["status"] = status
+                if status == "leased":
+                    task["attempts"] = 1
+                    task["claim"] = canonical_claim()
                 task["available_at"] = "2026-07-10T07:00:00Z"
                 self.assertEqual(
                     status, aq.derive_state(self.state, task, self.NOW)
@@ -849,6 +1316,8 @@ class StatusProjectionTests(unittest.TestCase):
     def test_status_rows_builds_active_lease_resource_map_once(self):
         holder = self.add("Holder", resources=["repo"])
         holder["status"] = "leased"
+        holder["attempts"] = 1
+        holder["claim"] = canonical_claim()
         contenders = [
             self.add(f"Contender {number}", resources=["repo"])
             for number in range(5)
@@ -894,7 +1363,9 @@ class StatusProjectionTests(unittest.TestCase):
             role="reviewer",
             labels=["queue", "python", "safe"],
         )
-        target["claim"] = {"agent_id": "agent-7"}
+        target["status"] = "leased"
+        target["attempts"] = 1
+        target["claim"] = canonical_claim(agent_id="agent-7")
         other = self.add(
             "Other",
             workflow_id="W-000004",
@@ -909,8 +1380,7 @@ class StatusProjectionTests(unittest.TestCase):
             {"assignee": "agent-7"},
             {"role": "reviewer"},
             {"labels": ["queue", "python"]},
-            {"state_filter": "ready"},
-            {"state_filter": "pending", "assignee": "agent-7"},
+            {"state_filter": "leased"},
         )
         for selected_filter in filters:
             with self.subTest(selected_filter=selected_filter):
@@ -927,10 +1397,8 @@ class StatusProjectionTests(unittest.TestCase):
     def test_tsv_has_exact_header_values_and_one_physical_line_per_task(self):
         dependency = self.add("Dependency", resources=["file:dep"])
         dependency["status"] = "leased"
-        dependency["claim"] = {
-            "agent_id": "dep-agent",
-            "expires_at": "2026-07-10T07:00:00Z",
-        }
+        dependency["attempts"] = 1
+        dependency["claim"] = canonical_claim(agent_id="dep-agent")
         task = self.add(
             "Back\\slash\tLine\r\nNext",
             workflow_id="W-000003",
@@ -941,19 +1409,15 @@ class StatusProjectionTests(unittest.TestCase):
             max_attempts=5,
         )
         task["attempts"] = 2
-        task["claim"] = {
-            "agent_id": "agent-owner",
-            "expires_at": "2026-07-10T08:00:00Z",
-        }
         self.state["revision"] = 9
         expected = (
             "# queue_revision: 9\n"
             "id\tworkflow\trole\tstate\tpriority\tassignee\tlease_until\t"
             "attempts\tdepends_on\tblocked_by\tresources\ttitle\n"
             "T-000001\t\t\tleased\t0\tdep-agent\t2026-07-10T07:00:00Z\t"
-            "0/3\t\t\tfile:dep\tDependency\n"
-            "T-000002\tW-000003\treview\twaiting_dependency\t4\tagent-owner\t"
-            "2026-07-10T08:00:00Z\t2/5\tT-000001\tT-000001\tfile:code\t"
+            "1/3\t\t\tfile:dep\tDependency\n"
+            "T-000002\tW-000003\treview\twaiting_dependency\t4\t\t"
+            "\t2/5\tT-000001\tT-000001\tfile:code\t"
             "Back\\\\slash\\tLine\\r\\nNext\n"
         )
 
@@ -968,11 +1432,9 @@ class StatusProjectionTests(unittest.TestCase):
 
     def test_status_projection_redacts_tokens_results_and_errors(self):
         task = self.add("Secret-bearing task")
-        task["claim"] = {
-            "agent_id": "agent-1",
-            "expires_at": "2026-07-10T07:00:00Z",
-            "lease_token": "TOP-SECRET-TOKEN",
-        }
+        task["status"] = "leased"
+        task["attempts"] = 1
+        task["claim"] = canonical_claim(lease_token="TOP-SECRET-TOKEN")
         task["result"] = {"arbitrary_result": "RESULT-SECRET"}
         task["last_error"] = {"arbitrary_error": "ERROR-SECRET"}
 
@@ -1251,10 +1713,10 @@ class StatusProjectionTests(unittest.TestCase):
         task = self.add("Stored")
         cases = (
             ("available_at", "2026-07-10T06:00:00+00:00", "available_at"),
-            ("claim", {"agent_id": ""}, "agent_id"),
-            ("claim", {"agent_id": 7}, "agent_id"),
-            ("claim", {"expires_at": "tomorrow"}, "expires_at"),
-            ("claim", {"expires_at": None}, "expires_at"),
+            ("claim", {"agent_id": ""}, "claim"),
+            ("claim", {"agent_id": 7}, "claim"),
+            ("claim", {"expires_at": "tomorrow"}, "claim"),
+            ("claim", {"expires_at": None}, "claim"),
         )
 
         for field, value, message in cases:
