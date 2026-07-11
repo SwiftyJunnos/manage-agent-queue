@@ -1,15 +1,41 @@
 #!/usr/bin/env python3
 """Manage a shared local queue for cooperating agents."""
 
+import argparse
 import copy
+import errno
 import json
 import os
+import random
 import re
 import secrets
+import shutil
+import socket
+import stat
+import sys
 import tempfile
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised by isolated import test
+    _fcntl = None
+
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - unavailable on POSIX
+    _msvcrt = None
+
+
+if _fcntl is not None:
+    LOCK_BACKEND = "fcntl"
+elif _msvcrt is not None:
+    LOCK_BACKEND = "msvcrt"
+else:
+    LOCK_BACKEND = None
 
 
 SCHEMA_VERSION = 1
@@ -23,6 +49,16 @@ STORED_STATUSES = {
     "blocked",
     "cancelled",
 }
+DERIVED_STATUSES = {
+    "ready",
+    "waiting_dependency",
+    "dependency_failed",
+    "waiting_retry",
+    "resource_conflict",
+    "leased",
+}
+STATUS_FILTER_STATES = tuple(sorted(STORED_STATUSES | DERIVED_STATUSES))
+GUARD_MARKER = b"LQG1"
 TASK_ID_PATTERN = re.compile(r"T-(\d{6})", flags=re.ASCII)
 WORKFLOW_ID_PATTERN = re.compile(r"W-(\d{6})", flags=re.ASCII)
 TASK_FIELDS = {
@@ -286,6 +322,10 @@ class NoTaskAvailable(QueueError):
 
 class LeaseError(QueueError):
     exit_code = 5
+
+
+class LockTimeout(QueueError):
+    exit_code = 4
 
 
 def utc_now():
@@ -1077,6 +1117,14 @@ def validate_state(state):
     return state
 
 
+def validate_persisted_state(state):
+    """Reject candidate-only future event revisions at a disk boundary."""
+    validate_state(state)
+    if any(event["revision"] > state["revision"] for event in state["events"]):
+        raise InvariantError("persisted event has a future revision")
+    return state
+
+
 def _sanitize_event_details(value):
     if isinstance(value, dict):
         return {
@@ -1174,7 +1222,7 @@ def atomic_write_text(path, text):
 
 def write_json(path, state):
     """Validate and atomically write queue state as deterministic JSON."""
-    validate_state(state)
+    validate_persisted_state(state)
     try:
         text = json.dumps(
             state,
@@ -1334,9 +1382,10 @@ def claim_task(
         eligible,
         key=lambda task: (-task["priority"], _task_id_sequence(task["id"])),
     )
-    lease_token = secrets.token_urlsafe(32)
-    if not isinstance(lease_token, str) or not lease_token.strip():
+    random_token = secrets.token_urlsafe(32)
+    if not isinstance(random_token, str) or not random_token.strip():
         raise InvariantError("generated lease_token must be a non-blank string")
+    lease_token = f"lq_{random_token}"
     expires_at = add_seconds(now, lease_seconds)
 
     candidate = copy.deepcopy(state)
@@ -2007,13 +2056,829 @@ def render_empty_tsv(revision):
     return f"# queue_revision: {revision}\n{header}\n"
 
 
-def initialize_queue(path, queue_id, config):
-    """Create a new JSON queue and its empty TSV projection."""
-    path = Path(path)
-    if path.exists():
-        raise QueueError(f"queue already exists: {path}")
+def resolve_queue_path(explicit=None, environ=None, cwd=None):
+    """Resolve the shared queue without invoking Git or another process."""
+    environment = os.environ if environ is None else environ
+    working_directory = Path.cwd() if cwd is None else Path(cwd)
+    if explicit is not None:
+        if not str(explicit).strip():
+            raise QueueError("--queue must not be blank")
+        selected = Path(explicit)
+    elif "AGENT_QUEUE_PATH" in environment:
+        value = environment["AGENT_QUEUE_PATH"]
+        if not isinstance(value, str) or not value.strip():
+            raise QueueError("AGENT_QUEUE_PATH must not be blank")
+        selected = Path(value)
+    else:
+        absolute_cwd = working_directory.expanduser().absolute()
+        root = next(
+            (parent for parent in (absolute_cwd, *absolute_cwd.parents)
+             if (parent / ".git").exists()),
+            absolute_cwd,
+        )
+        selected = root / ".agent-queue" / "queue.json"
+    return selected.expanduser().absolute()
 
-    state = new_state(queue_id, config)
-    write_json(path, state)
-    atomic_write_text(path.with_suffix(".tsv"), render_empty_tsv(state["revision"]))
+
+def _strict_json_constant(value):
+    raise ValueError(f"non-finite JSON constant {value}")
+
+
+def _read_json_text(text, source):
+    try:
+        return json.loads(text, parse_constant=_strict_json_constant)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise InvariantError(f"invalid JSON in {source}: {error}") from error
+
+
+def load_state(path):
+    """Load and fully validate a queue state from strict JSON."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise QueueError(f"queue does not exist: {path}") from error
+    except UnicodeError as error:
+        raise InvariantError(f"invalid UTF-8 in queue {path}: {error}") from error
+    except OSError as error:
+        raise QueueError(f"cannot read queue {path}: {error}") from error
+    state = _read_json_text(text, path)
+    try:
+        return validate_persisted_state(state)
+    except InvariantError as error:
+        raise InvariantError(f"invalid queue state: {error}") from error
+
+
+def tsv_revision(path):
+    """Return a TSV projection revision, or None for missing/malformed data."""
+    try:
+        first_line = Path(path).read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, IndexError, UnicodeError):
+        return None
+    match = re.fullmatch(r"# queue_revision: (0|[1-9]\d*)", first_line)
+    return int(match.group(1)) if match is not None else None
+
+
+def peek_lock_config(path):
+    """Read only safe lock timing hints from an otherwise untrusted file."""
+    defaults = fixed_config()
+    fallback = (
+        defaults["lock_timeout_seconds"], defaults["stale_lock_seconds"]
+    )
+    try:
+        source = _read_json_text(Path(path).read_text(encoding="utf-8"), path)
+        config = source["config"]
+        timeout = config["lock_timeout_seconds"]
+        stale = config["stale_lock_seconds"]
+    except (OSError, UnicodeError, KeyError, TypeError, InvariantError):
+        return fallback
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        for value in (timeout, stale)
+    ):
+        return fallback
+    return timeout, stale
+
+
+def _parse_lock_owner(path):
+    try:
+        raw = _read_json_text(Path(path).read_text(encoding="utf-8"), path)
+    except (OSError, UnicodeError, InvariantError):
+        return None
+    fields = {"token", "pid", "hostname", "acquired_at", "stale_after"}
+    if not isinstance(raw, dict) or set(raw) != fields:
+        return None
+    if (
+        not isinstance(raw["token"], str) or not raw["token"]
+        or not isinstance(raw["pid"], int) or isinstance(raw["pid"], bool)
+        or raw["pid"] <= 0
+        or not isinstance(raw["hostname"], str) or not raw["hostname"]
+    ):
+        return None
+    try:
+        _validate_timestamp(raw["acquired_at"], "acquired_at")
+        _validate_timestamp(raw["stale_after"], "stale_after")
+    except InvariantError:
+        return None
+    return raw
+
+
+class QueueLock:
+    """Same-host mutual exclusion using a kernel guard plus owner directory."""
+
+    def __init__(self, queue_path, lock_timeout=5, stale_seconds=30):
+        for value, name in ((lock_timeout, "lock_timeout"),
+                            (stale_seconds, "stale_seconds")):
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or value <= 0):
+                raise QueueError(f"{name} must be positive")
+        self.queue_path = Path(queue_path)
+        self.path = Path(str(self.queue_path) + ".lock")
+        self.guard_path = Path(str(self.queue_path) + ".lock.guard")
+        self.owner_path = self.path / "owner.json"
+        self.lock_timeout = lock_timeout
+        self.stale_seconds = stale_seconds
+        self.token = secrets.token_urlsafe(24)
+        self.acquired = False
+        self._guard_descriptor = None
+
+    def _open_guard(self):
+        flags = os.O_RDWR
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+
+        try:
+            descriptor = os.open(
+                self.guard_path, flags | os.O_CREAT | os.O_EXCL, 0o600
+            )
+        except FileExistsError:
+            return self._open_existing_guard(flags)
+        except OSError as error:
+            raise QueueError(f"cannot create queue lock guard: {error}") from error
+
+        created = os.fstat(descriptor)
+        try:
+            remaining = memoryview(GUARD_MARKER)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("short write initializing queue lock guard")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return descriptor
+        except Exception as error:
+            os.close(descriptor)
+            try:
+                current = os.lstat(self.guard_path)
+                if (current.st_dev, current.st_ino) == (
+                        created.st_dev, created.st_ino):
+                    self.guard_path.unlink()
+            except OSError:
+                pass
+            if isinstance(error, QueueError):
+                raise
+            raise QueueError(
+                f"cannot initialize queue lock guard: {error}"
+            ) from error
+
+    def _open_existing_guard(self, flags):
+        try:
+            before = os.lstat(self.guard_path)
+        except OSError as error:
+            raise QueueError(f"cannot inspect queue lock guard: {error}") from error
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise QueueError("queue lock guard must be a regular file")
+        try:
+            descriptor = os.open(self.guard_path, flags)
+        except OSError as error:
+            raise QueueError(f"cannot open queue lock guard: {error}") from error
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (before.st_dev, before.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise QueueError("queue lock guard changed while opening")
+            if opened.st_size != len(GUARD_MARKER):
+                raise QueueError(
+                    "queue lock guard has an invalid marker; manual repair required"
+                )
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            marker = b""
+            while len(marker) < len(GUARD_MARKER):
+                chunk = os.read(descriptor, len(GUARD_MARKER) - len(marker))
+                if not chunk:
+                    break
+                marker += chunk
+            if marker != GUARD_MARKER:
+                raise QueueError(
+                    "queue lock guard has an invalid marker; manual repair required"
+                )
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _try_guard_lock(self, descriptor):
+        try:
+            if LOCK_BACKEND == "fcntl":
+                _fcntl.flock(
+                    descriptor, _fcntl.LOCK_EX | _fcntl.LOCK_NB
+                )
+            elif LOCK_BACKEND == "msvcrt":
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                _msvcrt.locking(descriptor, _msvcrt.LK_NBLCK, 1)
+            else:
+                raise QueueError(
+                    "no supported local locking backend is available"
+                )
+            return True
+        except (BlockingIOError, PermissionError):
+            return False
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise QueueError(f"cannot lock queue guard: {error}") from error
+
+    def _unlock_guard(self, descriptor):
+        if LOCK_BACKEND == "fcntl":
+            _fcntl.flock(descriptor, _fcntl.LOCK_UN)
+        elif LOCK_BACKEND == "msvcrt":
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            _msvcrt.locking(descriptor, _msvcrt.LK_UNLCK, 1)
+
+    def _acquire_guard(self, deadline):
+        if LOCK_BACKEND is None:
+            raise QueueError(
+                "no supported local locking backend is available"
+            )
+        descriptor = self._open_guard()
+        try:
+            while not self._try_guard_lock(descriptor):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise LockTimeout(
+                        f"timed out waiting for queue lock: {self.path}"
+                    )
+                time.sleep(min(remaining, random.uniform(0.005, 0.02)))
+        except Exception:
+            os.close(descriptor)
+            raise
+        self._guard_descriptor = descriptor
+
+    def _release_guard(self):
+        descriptor = self._guard_descriptor
+        self._guard_descriptor = None
+        if descriptor is None:
+            return
+        try:
+            self._unlock_guard(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _lock_identity(self):
+        try:
+            directory = self.path.stat()
+        except FileNotFoundError:
+            return None
+        owner = _parse_lock_owner(self.owner_path)
+        try:
+            owner_stat = self.owner_path.stat()
+            owner_marker = (owner_stat.st_ino, owner_stat.st_size,
+                            owner_stat.st_mtime_ns)
+        except FileNotFoundError:
+            owner_marker = None
+        return (
+            directory.st_dev,
+            directory.st_ino,
+            owner["token"] if owner is not None else None,
+            owner_marker,
+        )
+
+    def _reclaimable(self):
+        identity = self._lock_identity()
+        if identity is None:
+            return None
+        owner = _parse_lock_owner(self.owner_path)
+        if owner is not None:
+            return identity if owner["stale_after"] <= utc_now() else None
+        try:
+            age = time.time() - self.path.stat().st_mtime
+        except FileNotFoundError:
+            return None
+        return identity if age > self.stale_seconds else None
+
+    def _reclaim(self, expected_identity):
+        owns_guard = self._guard_descriptor is not None
+        if not owns_guard:
+            self.queue_path.parent.mkdir(parents=True, exist_ok=True)
+            self._acquire_guard(time.monotonic() + self.lock_timeout)
+        try:
+            if self._lock_identity() != expected_identity:
+                return False
+            return self._rename_and_remove("orphan")
+        finally:
+            if not owns_guard:
+                self._release_guard()
+
+    def _rename_and_remove(self, kind):
+        orphan = self.path.with_name(
+            f".{self.path.name}.{kind}-{secrets.token_hex(12)}"
+        )
+        try:
+            os.replace(self.path, orphan)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        shutil.rmtree(orphan, ignore_errors=True)
+        return True
+
+    def __enter__(self):
+        self.queue_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.lock_timeout
+        self._acquire_guard(deadline)
+        try:
+            while True:
+                try:
+                    self.path.mkdir()
+                except FileExistsError:
+                    expected = self._reclaimable()
+                    if expected is not None:
+                        if self._lock_identity() == expected:
+                            self._rename_and_remove("orphan")
+                        continue
+                else:
+                    acquired_at = utc_now()
+                    owner = {
+                        "token": self.token,
+                        "pid": os.getpid(),
+                        "hostname": socket.gethostname(),
+                        "acquired_at": acquired_at,
+                        "stale_after": add_seconds(
+                            acquired_at, max(1, int(self.stale_seconds))
+                        ),
+                    }
+                    try:
+                        atomic_write_text(
+                            self.owner_path,
+                            json.dumps(owner, allow_nan=False, sort_keys=True) + "\n",
+                        )
+                    except Exception:
+                        try:
+                            self.path.rmdir()
+                        except OSError:
+                            pass
+                        raise
+                    self.acquired = True
+                    return self
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise LockTimeout(
+                        f"timed out waiting for queue lock: {self.path}"
+                    )
+                time.sleep(min(remaining, random.uniform(0.005, 0.02)))
+        except Exception:
+            self._release_guard()
+            raise
+
+    def __exit__(self, _error_type, _error, _traceback):
+        if not self.acquired:
+            self._release_guard()
+            return False
+        try:
+            owner = _parse_lock_owner(self.owner_path)
+            if (owner is None or not secrets.compare_digest(
+                    owner["token"], self.token)):
+                self.acquired = False
+                return False
+            self._rename_and_remove("release")
+        finally:
+            self.acquired = False
+            self._release_guard()
+        return False
+
+
+def _render_projection(state, now):
+    return render_tsv(state, now)
+
+
+def _repair_tsv(path, state, now, force=False):
+    tsv_path = Path(path).with_suffix(".tsv")
+    if force or tsv_revision(tsv_path) != state["revision"]:
+        atomic_write_text(tsv_path, _render_projection(state, now))
+
+
+def commit_state(path, state, now):
+    """Commit one revision, replacing canonical JSON before its TSV view."""
+    now = _canonical_now(now)
+    candidate = copy.deepcopy(state)
+    validate_state(candidate)
+    old_revision = candidate["revision"]
+    candidate["revision"] = old_revision + 1
+    candidate["updated_at"] = now
+    for event in candidate["events"]:
+        if event["revision"] == old_revision + 1:
+            event["revision"] = candidate["revision"]
+    validate_state(candidate)
+    write_json(path, candidate)
+    _repair_tsv(path, candidate, now, force=True)
+    return copy.deepcopy(candidate)
+
+
+def mutate_queue(
+    path,
+    callback,
+    now=None,
+    *,
+    auto_sweep=True,
+    user_input_errors=False,
+):
+    """Sweep and mutate one detached state under one queue transaction."""
+    path = Path(path)
+    requested_now = now
+    timeout, stale = peek_lock_config(path)
+    with QueueLock(path, timeout, stale):
+        now = _canonical_now(requested_now)
+        source = load_state(path)
+        candidate = copy.deepcopy(source)
+        if auto_sweep:
+            sweep_expired(candidate, now=now)
+        try:
+            result = callback(candidate)
+        except InvariantError as error:
+            if user_input_errors:
+                raise QueueError(str(error)) from error
+            raise
+        validate_state(candidate)
+        if candidate != source:
+            committed = commit_state(path, candidate, now)
+            candidate.clear()
+            candidate.update(committed)
+        else:
+            _repair_tsv(path, candidate, now)
+        return copy.deepcopy(result)
+
+
+def read_queue_snapshot(path):
+    """Return a consistent detached state without changing its revision."""
+    path = Path(path)
+    timeout, stale = peek_lock_config(path)
+    with QueueLock(path, timeout, stale):
+        return copy.deepcopy(load_state(path))
+
+
+def _status_transaction_details(path, now=None):
+    """Return state, clock, and the exact TSV projection produced under lock."""
+    path = Path(path)
+    requested_now = now
+    timeout, stale = peek_lock_config(path)
+    with QueueLock(path, timeout, stale):
+        now = _canonical_now(requested_now)
+        source = load_state(path)
+        candidate = copy.deepcopy(source)
+        sweep_expired(candidate, now=now)
+        if candidate != source:
+            candidate = commit_state(path, candidate, now)
+            projection = path.with_suffix(".tsv").read_text(encoding="utf-8")
+        else:
+            projection = _render_projection(candidate, now)
+            atomic_write_text(path.with_suffix(".tsv"), projection)
+        return copy.deepcopy(candidate), now, projection
+
+
+def status_transaction(path, now=None):
+    """Sweep under lock and always rewrite the canonical TSV projection."""
+    state, _now, _projection = _status_transaction_details(path, now)
     return state
+
+
+def initialize_queue(path, queue_id, config):
+    """Race-safely create a new JSON queue and its TSV projection."""
+    path = Path(path)
+    defaults = fixed_config()
+    with QueueLock(
+        path,
+        defaults["lock_timeout_seconds"],
+        defaults["stale_lock_seconds"],
+    ):
+        if path.exists():
+            raise QueueError(f"queue already exists: {path}")
+        state = new_state(queue_id, config)
+        write_json(path, state)
+        _repair_tsv(path, state, state["updated_at"], force=True)
+        return copy.deepcopy(state)
+
+
+def _safe_task(task):
+    safe = copy.deepcopy(task)
+    if isinstance(safe.get("claim"), dict):
+        safe["claim"].pop("lease_token", None)
+    return safe
+
+
+def _json_input(path):
+    try:
+        text = sys.stdin.read() if str(path) == "-" else Path(path).read_text(
+            encoding="utf-8"
+        )
+    except (OSError, UnicodeError) as error:
+        raise QueueError(f"cannot read JSON input {path}: {error}") from error
+    try:
+        return _read_json_text(text, path)
+    except InvariantError as error:
+        raise QueueError(str(error)) from error
+
+
+def _emit_json(value):
+    try:
+        print(json.dumps(value, allow_nan=False, sort_keys=True))
+    except (TypeError, ValueError) as error:
+        raise InvariantError(f"command result is not finite JSON: {error}") from error
+
+
+def _user_operation(callback):
+    """Map semantic errors in user-supplied operations to usage errors."""
+    try:
+        return callback()
+    except InvariantError as error:
+        raise QueueError(str(error)) from error
+
+
+def _positive(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _task_input_from_args(args):
+    if args.from_json is not None:
+        direct_values = (
+            args.title,
+            args.description,
+            args.role,
+            args.workflow,
+            args.priority,
+            args.depends_on,
+            args.resource,
+            args.label,
+            args.max_attempts,
+        )
+        if any(value not in (None, []) for value in direct_values):
+            raise QueueError("--from-json cannot be combined with task fields")
+        raw = _json_input(args.from_json)
+        if not isinstance(raw, dict):
+            raise QueueError("task JSON input must be an object")
+        return raw
+    if args.title is None:
+        raise QueueError("task add requires --title or --from-json")
+    raw = {"title": args.title}
+    mappings = {
+        "description": args.description,
+        "role": args.role,
+        "workflow_id": args.workflow,
+        "priority": args.priority,
+        "depends_on": args.depends_on,
+        "resources": args.resource,
+        "labels": args.label,
+        "max_attempts": args.max_attempts,
+    }
+    raw.update({key: value for key, value in mappings.items() if value is not None})
+    return raw
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--queue", help="queue.json path")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    init = commands.add_parser("init", help="initialize a queue")
+    init.add_argument("--id", required=True)
+    init.add_argument("--lease-seconds", type=_positive)
+    init.add_argument("--max-attempts", type=_positive)
+    init.add_argument("--retry-backoff", type=_positive)
+
+    task = commands.add_parser("task", help="manage tasks")
+    task_commands = task.add_subparsers(dest="task_command", required=True)
+    add = task_commands.add_parser("add", help="add one task")
+    add.add_argument("--title")
+    add.add_argument("--description")
+    add.add_argument("--role")
+    add.add_argument("--workflow")
+    add.add_argument("--priority", type=int)
+    add.add_argument("--depends-on", action="append")
+    add.add_argument("--resource", action="append")
+    add.add_argument("--label", action="append")
+    add.add_argument("--max-attempts", type=_positive)
+    add.add_argument("--from-json")
+    add_batch_parser = task_commands.add_parser(
+        "add-batch", help="add a JSON task batch"
+    )
+    add_batch_parser.add_argument("--from-json", required=True)
+    show = task_commands.add_parser("show", help="show one task")
+    show.add_argument("task_id")
+
+    claim = commands.add_parser("claim", help="claim eligible work")
+    claim.add_argument("--agent", required=True)
+    claim.add_argument("--role")
+    claim.add_argument("--label", action="append")
+    claim.add_argument("--lease-seconds", type=_positive)
+
+    def lease_parser(name, help_text):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument("--task", required=True)
+        command.add_argument("--agent", required=True)
+        command.add_argument("--token", required=True)
+        return command
+
+    heartbeat = lease_parser("heartbeat", "extend a lease")
+    heartbeat.add_argument("--lease-seconds", type=_positive)
+    complete = lease_parser("complete", "complete a task")
+    complete.add_argument("--summary", required=True)
+    complete.add_argument("--artifact", action="append", default=[])
+    fail = lease_parser("fail", "fail a task")
+    fail.add_argument("--error", required=True)
+    fail.add_argument("--terminal", action="store_true")
+    lease_parser("release", "release a task")
+
+    retry = commands.add_parser("retry", help="retry a failed task")
+    retry.add_argument("task_id")
+    retry.add_argument("--additional-attempts", type=_positive, default=1)
+    block = commands.add_parser("block", help="block a task")
+    block.add_argument("task_id")
+    block.add_argument("--reason", required=True)
+    for name in ("unblock", "cancel"):
+        command = commands.add_parser(name, help=f"{name} a task")
+        command.add_argument("task_id")
+
+    status = commands.add_parser("status", help="show queue status")
+    status.add_argument("--format", choices=("table", "json", "tsv"), default="table")
+    status.add_argument("--workflow")
+    status.add_argument("--assignee")
+    status.add_argument("--role")
+    status.add_argument("--label", action="append")
+    status.add_argument("--state", choices=STATUS_FILTER_STATES)
+    events = commands.add_parser("events", help="show sanitized events")
+    events.add_argument("--task")
+    commands.add_parser("sweep", help="sweep expired leases")
+    export = commands.add_parser("export", help="export queue projection")
+    export.add_argument("--format", choices=("tsv",), required=True)
+    return parser
+
+
+def _run_command(args, path):
+    def user_mutation(callback):
+        return mutate_queue(path, callback, user_input_errors=True)
+
+    if args.command == "init":
+        config = fixed_config()
+        if args.lease_seconds is not None:
+            config["default_lease_seconds"] = args.lease_seconds
+        if args.max_attempts is not None:
+            config["default_max_attempts"] = args.max_attempts
+        if args.retry_backoff is not None:
+            config["retry_backoff_seconds"] = args.retry_backoff
+        state = _user_operation(
+            lambda: initialize_queue(path, args.id, config)
+        )
+        return {"ok": True, "queue_id": state["queue_id"], "revision": 0}
+
+    if args.command == "task" and args.task_command == "show":
+        state = read_queue_snapshot(path)
+        task = _user_operation(lambda: _require_task(state, args.task_id))
+        return {"ok": True, "task": _safe_task(task), "revision": state["revision"]}
+
+    if args.command == "events":
+        state = read_queue_snapshot(path)
+        if args.task is not None:
+            _user_operation(lambda: _require_task(state, args.task))
+        events = [event for event in state["events"]
+                  if args.task is None or event["task_id"] == args.task]
+        return {"ok": True, "queue_id": state["queue_id"],
+                "revision": state["revision"], "events": copy.deepcopy(events)}
+
+    if args.command == "task" and args.task_command == "add":
+        raw = _task_input_from_args(args)
+
+        def add_one(state):
+            task = add_task(state, raw)
+            append_event(state, "task.added", "operator", task["id"], {}, utc_now())
+            return _safe_task(task)
+
+        task_result = user_mutation(add_one)
+        return {"ok": True, "task": task_result}
+
+    if args.command == "task" and args.task_command == "add-batch":
+        raw_tasks = _json_input(args.from_json)
+        if not isinstance(raw_tasks, list):
+            raise QueueError("task batch JSON input must be an array")
+
+        def add_many(state):
+            tasks = add_task_batch(state, raw_tasks)
+            event_now = utc_now()
+            for task in tasks:
+                append_event(state, "task.added", "operator", task["id"], {}, event_now)
+            return [_safe_task(task) for task in tasks]
+
+        tasks = user_mutation(add_many)
+        return {"ok": True, "tasks": tasks}
+
+    if args.command == "claim":
+        claim_result = user_mutation(
+            lambda state: claim_task(
+                state, args.agent, role=args.role, labels=args.label,
+                lease_seconds=args.lease_seconds,
+            ),
+        )
+        return {
+            "ok": True,
+            "task": _safe_task(claim_result["task"]),
+            "lease_token": claim_result["lease_token"],
+            "expires_at": claim_result["expires_at"],
+        }
+
+    if args.command == "heartbeat":
+        task_result = user_mutation(
+            lambda state: heartbeat_task(
+                state, args.task, args.agent, args.token,
+                lease_seconds=args.lease_seconds,
+            )
+        )
+    elif args.command == "complete":
+        task_result = user_mutation(
+            lambda state: complete_task(
+                state, args.task, args.agent, args.token,
+                args.summary, args.artifact,
+            )
+        )
+    elif args.command == "fail":
+        task_result = user_mutation(
+            lambda state: fail_task(
+                state, args.task, args.agent, args.token,
+                args.error, terminal=args.terminal,
+            )
+        )
+    elif args.command == "release":
+        task_result = user_mutation(
+            lambda state: release_task(
+                state, args.task, args.agent, args.token
+            )
+        )
+    elif args.command == "retry":
+        task_result = user_mutation(
+            lambda state: retry_task(
+                state, args.task_id, args.additional_attempts
+            )
+        )
+    elif args.command == "block":
+        task_result = user_mutation(
+            lambda state: block_task(state, args.task_id, args.reason)
+        )
+    elif args.command == "unblock":
+        task_result = user_mutation(
+            lambda state: unblock_task(state, args.task_id)
+        )
+    elif args.command == "cancel":
+        task_result = user_mutation(
+            lambda state: cancel_task(state, args.task_id)
+        )
+    else:
+        task_result = None
+    if task_result is not None:
+        return {"ok": True, "task": _safe_task(task_result)}
+
+    if args.command == "sweep":
+        changed = mutate_queue(
+            path, lambda state: sweep_expired(state), auto_sweep=False
+        )
+        return {"ok": True, "swept": changed}
+
+    if args.command in {"status", "export"}:
+        state, now, projection = _status_transaction_details(path)
+        if args.command == "export":
+            return projection
+        rows = status_rows(
+            state, now, workflow=args.workflow, assignee=args.assignee,
+            role=args.role, labels=args.label, state_filter=args.state,
+        )
+        if args.format == "json":
+            return {"queue_id": state["queue_id"],
+                    "revision": state["revision"], "rows": rows}
+        if args.format == "tsv":
+            return render_tsv(
+                state, now, workflow=args.workflow, assignee=args.assignee,
+                role=args.role, labels=args.label, state_filter=args.state,
+            )
+        return format_terminal_table(rows) + "\n"
+    raise QueueError("unsupported command")
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        path = resolve_queue_path(args.queue)
+        result = _run_command(args, path)
+        if isinstance(result, str):
+            sys.stdout.write(result)
+        else:
+            _emit_json(result)
+        return 0
+    except QueueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return error.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

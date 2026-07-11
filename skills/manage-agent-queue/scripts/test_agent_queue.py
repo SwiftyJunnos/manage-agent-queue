@@ -2,10 +2,16 @@
 """Tests for the manage-agent-queue CLI."""
 
 import copy
+import io
 import json
+import os
+import socket
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +20,41 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import agent_queue as aq
+
+
+SCRIPT_PATH = SCRIPT_DIR / "agent_queue.py"
+
+
+def run_cli(*arguments, cwd=None, env=None, timeout=10):
+    command = [sys.executable, str(SCRIPT_PATH), *map(str, arguments)]
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def communicate_all(processes, timeout):
+    """Bound a process group and always terminate/reap it on failure."""
+    deadline = time.monotonic() + timeout
+    outputs = []
+    try:
+        for process in processes:
+            outputs.append(
+                process.communicate(timeout=max(0.01, deadline - time.monotonic()))
+            )
+        return outputs
+    except BaseException:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+        for process in processes:
+            process.communicate()
+        raise
 
 
 def canonical_claim(
@@ -945,14 +986,14 @@ class ClaimTaskTests(unittest.TestCase):
         self.assertEqual(
             {
                 "agent_id": "agent-1",
-                "lease_token": "TOP-SECRET-TOKEN",
+                "lease_token": "lq_TOP-SECRET-TOKEN",
                 "claimed_at": self.NOW,
                 "heartbeat_at": self.NOW,
                 "expires_at": "2026-07-10T06:00:30Z",
             },
             stored["claim"],
         )
-        self.assertEqual("TOP-SECRET-TOKEN", result["lease_token"])
+        self.assertEqual("lq_TOP-SECRET-TOKEN", result["lease_token"])
         self.assertEqual(stored["claim"]["expires_at"], result["expires_at"])
         self.assertEqual(stored, result["task"])
         self.assertIsNot(stored, result["task"])
@@ -1285,7 +1326,7 @@ class ClaimTaskTests(unittest.TestCase):
         ):
             result = aq.claim_task(self.state, "agent-1", now=self.NOW)
 
-        self.assertEqual("MOCKED-SECRET", result["lease_token"])
+        self.assertEqual("lq_MOCKED-SECRET", result["lease_token"])
         public = (
             repr(self.state["events"])
             + repr(aq.status_rows(self.state, self.NOW))
@@ -2480,6 +2521,737 @@ class StatusProjectionTests(unittest.TestCase):
                 candidate["tasks"][task["id"]][field] = value
                 with self.assertRaisesRegex(aq.InvariantError, message):
                     aq.validate_state(candidate)
+
+
+class QueuePersistenceTests(unittest.TestCase):
+    NOW = "2099-07-11T01:00:00Z"
+
+    def test_resolve_queue_path_precedence_git_file_directory_and_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            explicit = root / "explicit.json"
+            environment = {"AGENT_QUEUE_PATH": str(root / "environment.json")}
+            nested = root / "repo" / "packages" / "app"
+            nested.mkdir(parents=True)
+            (root / "repo" / ".git").write_text("gitdir: elsewhere\n")
+
+            self.assertEqual(
+                explicit.absolute(),
+                aq.resolve_queue_path(explicit, environment, nested),
+            )
+            self.assertEqual(
+                (root / "environment.json").absolute(),
+                aq.resolve_queue_path(None, environment, nested),
+            )
+            self.assertEqual(
+                (root / "repo" / ".agent-queue" / "queue.json").absolute(),
+                aq.resolve_queue_path(None, {}, nested),
+            )
+
+            (root / "repo" / ".git").unlink()
+            (root / "repo" / ".git").mkdir()
+            self.assertEqual(
+                (root / "repo" / ".agent-queue" / "queue.json").absolute(),
+                aq.resolve_queue_path(None, {}, nested),
+            )
+            (root / "repo" / ".git").rmdir()
+            self.assertEqual(
+                (nested / ".agent-queue" / "queue.json").absolute(),
+                aq.resolve_queue_path(None, {}, nested),
+            )
+
+            for value in ("", "  "):
+                with self.subTest(value=value):
+                    with self.assertRaises(aq.QueueError):
+                        aq.resolve_queue_path(value, {}, nested)
+                    with self.assertRaises(aq.QueueError):
+                        aq.resolve_queue_path(
+                            None, {"AGENT_QUEUE_PATH": value}, nested
+                        )
+
+    def test_load_state_rejects_constants_schema_graph_and_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            with self.assertRaises(aq.QueueError):
+                aq.load_state(path)
+
+            for text in ('{"x": NaN}', '{"x": Infinity}', "not-json"):
+                path.write_text(text, encoding="utf-8")
+                with self.subTest(text=text):
+                    with self.assertRaises(aq.InvariantError):
+                        aq.load_state(path)
+
+            path.write_bytes(b"\xff")
+            with self.assertRaises(aq.InvariantError):
+                aq.load_state(path)
+
+            state = aq.new_state("demo", aq.fixed_config())
+            state["schema_version"] = 9
+            path.write_text(json.dumps(state), encoding="utf-8")
+            with self.assertRaises(aq.InvariantError):
+                aq.load_state(path)
+
+            future_event = aq.new_state("demo", aq.fixed_config())
+            task = aq.add_task(future_event, {"title": "work"})
+            aq.append_event(
+                future_event, "task.added", "operator", task["id"], {},
+                "2099-07-11T01:00:00Z",
+            )
+            path.write_text(json.dumps(future_event), encoding="utf-8")
+            with self.assertRaisesRegex(aq.InvariantError, "future revision"):
+                aq.load_state(path)
+
+    def test_commit_state_increments_once_normalizes_events_and_writes_json_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            state = aq.new_state("demo", aq.fixed_config())
+            aq.add_task(state, {"title": "work"})
+            aq.append_event(
+                state, "task.added", "operator", "T-000001", {}, self.NOW
+            )
+            writes = []
+            real_atomic_write = aq.atomic_write_text
+
+            def recording_write(target, text):
+                writes.append(Path(target).suffix)
+                return real_atomic_write(target, text)
+
+            with mock.patch.object(aq, "atomic_write_text", recording_write):
+                committed = aq.commit_state(path, state, self.NOW)
+
+            self.assertEqual(1, committed["revision"])
+            self.assertEqual([1], [event["revision"] for event in committed["events"]])
+            self.assertEqual([".json", ".tsv"], writes)
+            self.assertEqual(1, aq.tsv_revision(path.with_suffix(".tsv")))
+
+    def test_mutate_callback_failure_after_sweep_preserves_source_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            state = aq.new_state("demo", aq.fixed_config())
+            task = aq.add_task(state, {"title": "work"})
+            aq.claim_task(state, "agent", now="2099-07-11T00:00:00Z", lease_seconds=1)
+            aq.commit_state(path, state, "2099-07-11T00:00:00Z")
+            before_json = path.read_bytes()
+            before_tsv = path.with_suffix(".tsv").read_bytes()
+
+            def fail(_state):
+                raise RuntimeError("callback failed")
+
+            with self.assertRaisesRegex(RuntimeError, "callback failed"):
+                aq.mutate_queue(path, fail, now=self.NOW)
+
+            self.assertEqual(before_json, path.read_bytes())
+            self.assertEqual(before_tsv, path.with_suffix(".tsv").read_bytes())
+            self.assertEqual(task["id"], "T-000001")
+
+    def test_mutate_sweep_and_callback_share_one_revision_and_noop_repairs_tsv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            state = aq.new_state("demo", aq.fixed_config())
+            aq.add_task(state, {"title": "expired"})
+            aq.add_task(state, {"title": "block me"})
+            aq.claim_task(state, "agent", now="2099-07-11T00:00:00Z", lease_seconds=1)
+            aq.commit_state(path, state, "2099-07-11T00:00:00Z")
+
+            result = aq.mutate_queue(
+                path,
+                lambda candidate: aq.block_task(
+                    candidate, "T-000002", "pause", now=self.NOW
+                ),
+                now=self.NOW,
+            )
+            committed = aq.load_state(path)
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual(2, committed["revision"])
+            self.assertEqual(
+                [2, 2], [event["revision"] for event in committed["events"][-2:]]
+            )
+
+            path.with_suffix(".tsv").unlink()
+            unchanged = path.read_bytes()
+            aq.mutate_queue(path, lambda _candidate: None, now=self.NOW)
+            self.assertEqual(unchanged, path.read_bytes())
+            self.assertEqual(2, aq.tsv_revision(path.with_suffix(".tsv")))
+
+
+class QueueLockTests(unittest.TestCase):
+    def assert_hostile_guard_rejected(self, path):
+        lock = aq.QueueLock(path, lock_timeout=0.05, stale_seconds=1)
+        with self.assertRaises(aq.QueueError):
+            with lock:
+                self.fail("hostile guard was accepted")
+        self.assertFalse(lock.path.exists())
+        self.assertEqual(
+            [], list(path.parent.glob(f".{lock.path.name}.*"))
+        )
+
+    def test_guard_symlink_never_modifies_empty_or_nonempty_victim(self):
+        for initial in (b"", b"do-not-touch"):
+            with self.subTest(initial=initial), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "queue.json"
+                victim = Path(directory) / "victim"
+                victim.write_bytes(initial)
+                Path(str(path) + ".lock.guard").symlink_to(victim)
+
+                self.assert_hostile_guard_rejected(path)
+
+                self.assertEqual(initial, victim.read_bytes())
+
+    def test_nonregular_guard_fifo_and_directory_fail_closed(self):
+        makers = [("directory", lambda guard: guard.mkdir())]
+        if hasattr(os, "mkfifo"):
+            makers.append(("fifo", lambda guard: os.mkfifo(guard)))
+        for name, make_guard in makers:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "queue.json"
+                make_guard(Path(str(path) + ".lock.guard"))
+
+                self.assert_hostile_guard_rejected(path)
+
+    def test_existing_guard_requires_exact_marker_without_repair(self):
+        for contents in (b"", b"\0", b"LQG", b"LQG1-extra"):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "queue.json"
+                guard = Path(str(path) + ".lock.guard")
+                guard.write_bytes(contents)
+
+                self.assert_hostile_guard_rejected(path)
+
+                self.assertEqual(contents, guard.read_bytes())
+
+    def test_lock_backend_helpers_use_selected_portable_api(self):
+        lock = aq.QueueLock("queue.json")
+        fake_fcntl = mock.Mock(LOCK_EX=1, LOCK_NB=2, LOCK_UN=4)
+        with mock.patch.object(aq, "LOCK_BACKEND", "fcntl"):
+            with mock.patch.object(aq, "_fcntl", fake_fcntl):
+                self.assertTrue(lock._try_guard_lock(9))
+                lock._unlock_guard(9)
+        self.assertEqual(
+            [mock.call(9, 3), mock.call(9, 4)],
+            fake_fcntl.flock.call_args_list,
+        )
+
+        fake_msvcrt = mock.Mock(LK_NBLCK=5, LK_UNLCK=6)
+        with mock.patch.object(aq, "LOCK_BACKEND", "msvcrt"):
+            with mock.patch.object(aq, "_msvcrt", fake_msvcrt):
+                with mock.patch.object(aq.os, "lseek") as seek:
+                    self.assertTrue(lock._try_guard_lock(11))
+                    lock._unlock_guard(11)
+        self.assertEqual(
+            [mock.call(11, 5, 1), mock.call(11, 6, 1)],
+            fake_msvcrt.locking.call_args_list,
+        )
+        self.assertEqual(2, seek.call_count)
+
+    def test_live_holder_is_not_reclaimed_after_metadata_stales(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            ready = Path(directory) / "holder-ready"
+            holder_source = "\n".join((
+                "import pathlib, sys, time",
+                f"sys.path.insert(0, {str(SCRIPT_DIR)!r})",
+                "import agent_queue as aq",
+                "path = pathlib.Path(sys.argv[1])",
+                "ready = pathlib.Path(sys.argv[2])",
+                "with aq.QueueLock(path, lock_timeout=1, stale_seconds=1):",
+                "    ready.write_text('ready')",
+                "    time.sleep(10)",
+            ))
+            holder = subprocess.Popen(
+                [sys.executable, "-c", holder_source, str(path), str(ready)]
+            )
+            try:
+                deadline = time.monotonic() + 3
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                time.sleep(1.1)
+                with self.assertRaises(aq.LockTimeout):
+                    with aq.QueueLock(
+                        path, lock_timeout=0.1, stale_seconds=1
+                    ):
+                        self.fail("live holder was reclaimed")
+            finally:
+                holder.terminate()
+                holder.wait(timeout=5)
+
+            with aq.QueueLock(path, lock_timeout=1, stale_seconds=1):
+                self.assertTrue(Path(str(path) + ".lock").exists())
+            self.assertFalse(Path(str(path) + ".lock").exists())
+            self.assertTrue(Path(str(path) + ".lock.guard").exists())
+
+    def test_module_loads_without_fcntl_and_has_no_unsafe_fallback(self):
+        source = "\n".join((
+            "import builtins, runpy, sys",
+            "real_import = builtins.__import__",
+            "def guarded_import(name, *args, **kwargs):",
+            "    if name == 'fcntl':",
+            "        raise ImportError('simulated missing fcntl')",
+            "    return real_import(name, *args, **kwargs)",
+            "builtins.__import__ = guarded_import",
+            "namespace = runpy.run_path(sys.argv[1])",
+            "assert namespace['LOCK_BACKEND'] in (None, 'msvcrt')",
+        ))
+        result = subprocess.run(
+            [sys.executable, "-c", source, str(SCRIPT_PATH)],
+            text=True, capture_output=True, timeout=10, check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        with mock.patch.object(aq, "LOCK_BACKEND", None, create=True):
+            with tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(aq.QueueError, "locking backend"):
+                    with aq.QueueLock(Path(directory) / "queue.json"):
+                        pass
+
+    def test_lock_timeout_and_owner_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            with aq.QueueLock(path, lock_timeout=1, stale_seconds=30) as owner:
+                data = json.loads(
+                    (Path(str(path) + ".lock") / "owner.json").read_text()
+                )
+                self.assertEqual(owner.token, data["token"])
+                self.assertEqual(os.getpid(), data["pid"])
+                self.assertEqual(socket.gethostname(), data["hostname"])
+                self.assertEqual(
+                    {"token", "pid", "hostname", "acquired_at", "stale_after"},
+                    set(data),
+                )
+                with self.assertRaises(aq.LockTimeout) as caught:
+                    with aq.QueueLock(path, lock_timeout=0.05, stale_seconds=30):
+                        pass
+                self.assertEqual(4, caught.exception.exit_code)
+
+    def test_kernel_guard_honors_lock_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            ready = Path(directory) / "ready"
+            holder_source = "\n".join((
+                "import pathlib, sys, time",
+                f"sys.path.insert(0, {str(SCRIPT_DIR)!r})",
+                "import agent_queue as aq",
+                "with aq.QueueLock(sys.argv[1], lock_timeout=1, stale_seconds=30):",
+                "    pathlib.Path(sys.argv[2]).write_text('ready')",
+                "    time.sleep(2)",
+            ))
+            holder = subprocess.Popen(
+                [sys.executable, "-c", holder_source, str(path), str(ready)]
+            )
+            try:
+                deadline = time.monotonic() + 2
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                started = time.monotonic()
+                with self.assertRaises(aq.LockTimeout):
+                    with aq.QueueLock(path, lock_timeout=0.05, stale_seconds=30):
+                        pass
+                self.assertLess(time.monotonic() - started, 0.5)
+            finally:
+                holder.kill()
+                holder.wait(timeout=5)
+
+    def test_valid_stale_owner_reclaimed_and_foreign_cleanup_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            lock_path = Path(str(path) + ".lock")
+            lock_path.mkdir(parents=True)
+            (lock_path / "owner.json").write_text(
+                json.dumps(
+                    {
+                        "token": "old",
+                        "pid": 1,
+                        "hostname": "host",
+                        "acquired_at": "2020-01-01T00:00:00Z",
+                        "stale_after": "2020-01-01T00:00:01Z",
+                    }
+                )
+            )
+            lock = aq.QueueLock(path, lock_timeout=1, stale_seconds=30)
+            lock.__enter__()
+            owner_path = lock_path / "owner.json"
+            owner = json.loads(owner_path.read_text())
+            owner["token"] = "foreign"
+            owner_path.write_text(json.dumps(owner))
+            lock.__exit__(None, None, None)
+            self.assertTrue(lock_path.exists())
+
+    def test_stale_reclaim_refuses_aba_fresh_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            lock_path = Path(str(path) + ".lock")
+            lock_path.mkdir(parents=True)
+            (lock_path / "owner.json").write_text(json.dumps({
+                "token": "stale",
+                "pid": 1,
+                "hostname": "host",
+                "acquired_at": "2020-01-01T00:00:00Z",
+                "stale_after": "2020-01-01T00:00:01Z",
+            }))
+            late_contender = aq.QueueLock(path, lock_timeout=1, stale_seconds=30)
+            observed = late_contender._lock_identity()
+            first = aq.QueueLock(path, lock_timeout=1, stale_seconds=30)
+            self.assertTrue(first._reclaim(observed))
+            first.__enter__()
+
+            with self.assertRaises(aq.LockTimeout):
+                late_contender._reclaim(observed)
+            owner = json.loads((lock_path / "owner.json").read_text())
+            self.assertEqual(first.token, owner["token"])
+            first.__exit__(None, None, None)
+
+    def test_missing_or_corrupt_owner_reclaimed_only_after_mtime_age(self):
+        for contents in (None, "not-json", b"\xff"):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "queue.json"
+                lock_path = Path(str(path) + ".lock")
+                lock_path.mkdir(parents=True)
+                if contents is not None:
+                    if isinstance(contents, bytes):
+                        (lock_path / "owner.json").write_bytes(contents)
+                    else:
+                        (lock_path / "owner.json").write_text(contents)
+                with self.assertRaises(aq.LockTimeout):
+                    with aq.QueueLock(path, lock_timeout=0.05, stale_seconds=1):
+                        pass
+                old = time.time() - 5
+                os.utime(lock_path, (old, old))
+                with aq.QueueLock(path, lock_timeout=1, stale_seconds=1):
+                    pass
+                self.assertFalse(lock_path.exists())
+
+    def test_peek_lock_config_uses_only_positive_integers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            for value, expected in (
+                ({"config": {"lock_timeout_seconds": 2, "stale_lock_seconds": 9}}, (2, 9)),
+                ({"config": {"lock_timeout_seconds": 0, "stale_lock_seconds": True}}, (5, 30)),
+                ({"broken": True}, (5, 30)),
+            ):
+                path.write_text(json.dumps(value), encoding="utf-8")
+                self.assertEqual(expected, aq.peek_lock_config(path))
+
+
+class QueueCliTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.queue = Path(self.temporary.name) / "queue.json"
+
+    def cli(self, *arguments, timeout=10):
+        return run_cli("--queue", self.queue, *arguments, timeout=timeout)
+
+    def json_output(self, result):
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stderr)
+        return json.loads(result.stdout)
+
+    def init(self, **overrides):
+        arguments = ["init", "--id", "demo"]
+        for name, value in overrides.items():
+            arguments.extend((f"--{name.replace('_', '-')}", str(value)))
+        return self.json_output(self.cli(*arguments))
+
+    def add(self, title="work", *extra):
+        return self.json_output(self.cli("task", "add", "--title", title, *extra))
+
+    def test_cli_init_creates_both_files_and_second_is_code_two_unchanged(self):
+        output = self.init(lease_seconds=10, max_attempts=4, retry_backoff=2)
+        self.assertTrue(output["ok"])
+        self.assertTrue(self.queue.exists())
+        self.assertTrue(self.queue.with_suffix(".tsv").exists())
+        before = self.queue.read_bytes()
+        result = self.cli("init", "--id", "again")
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertNotEqual("", result.stderr)
+        self.assertEqual(before, self.queue.read_bytes())
+
+    def test_task_add_batch_show_and_json_errors_are_atomic(self):
+        self.init()
+        added = self.add(
+            "one", "--description", "desc", "--role", "dev", "--priority", "3",
+            "--resource", "repo", "--label", "backend"
+        )
+        self.assertEqual("T-000001", added["task"]["id"])
+        shown = self.json_output(self.cli("task", "show", "T-000001"))
+        self.assertEqual("one", shown["task"]["title"])
+        self.assertNotIn("lease_token", shown["task"].get("claim") or {})
+
+        batch_path = Path(self.temporary.name) / "batch.json"
+        batch_path.write_text(
+            json.dumps([{"title": "two"}, {"title": "three", "depends_on": ["T-000002"]}])
+        )
+        batch = self.json_output(
+            self.cli("task", "add-batch", "--from-json", batch_path)
+        )
+        self.assertEqual(["T-000002", "T-000003"], [task["id"] for task in batch["tasks"]])
+        before = self.queue.read_bytes()
+        bad = Path(self.temporary.name) / "bad.json"
+        bad.write_text('[{"title":"four"}, NaN]')
+        result = self.cli("task", "add-batch", "--from-json", bad)
+        self.assertEqual(2, result.returncode)
+        self.assertEqual(before, self.queue.read_bytes())
+
+    def test_lifecycle_commands_and_token_redaction(self):
+        self.init(retry_backoff=1)
+        self.add("work")
+        claim = self.json_output(self.cli("claim", "--agent", "a"))
+        token = claim["lease_token"]
+        self.assertNotIn(token, self.queue.with_suffix(".tsv").read_text())
+
+        heartbeat = self.json_output(
+            self.cli("heartbeat", "--task", "T-000001", "--agent", "a", "--token", token)
+        )
+        self.assertNotIn(token, json.dumps(heartbeat))
+        wrong = self.cli(
+            "complete", "--task", "T-000001", "--agent", "a", "--token", "wrong", "--summary", "done"
+        )
+        self.assertEqual(5, wrong.returncode)
+        complete = self.json_output(
+            self.cli("complete", "--task", "T-000001", "--agent", "a", "--token", token, "--summary", "done", "--artifact", "out.txt")
+        )
+        self.assertEqual("completed", complete["task"]["status"])
+        none = self.cli("claim", "--agent", "b")
+        self.assertEqual(3, none.returncode)
+
+    def test_generated_dash_token_round_trips_as_separate_cli_argument(self):
+        self.init()
+        self.add("dash token")
+
+        def invoke(*arguments):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                try:
+                    code = aq.main(["--queue", str(self.queue), *arguments])
+                except SystemExit as error:
+                    code = error.code
+            return code, stdout.getvalue(), stderr.getvalue()
+
+        with mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value="-forced-token"
+        ):
+            code, stdout, stderr = invoke("claim", "--agent", "agent")
+        self.assertEqual(0, code, stderr)
+        token = json.loads(stdout)["lease_token"]
+        self.assertIn("-forced-token", token)
+
+        code, _stdout, stderr = invoke(
+            "heartbeat", "--task", "T-000001", "--agent", "agent",
+            "--token", token,
+        )
+        self.assertEqual(0, code, stderr)
+        code, status_stdout, stderr = invoke("status", "--format", "json")
+        self.assertEqual(0, code, stderr)
+        self.assertNotIn(token, status_stdout)
+        code, _stdout, stderr = invoke(
+            "complete", "--task", "T-000001", "--agent", "agent",
+            "--token", token, "--summary", "done",
+        )
+        self.assertEqual(0, code, stderr)
+        code, events_stdout, stderr = invoke("events")
+        self.assertEqual(0, code, stderr)
+        self.assertNotIn(token, events_stdout)
+
+    def test_release_fail_retry_block_unblock_cancel_and_sweep_commands(self):
+        self.init(retry_backoff=1)
+        for title in ("release", "fail", "admin"):
+            self.add(title)
+        first = self.json_output(self.cli("claim", "--agent", "a"))
+        released = self.json_output(
+            self.cli("release", "--task", first["task"]["id"], "--agent", "a", "--token", first["lease_token"])
+        )
+        self.assertEqual("pending", released["task"]["status"])
+        reclaimed = self.json_output(self.cli("claim", "--agent", "a"))
+        failed = self.json_output(
+            self.cli("fail", "--task", reclaimed["task"]["id"], "--agent", "a", "--token", reclaimed["lease_token"], "--error", "bad", "--terminal")
+        )
+        self.assertEqual("failed", failed["task"]["status"])
+        retried = self.json_output(self.cli("retry", reclaimed["task"]["id"]))
+        self.assertEqual("pending", retried["task"]["status"])
+        blocked = self.json_output(self.cli("block", "T-000002", "--reason", "wait"))
+        self.assertEqual("blocked", blocked["task"]["status"])
+        self.assertEqual("pending", self.json_output(self.cli("unblock", "T-000002"))["task"]["status"])
+        self.assertEqual("cancelled", self.json_output(self.cli("cancel", "T-000003"))["task"]["status"])
+        self.assertTrue(self.json_output(self.cli("sweep"))["ok"])
+
+    def test_cli_lock_timeout_is_code_four(self):
+        self.init()
+        with aq.QueueLock(self.queue, lock_timeout=1, stale_seconds=30):
+            result = self.cli("status", "--format", "json", timeout=8)
+        self.assertEqual(4, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertIn("timed out", result.stderr)
+
+    def test_conflicting_resource_is_claimed_only_once_concurrently(self):
+        self.init()
+        batch_path = Path(self.temporary.name) / "resources.json"
+        batch_path.write_text(json.dumps([
+            {"title": "shared one", "resources": ["shared"]},
+            {"title": "shared two", "resources": ["shared"]},
+            {"title": "disjoint", "resources": ["other"]},
+        ]))
+        self.json_output(self.cli("task", "add-batch", "--from-json", batch_path))
+        processes = [
+            subprocess.Popen(
+                [sys.executable, str(SCRIPT_PATH), "--queue", str(self.queue), "claim", "--agent", f"r-{index}"],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ) for index in range(4)
+        ]
+        outputs = communicate_all(processes, 15)
+        self.assertTrue(all(process.returncode in (0, 3) for process in processes), outputs)
+        claims = [json.loads(stdout) for process, (stdout, _stderr) in zip(processes, outputs) if process.returncode == 0]
+        self.assertEqual(2, len(claims))
+        resources = [claim["task"]["resources"] for claim in claims]
+        self.assertEqual(1, sum("shared" in value for value in resources))
+        self.assertEqual(1, sum("other" in value for value in resources))
+
+    def test_status_events_export_and_crash_repair_do_not_bump_revision(self):
+        self.init()
+        self.add("work")
+        revision = aq.load_state(self.queue)["revision"]
+        self.queue.with_suffix(".tsv").write_text(
+            f"# queue_revision: {revision}\ncorrupt\n", encoding="utf-8"
+        )
+        status = self.json_output(self.cli("status", "--format", "json"))
+        self.assertEqual("demo", status["queue_id"])
+        self.assertEqual(revision, status["revision"])
+        self.assertEqual(1, len(status["rows"]))
+        self.assertEqual(revision, aq.tsv_revision(self.queue.with_suffix(".tsv")))
+        self.assertIn("T-000001", self.queue.with_suffix(".tsv").read_text())
+        events = self.json_output(self.cli("events"))
+        self.assertNotIn("lease_token", json.dumps(events))
+        exported = self.cli("export", "--format", "tsv")
+        self.assertEqual(0, exported.returncode)
+        self.assertEqual(self.queue.with_suffix(".tsv").read_text(), exported.stdout)
+
+    def test_export_reuses_projection_rendered_inside_transaction_lock(self):
+        self.init()
+        self.add("exported")
+        lock_path = Path(str(self.queue) + ".lock")
+        render_lock_states = []
+        real_render = aq._render_projection
+
+        def tracked_render(state, now):
+            render_lock_states.append(lock_path.is_dir())
+            return real_render(state, now)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(aq, "_render_projection", tracked_render):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = aq.main([
+                    "--queue", str(self.queue), "export", "--format", "tsv"
+                ])
+
+        self.assertEqual(0, code, stderr.getvalue())
+        self.assertEqual(self.queue.with_suffix(".tsv").read_text(), stdout.getvalue())
+        self.assertTrue(render_lock_states)
+        self.assertTrue(all(render_lock_states), render_lock_states)
+
+    def test_strict_json_corruption_is_code_six_and_never_written(self):
+        self.queue.write_text('{"revision": NaN}', encoding="utf-8")
+        before = self.queue.read_bytes()
+        result = self.cli("status", "--format", "json")
+        self.assertEqual(6, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertEqual(before, self.queue.read_bytes())
+
+    def test_explicit_sweep_returns_expired_ids_and_commits_once(self):
+        state = aq.new_state("demo", aq.fixed_config())
+        task = aq.add_task(state, {"title": "expired"})
+        for target in (state, state["tasks"][task["id"]]):
+            target["created_at"] = "2020-01-01T00:00:00Z"
+            target["updated_at"] = "2020-01-01T00:00:00Z"
+        aq.claim_task(
+            state, "agent", now="2020-01-01T00:00:00Z", lease_seconds=1
+        )
+        aq.commit_state(self.queue, state, "2020-01-01T00:00:00Z")
+
+        result = self.json_output(self.cli("sweep"))
+        self.assertEqual(["T-000001"], result["swept"])
+        persisted = aq.load_state(self.queue)
+        self.assertEqual(2, persisted["revision"])
+        expiry_events = [
+            event for event in persisted["events"]
+            if event["type"] == "task.lease_expired"
+        ]
+        self.assertEqual(1, len(expiry_events))
+        self.assertEqual(2, expiry_events[0]["revision"])
+
+    def test_user_task_semantic_errors_are_code_two_and_atomic(self):
+        blank_queue = Path(self.temporary.name) / "blank-id.json"
+        blank_init = run_cli(
+            "--queue", blank_queue, "init", "--id", "   "
+        )
+        self.assertEqual(2, blank_init.returncode)
+        self.assertFalse(blank_queue.exists())
+        self.init()
+        self.add("existing")
+        cases = (
+            ("task", "add", "--title", "   "),
+            ("task", "add", "--title", "missing dep", "--depends-on", "T-999999"),
+            ("task", "show", "T-999999"),
+            ("retry", "T-999999"),
+            ("block", "T-999999", "--reason", "wait"),
+            ("unblock", "not-a-task"),
+            ("cancel", "T-999999"),
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                before_json = self.queue.read_bytes()
+                before_tsv = self.queue.with_suffix(".tsv").read_bytes()
+                result = self.cli(*arguments)
+                self.assertEqual(2, result.returncode, result.stderr)
+                self.assertEqual("", result.stdout)
+                self.assertNotEqual("", result.stderr)
+                self.assertEqual(before_json, self.queue.read_bytes())
+                self.assertEqual(before_tsv, self.queue.with_suffix(".tsv").read_bytes())
+
+    def test_status_rejects_unknown_state_with_argparse_code_two(self):
+        result = self.cli(
+            "status", "--state", "definitely-not-a-state", "--format", "json"
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertIn("invalid choice", result.stderr)
+
+    def test_parser_help_and_invalid_arguments_use_argparse_code_two(self):
+        for arguments in (
+            ("--help",), ("task", "--help"), ("status", "--help"),
+            ("workflow", "add"), ("doctor",), ("compact",),
+        ):
+            result = run_cli(*arguments)
+            if "--help" in arguments:
+                self.assertEqual(0, result.returncode, arguments)
+            else:
+                self.assertEqual(2, result.returncode, arguments)
+
+    def test_sixteen_processes_claim_unique_tasks_without_residue(self):
+        self.init(lease_seconds=30)
+        batch_path = Path(self.temporary.name) / "sixteen.json"
+        batch_path.write_text(json.dumps([{"title": f"task {index}"} for index in range(16)]))
+        self.json_output(self.cli("task", "add-batch", "--from-json", batch_path))
+        processes = [
+            subprocess.Popen(
+                [sys.executable, str(SCRIPT_PATH), "--queue", str(self.queue), "claim", "--agent", f"a-{index}"],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for index in range(16)
+        ]
+        outputs = communicate_all(processes, 20)
+        self.assertTrue(all(process.returncode == 0 for process in processes), outputs)
+        claims = [json.loads(stdout) for stdout, _stderr in outputs]
+        self.assertEqual(16, len({claim["task"]["id"] for claim in claims}))
+        self.assertEqual(16, len({claim["lease_token"] for claim in claims}))
+        state = aq.load_state(self.queue)
+        self.assertEqual(17, state["revision"])
+        self.assertEqual(16, len([task for task in state["tasks"].values() if task["status"] == "leased"]))
+        self.assertFalse(Path(str(self.queue) + ".lock").exists())
+        self.assertTrue(Path(str(self.queue) + ".lock.guard").is_file())
+        self.assertEqual([], list(self.queue.parent.glob("*.tmp")))
 
 
 if __name__ == "__main__":
