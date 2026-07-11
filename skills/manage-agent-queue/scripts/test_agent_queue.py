@@ -852,6 +852,291 @@ class TaskGraphTests(unittest.TestCase):
             aq.validate_state(self.state)
 
 
+class WorkflowTemplateTests(unittest.TestCase):
+    def setUp(self):
+        self.state = aq.new_state("demo", aq.fixed_config())
+        self.now = "2026-07-11T01:02:03Z"
+
+    def test_adversarial_review_builds_exact_graph_for_reviewer_counts(self):
+        for reviewer_count in (1, 2, 3):
+            with self.subTest(reviewer_count=reviewer_count):
+                state = aq.new_state("demo", aq.fixed_config())
+                result = aq.add_adversarial_review(
+                    state, "Ship change", 40, ["src/a.py", "src/b.py"],
+                    reviewer_count, now=self.now,
+                )
+                count = reviewer_count + 3
+                ids = [f"T-{index:06d}" for index in range(1, count + 1)]
+                self.assertEqual({
+                    "workflow_id": "W-000001",
+                    "template": "adversarial-review",
+                    "task_ids": ids,
+                }, result)
+                tasks = [state["tasks"][task_id] for task_id in ids]
+                self.assertEqual(
+                    ["implement"] + ["review"] * reviewer_count
+                    + ["apply", "verify"],
+                    [task["role"] for task in tasks],
+                )
+                self.assertEqual(
+                    ["Ship change"]
+                    + [f"Review {i}: Ship change" for i in range(1, reviewer_count + 1)]
+                    + ["Apply reviews: Ship change", "Verify: Ship change"],
+                    [task["title"] for task in tasks],
+                )
+                self.assertEqual(
+                    [40] + [30] * reviewer_count + [20, 10],
+                    [task["priority"] for task in tasks],
+                )
+                review_ids = ids[1:1 + reviewer_count]
+                self.assertEqual(
+                    [[]] + [[ids[0]]] * reviewer_count
+                    + [review_ids, [ids[-2]]],
+                    [task["depends_on"] for task in tasks],
+                )
+                self.assertEqual(
+                    [["src/a.py", "src/b.py"]]
+                    + [[]] * reviewer_count
+                    + [["src/a.py", "src/b.py"], []],
+                    [task["resources"] for task in tasks],
+                )
+                for review in tasks[1:1 + reviewer_count]:
+                    self.assertIn("src/a.py, src/b.py", review["description"])
+                    self.assertIn("review the implementation artifact", review["description"].lower())
+                    self.assertIn("without implementer reasoning or other reviewer findings", review["description"].lower())
+                self.assertEqual(count + 1, state["next_task_sequence"])
+                self.assertEqual(2, state["next_workflow_sequence"])
+                self.assertEqual({
+                    "template": "adversarial-review",
+                    "workflow_id": "W-000001",
+                    "task_ids": ids,
+                    "task_count": count,
+                    "reviewer_count": reviewer_count,
+                }, state["events"][0]["details"])
+
+    def test_adversarial_review_readiness_isolated_by_graph_and_resources(self):
+        result = aq.add_adversarial_review(
+            self.state, "Change", 0, ["shared"], 3, now=self.now
+        )
+        implement_id, *review_and_tail = result["task_ids"]
+        review_ids = review_and_tail[:3]
+        apply_id, verify_id = review_and_tail[3:]
+        self.state["tasks"][implement_id]["status"] = "completed"
+        self.state["tasks"][implement_id]["result"] = {
+            "summary": "done", "artifacts": []
+        }
+        rows = {row["id"]: row for row in aq.status_rows(self.state, self.now)}
+        self.assertEqual(["ready"] * 3, [rows[task_id]["state"] for task_id in review_ids])
+        self.assertEqual([[]] * 3, [self.state["tasks"][task_id]["resources"] for task_id in review_ids])
+        self.assertEqual("waiting_dependency", rows[apply_id]["state"])
+        self.assertEqual("waiting_dependency", rows[verify_id]["state"])
+        for task_id in review_ids:
+            self.state["tasks"][task_id]["status"] = "completed"
+            self.state["tasks"][task_id]["result"] = {
+                "summary": "done", "artifacts": []
+            }
+        rows = {row["id"]: row for row in aq.status_rows(self.state, self.now)}
+        self.assertEqual("ready", rows[apply_id]["state"])
+        self.assertEqual("waiting_dependency", rows[verify_id]["state"])
+
+    def test_parallel_shards_builds_exact_graph_and_normalizes_each_shard(self):
+        for shards in ([['a', 'a']], [['a'], ['b', 'c'], ['d']]):
+            with self.subTest(shards=shards):
+                state = aq.new_state("demo", aq.fixed_config())
+                result = aq.add_parallel_shards(
+                    state, "Build", 9, shards, now=self.now
+                )
+                normalized = [list(dict.fromkeys(shard)) for shard in shards]
+                shard_count = len(shards)
+                ids = [f"T-{i:06d}" for i in range(1, shard_count + 3)]
+                self.assertEqual({
+                    "workflow_id": "W-000001",
+                    "template": "parallel-shards",
+                    "task_ids": ids,
+                }, result)
+                tasks = [state["tasks"][task_id] for task_id in ids]
+                self.assertEqual(
+                    [f"Shard {i}: Build" for i in range(1, shard_count + 1)]
+                    + ["Integrate: Build", "Verify: Build"],
+                    [task["title"] for task in tasks],
+                )
+                self.assertEqual(
+                    ["shard"] * shard_count + ["integrate", "verify"],
+                    [task["role"] for task in tasks],
+                )
+                self.assertEqual(
+                    [9] * shard_count + [-1, -11],
+                    [task["priority"] for task in tasks],
+                )
+                flattened = [resource for shard in normalized for resource in shard]
+                self.assertEqual(
+                    normalized + [flattened, []],
+                    [task["resources"] for task in tasks],
+                )
+                self.assertEqual(
+                    [[]] * shard_count + [ids[:shard_count], [ids[-2]]],
+                    [task["depends_on"] for task in tasks],
+                )
+                self.assertEqual({
+                    "template": "parallel-shards",
+                    "workflow_id": "W-000001",
+                    "task_ids": ids,
+                    "task_count": shard_count + 2,
+                    "shard_count": shard_count,
+                }, state["events"][0]["details"])
+
+    def test_workflow_api_copies_once_and_validates_source_and_candidate_once(self):
+        real_deepcopy = aq.copy.deepcopy
+        real_validate_state = aq.validate_state
+        real_validate_graph = aq.validate_graph
+        with mock.patch.object(
+            aq.copy, "deepcopy", wraps=real_deepcopy
+        ) as deepcopy_spy, mock.patch.object(
+            aq, "validate_state", wraps=real_validate_state
+        ) as validate_state_spy, mock.patch.object(
+            aq, "validate_graph", wraps=real_validate_graph
+        ) as validate_graph_spy:
+            result = aq.add_adversarial_review(
+                self.state, "Efficient", 0, ["r"], 2, now=self.now
+            )
+
+        self.assertEqual(5, len(result["task_ids"]))
+        self.assertEqual(1, deepcopy_spy.call_count)
+        self.assertEqual(2, validate_state_spy.call_count)
+        self.assertEqual(2, validate_graph_spy.call_count)
+
+    def test_workflow_templates_respect_advanced_historical_counters(self):
+        aq.add_task(self.state, {"title": "old"})
+        del self.state["tasks"]["T-000001"]
+        self.state["next_workflow_sequence"] = 4
+        before_task = self.state["next_task_sequence"]
+        before_workflow = self.state["next_workflow_sequence"]
+
+        result = aq.add_adversarial_review(
+            self.state, "Fresh", 0, ["r"], 1, now=self.now
+        )
+
+        self.assertEqual("W-000004", result["workflow_id"])
+        self.assertEqual(
+            [f"T-{index:06d}" for index in range(2, 6)], result["task_ids"]
+        )
+        self.assertEqual(before_task + 4, self.state["next_task_sequence"])
+        self.assertEqual(before_workflow + 1, self.state["next_workflow_sequence"])
+        self.assertNotIn("T-000001", self.state["tasks"])
+
+    def test_workflow_templates_never_preallocate_ids(self):
+        with mock.patch.object(
+            aq, "allocate_id", side_effect=AssertionError("must not preallocate")
+        ):
+            first = aq.add_adversarial_review(
+                self.state, "First", 0, ["a"], 1, now=self.now
+            )
+            second = aq.add_parallel_shards(
+                self.state, "Second", 0, [["b"]], now=self.now
+            )
+        self.assertEqual("W-000001", first["workflow_id"])
+        self.assertEqual("W-000002", second["workflow_id"])
+        self.assertEqual("T-000005", second["task_ids"][0])
+
+    def test_workflow_results_are_detached_and_event_is_exact_and_sanitized(self):
+        result = aq.add_adversarial_review(
+            self.state, "Do not leak lease_token", 5, ["secret"], 2,
+            now=self.now,
+        )
+        event = self.state["events"][0]
+        self.assertEqual({
+            "seq": 1,
+            "at": self.now,
+            "type": "workflow.created",
+            "actor": "operator",
+            "task_id": None,
+            "revision": 1,
+            "details": {
+                "template": "adversarial-review",
+                "workflow_id": "W-000001",
+                "task_ids": [f"T-{index:06d}" for index in range(1, 6)],
+                "task_count": 5,
+                "reviewer_count": 2,
+            },
+        }, event)
+        self.assertNotIn("lease_token", json.dumps(event))
+        result["task_ids"].append("T-999999")
+        result["workflow_id"] = "W-999999"
+        self.assertEqual(5, len(self.state["tasks"]))
+        self.assertEqual("W-000001", next(iter(self.state["tasks"].values()))["workflow_id"])
+        self.assertEqual(
+            [f"T-{index:06d}" for index in range(1, 6)],
+            event["details"]["task_ids"],
+        )
+
+    def test_invalid_workflow_inputs_and_id_exhaustion_are_byte_atomic(self):
+        cases = (
+            lambda state: aq.add_adversarial_review(state, "", 0, ["r"], 1, now=self.now),
+            lambda state: aq.add_adversarial_review(state, "x", True, ["r"], 1, now=self.now),
+            lambda state: aq.add_adversarial_review(state, "x", 0, "r", 1, now=self.now),
+            lambda state: aq.add_adversarial_review(state, "x", 0, ["r", "r"], 1, now=self.now),
+            lambda state: aq.add_adversarial_review(state, "x", 0, [""], 1, now=self.now),
+            lambda state: aq.add_adversarial_review(state, "x", 0, ["r"], True, now=self.now),
+            lambda state: aq.add_adversarial_review(state, "x", 0, ["r"], 0, now=self.now),
+            lambda state: aq.add_parallel_shards(state, "x", 0, [], now=self.now),
+            lambda state: aq.add_parallel_shards(state, "", 0, [["r"]], now=self.now),
+            lambda state: aq.add_parallel_shards(state, "x", False, [["r"]], now=self.now),
+            lambda state: aq.add_parallel_shards(state, "x", 0, "r", now=self.now),
+            lambda state: aq.add_parallel_shards(state, "x", 0, [[]], now=self.now),
+            lambda state: aq.add_parallel_shards(state, "x", 0, [["r"], ["r"]], now=self.now),
+            lambda state: aq.add_parallel_shards(state, "x", 0, [[" "]], now=self.now),
+            lambda state: aq.add_parallel_shards(state, "x", 0, [[1]], now=self.now),
+        )
+        for operation in cases:
+            with self.subTest(operation=operation):
+                state = aq.new_state("demo", aq.fixed_config())
+                before = json.dumps(state, sort_keys=True).encode()
+                with self.assertRaises(aq.InvariantError):
+                    operation(state)
+                self.assertEqual(before, json.dumps(state, sort_keys=True).encode())
+        for field in ("next_task_sequence", "next_workflow_sequence"):
+            state = aq.new_state("demo", aq.fixed_config())
+            state[field] = aq.MAX_ID_SEQUENCE + 1
+            before = copy.deepcopy(state)
+            with self.assertRaisesRegex(aq.InvariantError, "exhausted"):
+                aq.add_adversarial_review(state, "x", 0, ["r"], 1, now=self.now)
+            self.assertEqual(before, state)
+        state = aq.new_state("demo", aq.fixed_config())
+        state["next_task_sequence"] = aq.MAX_ID_SEQUENCE - 1
+        before = copy.deepcopy(state)
+        with self.assertRaisesRegex(aq.InvariantError, "task.*exhausted"):
+            aq.add_adversarial_review(state, "x", 0, ["r"], 1, now=self.now)
+        self.assertEqual(before, state)
+
+    def test_workflow_apis_reject_malformed_state_without_raw_key_error(self):
+        operations = (
+            lambda state: aq.add_adversarial_review(
+                state, "x", 0, ["r"], 1, now=self.now
+            ),
+            lambda state: aq.add_parallel_shards(
+                state, "x", 0, [["r"]], now=self.now
+            ),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation):
+                malformed = {}
+                before = copy.deepcopy(malformed)
+                with self.assertRaises(aq.InvariantError):
+                    operation(malformed)
+                self.assertEqual(before, malformed)
+
+    def test_event_failure_rolls_back_tasks_and_counters(self):
+        aq.append_event(
+            self.state, "prior", "operator", None, {}, "2026-07-11T02:00:00Z"
+        )
+        before = copy.deepcopy(self.state)
+        with self.assertRaisesRegex(aq.InvariantError, "latest event"):
+            aq.add_parallel_shards(
+                self.state, "x", 0, [["r"]], now="2026-07-11T01:00:00Z"
+            )
+        self.assertEqual(before, self.state)
+
+
 class ClaimTaskTests(unittest.TestCase):
     CREATED = "2026-07-10T05:00:00Z"
     NOW = "2026-07-10T06:00:00Z"
@@ -2994,6 +3279,146 @@ class QueueCliTests(unittest.TestCase):
         self.assertEqual(2, result.returncode)
         self.assertEqual(before, self.queue.read_bytes())
 
+    def test_cli_creates_both_workflow_templates_with_one_revision_and_event(self):
+        self.init()
+        adversarial = self.json_output(self.cli(
+            "workflow", "add", "--template", "adversarial-review",
+            "--title", "Review me", "--priority", "20",
+            "--resource", "a", "--resource", "b", "--reviewers", "3",
+        ))
+        self.assertEqual({
+            "ok": True,
+            "workflow_id": "W-000001",
+            "template": "adversarial-review",
+            "task_ids": [f"T-{i:06d}" for i in range(1, 7)],
+        }, adversarial)
+        state = aq.load_state(self.queue)
+        self.assertEqual(1, state["revision"])
+        self.assertEqual(1, len(state["events"]))
+        self.assertEqual(1, state["events"][0]["revision"])
+        self.assertNotIn("lease_token", self.queue.read_text())
+        tsv = self.cli("status", "--format", "tsv", "--workflow", "W-000001")
+        self.assertEqual(0, tsv.returncode, tsv.stderr)
+        self.assertEqual(6, sum(line.startswith("T-") for line in tsv.stdout.splitlines()))
+
+        input_path = Path(self.temporary.name) / "shards.json"
+        input_path.write_text(json.dumps({
+            "title": "Parallel", "priority": 7,
+            "shards": [["left"], ["middle"], ["right"]],
+        }))
+        parallel = self.json_output(self.cli(
+            "workflow", "add", "--template", "parallel-shards",
+            "--from-json", input_path,
+        ))
+        self.assertEqual("W-000002", parallel["workflow_id"])
+        self.assertEqual("parallel-shards", parallel["template"])
+        self.assertEqual([f"T-{i:06d}" for i in range(7, 12)], parallel["task_ids"])
+        state = aq.load_state(self.queue)
+        self.assertEqual(2, state["revision"])
+        self.assertEqual(2, len(state["events"]))
+        self.assertEqual({
+            "template": "parallel-shards",
+            "workflow_id": "W-000002",
+            "task_ids": [f"T-{i:06d}" for i in range(7, 12)],
+            "task_count": 5,
+            "shard_count": 3,
+        }, state["events"][-1]["details"])
+
+    def test_cli_workflow_user_errors_are_code_two_and_atomic(self):
+        self.init()
+        paths = []
+        for name, value in (
+            ("missing", {"title": "x"}),
+            ("unknown", {"title": "x", "shards": [["r"]], "extra": 1}),
+            ("bad-priority", {"title": "x", "priority": True, "shards": [["r"]]}),
+            ("duplicate", {"title": "x", "shards": [["r"], ["r"]]}),
+        ):
+            path = Path(self.temporary.name) / f"{name}.json"
+            path.write_text(json.dumps(value))
+            paths.append(path)
+        cases = (
+            ("workflow", "add", "--template", "adversarial-review", "--title", "x", "--resource", "r", "--from-json", paths[0]),
+            ("workflow", "add", "--template", "parallel-shards", "--from-json", paths[0]),
+            ("workflow", "add", "--template", "parallel-shards", "--from-json", paths[1]),
+            ("workflow", "add", "--template", "parallel-shards", "--from-json", paths[2]),
+            ("workflow", "add", "--template", "parallel-shards", "--from-json", paths[3]),
+            ("workflow", "add", "--template", "parallel-shards", "--title", "x", "--from-json", paths[3]),
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                before_json = self.queue.read_bytes()
+                before_tsv = self.queue.with_suffix(".tsv").read_bytes()
+                result = self.cli(*arguments)
+                self.assertEqual(2, result.returncode, result.stderr)
+                self.assertEqual("", result.stdout)
+                self.assertEqual(before_json, self.queue.read_bytes())
+                self.assertEqual(before_tsv, self.queue.with_suffix(".tsv").read_bytes())
+
+    def test_cli_workflow_corrupt_queue_is_code_six(self):
+        self.queue.write_text('{"revision": NaN}', encoding="utf-8")
+        before = self.queue.read_bytes()
+        result = self.cli(
+            "workflow", "add", "--template", "adversarial-review",
+            "--title", "x", "--resource", "r",
+        )
+        self.assertEqual(6, result.returncode)
+        self.assertEqual("", result.stdout)
+        self.assertEqual(before, self.queue.read_bytes())
+
+    def test_concurrent_workflow_creation_serializes_unique_graphs(self):
+        self.init()
+        processes = [
+            subprocess.Popen(
+                [
+                    sys.executable, str(SCRIPT_PATH), "--queue", str(self.queue),
+                    "workflow", "add", "--template", "adversarial-review",
+                    "--title", f"flow {index}", "--resource", f"r-{index}",
+                    "--reviewers", "2",
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for index in range(6)
+        ]
+        outputs = communicate_all(processes, 20)
+        self.assertTrue(all(process.returncode == 0 for process in processes), outputs)
+        results = [json.loads(stdout) for stdout, _stderr in outputs]
+        self.assertEqual(6, len({result["workflow_id"] for result in results}))
+        self.assertEqual(30, len({task_id for result in results for task_id in result["task_ids"]}))
+        state = aq.load_state(self.queue)
+        self.assertEqual(6, state["revision"])
+        self.assertEqual(6, len(state["events"]))
+        self.assertEqual(30, len(state["tasks"]))
+        aq.validate_persisted_state(state)
+        expected_by_workflow = {
+            result["workflow_id"]: tuple(result["task_ids"])
+            for result in results
+        }
+        events_by_workflow = {}
+        for event in state["events"]:
+            details = event["details"]
+            workflow_id = details["workflow_id"]
+            self.assertNotIn(workflow_id, events_by_workflow)
+            events_by_workflow[workflow_id] = tuple(details["task_ids"])
+            self.assertEqual(
+                [workflow_id] * len(details["task_ids"]),
+                [state["tasks"][task_id]["workflow_id"]
+                 for task_id in details["task_ids"]],
+            )
+        self.assertEqual(expected_by_workflow, events_by_workflow)
+
+    def test_workflow_parser_namespace_and_template_flag_validation(self):
+        task_args = aq.build_parser().parse_args(["task", "add", "--title", "x"])
+        self.assertFalse(hasattr(task_args, "workflow_command"))
+        workflow_args = aq.build_parser().parse_args([
+            "workflow", "add", "--template", "adversarial-review",
+            "--title", "x", "--resource", "r",
+        ])
+        self.assertEqual("add", workflow_args.workflow_command)
+        self.assertEqual("adversarial-review", workflow_args.template)
+        invalid = run_cli("workflow", "add", "--template", "not-real")
+        self.assertEqual(2, invalid.returncode)
+        self.assertEqual("", invalid.stdout)
+
     def test_lifecycle_commands_and_token_redaction(self):
         self.init(retry_backoff=1)
         self.add("work")
@@ -3220,7 +3645,8 @@ class QueueCliTests(unittest.TestCase):
 
     def test_parser_help_and_invalid_arguments_use_argparse_code_two(self):
         for arguments in (
-            ("--help",), ("task", "--help"), ("status", "--help"),
+            ("--help",), ("task", "--help"), ("workflow", "--help"),
+            ("workflow", "add", "--help"), ("status", "--help"),
             ("workflow", "add"), ("doctor",), ("compact",),
         ):
             result = run_cli(*arguments)

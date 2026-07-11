@@ -865,12 +865,8 @@ def validate_graph(tasks):
         )
 
 
-def add_task_batch(state, raw_tasks):
-    """Validate and atomically append a nonempty batch of generic tasks."""
-    if not isinstance(raw_tasks, list) or not raw_tasks:
-        raise InvariantError("raw_tasks must be a nonempty list")
-    candidate = copy.deepcopy(state)
-    validate_state(candidate)
+def _add_task_batch_to_candidate(candidate, raw_tasks):
+    """Append a prepared batch to an already isolated candidate state."""
     explicit_task_ids = _reserve_batch_ids(candidate, raw_tasks)
     prepared_tasks = _assign_batch_task_ids(
         candidate, raw_tasks, explicit_task_ids
@@ -883,6 +879,16 @@ def add_task_batch(state, raw_tasks):
             raise InvariantError(f"duplicate task id: {task_id}")
         candidate["tasks"][task_id] = task
         created_ids.append(task_id)
+    return created_ids
+
+
+def add_task_batch(state, raw_tasks):
+    """Validate and atomically append a nonempty batch of generic tasks."""
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        raise InvariantError("raw_tasks must be a nonempty list")
+    candidate = copy.deepcopy(state)
+    validate_state(candidate)
+    created_ids = _add_task_batch_to_candidate(candidate, raw_tasks)
     validate_state(candidate)
     state.clear()
     state.update(candidate)
@@ -892,6 +898,226 @@ def add_task_batch(state, raw_tasks):
 def add_task(state, raw):
     """Validate and atomically append one generic task."""
     return add_task_batch(state, [raw])[0]
+
+
+def _workflow_title_priority(title, priority):
+    if not isinstance(title, str) or not title.strip():
+        raise InvariantError("workflow title must be a non-blank string")
+    if not isinstance(priority, int) or isinstance(priority, bool):
+        raise InvariantError("workflow priority must be an integer")
+    return title.strip()
+
+
+def _workflow_ids(state, task_count):
+    workflow_sequence = state["next_workflow_sequence"]
+    task_sequence = state["next_task_sequence"]
+    for sequence, field in (
+        (workflow_sequence, "next_workflow_sequence"),
+        (task_sequence, "next_task_sequence"),
+    ):
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence <= 0
+        ):
+            raise InvariantError(f"{field} must be a positive integer")
+    if workflow_sequence > MAX_ID_SEQUENCE:
+        raise InvariantError("workflow id sequence exhausted at W-999999")
+    if task_sequence + task_count - 1 > MAX_ID_SEQUENCE:
+        raise InvariantError("task id sequence exhausted at T-999999")
+    workflow_id = f"W-{workflow_sequence:06d}"
+    task_ids = [
+        f"T-{sequence:06d}"
+        for sequence in range(task_sequence, task_sequence + task_count)
+    ]
+    return workflow_id, task_ids
+
+
+def _commit_workflow(state, raw_tasks, template, details, now):
+    candidate = copy.deepcopy(state)
+    created_ids = _add_task_batch_to_candidate(candidate, raw_tasks)
+    workflow_id = raw_tasks[0]["workflow_id"]
+    _append_event_to_candidate(
+        candidate,
+        "workflow.created",
+        "operator",
+        None,
+        {
+            "template": template,
+            "workflow_id": workflow_id,
+            "task_ids": created_ids,
+            "task_count": len(created_ids),
+            **details,
+        },
+        utc_now() if now is None else now,
+    )
+    validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+    return {
+        "workflow_id": workflow_id,
+        "template": template,
+        "task_ids": created_ids,
+    }
+
+
+def add_adversarial_review(
+    state, title, priority, resources, reviewer_count, now=None
+):
+    """Atomically add an implement-review-apply-verify workflow."""
+    validate_state(state)
+    title = _workflow_title_priority(title, priority)
+    if not isinstance(resources, list):
+        raise InvariantError("workflow resources must be a list")
+    if any(not isinstance(resource, str) for resource in resources):
+        raise InvariantError("workflow resources must contain strings")
+    if any(not resource.strip() for resource in resources):
+        raise InvariantError("workflow resources must contain non-blank strings")
+    if len(set(resources)) != len(resources):
+        raise InvariantError("workflow resources must be unique")
+    if (
+        not isinstance(reviewer_count, int)
+        or isinstance(reviewer_count, bool)
+        or reviewer_count <= 0
+    ):
+        raise InvariantError("reviewer_count must be a positive integer")
+
+    task_count = reviewer_count + 3
+    workflow_id, task_ids = _workflow_ids(state, task_count)
+    implement_id = task_ids[0]
+    review_ids = task_ids[1:1 + reviewer_count]
+    apply_id = task_ids[-2]
+    target_resources = ", ".join(resources)
+    raw_tasks = [{
+        "id": implement_id,
+        "workflow_id": workflow_id,
+        "role": "implement",
+        "title": title,
+        "description": f"Implement {title} for resources: {target_resources}.",
+        "priority": priority,
+        "depends_on": [],
+        "resources": list(resources),
+    }]
+    raw_tasks.extend({
+        "id": review_id,
+        "workflow_id": workflow_id,
+        "role": "review",
+        "title": f"Review {index}: {title}",
+        "description": (
+            "For target resources: "
+            f"{target_resources}. Independently review the implementation "
+            "artifact without implementer reasoning or other reviewer findings."
+        ),
+        "priority": priority - 10,
+        "depends_on": [implement_id],
+        "resources": [],
+    } for index, review_id in enumerate(review_ids, start=1))
+    raw_tasks.extend((
+        {
+            "id": apply_id,
+            "workflow_id": workflow_id,
+            "role": "apply",
+            "title": f"Apply reviews: {title}",
+            "description": f"Apply all review findings for {title}.",
+            "priority": priority - 20,
+            "depends_on": review_ids,
+            "resources": list(resources),
+        },
+        {
+            "id": task_ids[-1],
+            "workflow_id": workflow_id,
+            "role": "verify",
+            "title": f"Verify: {title}",
+            "description": f"Verify the reviewed implementation for {title}.",
+            "priority": priority - 30,
+            "depends_on": [apply_id],
+            "resources": [],
+        },
+    ))
+    return _commit_workflow(
+        state,
+        raw_tasks,
+        "adversarial-review",
+        {"reviewer_count": reviewer_count},
+        now,
+    )
+
+
+def add_parallel_shards(state, title, priority, shard_resources, now=None):
+    """Atomically add parallel resource shards followed by integration."""
+    validate_state(state)
+    title = _workflow_title_priority(title, priority)
+    if not isinstance(shard_resources, list) or not shard_resources:
+        raise InvariantError("shard_resources must be a nonempty list")
+    normalized_shards = []
+    seen_resources = set()
+    for shard in shard_resources:
+        if not isinstance(shard, list) or not shard:
+            raise InvariantError("each shard must be a nonempty resource list")
+        if any(not isinstance(resource, str) for resource in shard):
+            raise InvariantError("shard resources must be strings")
+        if any(not resource.strip() for resource in shard):
+            raise InvariantError("shard resources must be non-blank strings")
+        normalized = list(dict.fromkeys(shard))
+        duplicate = next(
+            (resource for resource in normalized if resource in seen_resources),
+            None,
+        )
+        if duplicate is not None:
+            raise InvariantError(
+                f"resource appears in more than one shard: {duplicate}"
+            )
+        seen_resources.update(normalized)
+        normalized_shards.append(normalized)
+
+    shard_count = len(normalized_shards)
+    workflow_id, task_ids = _workflow_ids(state, shard_count + 2)
+    shard_ids = task_ids[:shard_count]
+    integrate_id = task_ids[-2]
+    flattened_resources = [
+        resource for shard in normalized_shards for resource in shard
+    ]
+    raw_tasks = [{
+        "id": task_id,
+        "workflow_id": workflow_id,
+        "role": "shard",
+        "title": f"Shard {index}: {title}",
+        "description": f"Complete shard {index} for {title}.",
+        "priority": priority,
+        "depends_on": [],
+        "resources": shard,
+    } for index, (task_id, shard) in enumerate(
+        zip(shard_ids, normalized_shards), start=1
+    )]
+    raw_tasks.extend((
+        {
+            "id": integrate_id,
+            "workflow_id": workflow_id,
+            "role": "integrate",
+            "title": f"Integrate: {title}",
+            "description": f"Integrate all shards for {title}.",
+            "priority": priority - 10,
+            "depends_on": shard_ids,
+            "resources": flattened_resources,
+        },
+        {
+            "id": task_ids[-1],
+            "workflow_id": workflow_id,
+            "role": "verify",
+            "title": f"Verify: {title}",
+            "description": f"Verify the integrated result for {title}.",
+            "priority": priority - 20,
+            "depends_on": [integrate_id],
+            "resources": [],
+        },
+    ))
+    return _commit_workflow(
+        state,
+        raw_tasks,
+        "parallel-shards",
+        {"shard_count": shard_count},
+        now,
+    )
 
 
 def new_state(queue_id, config):
@@ -1176,7 +1402,7 @@ def _append_event_to_candidate(
         "actor": actor,
         "task_id": task_id,
         "revision": state["revision"] + 1,
-        "details": _sanitize_event_details(copy.deepcopy(details)),
+        "details": _sanitize_event_details(details),
     }
     state["next_event_sequence"] += 1
     state["events"].append(event)
@@ -2638,6 +2864,25 @@ def _task_input_from_args(args):
     return raw
 
 
+def _parallel_workflow_input(path):
+    raw = _json_input(path)
+    if not isinstance(raw, dict):
+        raise QueueError("parallel-shards JSON input must be an object")
+    required = {"title", "shards"}
+    allowed = required | {"priority"}
+    missing = sorted(required.difference(raw))
+    unknown = sorted(set(raw).difference(allowed))
+    if missing:
+        raise QueueError(
+            f"parallel-shards JSON input missing keys: {', '.join(missing)}"
+        )
+    if unknown:
+        raise QueueError(
+            f"parallel-shards JSON input has unknown keys: {', '.join(unknown)}"
+        )
+    return raw
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--queue", help="queue.json path")
@@ -2668,6 +2913,24 @@ def build_parser():
     add_batch_parser.add_argument("--from-json", required=True)
     show = task_commands.add_parser("show", help="show one task")
     show.add_argument("task_id")
+
+    workflow = commands.add_parser("workflow", help="manage workflows")
+    workflow_commands = workflow.add_subparsers(
+        dest="workflow_command", required=True
+    )
+    workflow_add = workflow_commands.add_parser(
+        "add", help="add a built-in workflow"
+    )
+    workflow_add.add_argument(
+        "--template",
+        choices=("adversarial-review", "parallel-shards"),
+        required=True,
+    )
+    workflow_add.add_argument("--title")
+    workflow_add.add_argument("--priority", type=int)
+    workflow_add.add_argument("--resource", action="append")
+    workflow_add.add_argument("--reviewers", type=_positive)
+    workflow_add.add_argument("--from-json")
 
     claim = commands.add_parser("claim", help="claim eligible work")
     claim.add_argument("--agent", required=True)
@@ -2773,6 +3036,46 @@ def _run_command(args, path):
 
         tasks = user_mutation(add_many)
         return {"ok": True, "tasks": tasks}
+
+    if args.command == "workflow" and args.workflow_command == "add":
+        if args.template == "adversarial-review":
+            if args.from_json is not None:
+                raise QueueError(
+                    "--from-json cannot be used with adversarial-review"
+                )
+            if args.title is None:
+                raise QueueError("adversarial-review requires --title")
+            workflow_result = user_mutation(
+                lambda state: add_adversarial_review(
+                    state,
+                    args.title,
+                    0 if args.priority is None else args.priority,
+                    [] if args.resource is None else args.resource,
+                    2 if args.reviewers is None else args.reviewers,
+                    now=utc_now(),
+                )
+            )
+        else:
+            if args.from_json is None:
+                raise QueueError("parallel-shards requires --from-json")
+            if any(value is not None for value in (
+                args.title, args.priority, args.resource, args.reviewers
+            )):
+                raise QueueError(
+                    "parallel-shards --from-json cannot be combined with "
+                    "template fields"
+                )
+            raw = _parallel_workflow_input(args.from_json)
+            workflow_result = user_mutation(
+                lambda state: add_parallel_shards(
+                    state,
+                    raw["title"],
+                    raw.get("priority", 0),
+                    raw["shards"],
+                    now=utc_now(),
+                )
+            )
+        return {"ok": True, **workflow_result}
 
     if args.command == "claim":
         claim_result = user_mutation(
