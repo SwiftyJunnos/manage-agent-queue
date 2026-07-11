@@ -2959,6 +2959,831 @@ class QueuePersistenceTests(unittest.TestCase):
             self.assertEqual(2, aq.tsv_revision(path.with_suffix(".tsv")))
 
 
+class TextLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.state = aq.new_state("demo", aq.fixed_config())
+
+    def test_utf8_text_limit_accepts_exact_bytes_and_rejects_one_byte_over(self):
+        exact = "가" * (aq.MAX_TEXT_BYTES // 3) + "x"
+        over = exact + "x"
+        self.assertEqual(aq.MAX_TEXT_BYTES, len(exact.encode("utf-8")))
+
+        task = aq.add_task(self.state, {"title": "boundary", "description": exact})
+        self.assertEqual(exact, task["description"])
+        before = copy.deepcopy(self.state)
+        with self.assertRaisesRegex(aq.InvariantError, "description.*16384 UTF-8 bytes"):
+            aq.add_task(self.state, {"title": "over", "description": over})
+        self.assertEqual(before, self.state)
+
+    def test_summary_error_and_reason_enforce_utf8_bytes_atomically(self):
+        exact = "한" * (aq.MAX_TEXT_BYTES // 3) + "x"
+        over = exact + "x"
+        for field, operation in (
+            ("summary", lambda state, value: aq.complete_task(
+                state, "T-000001", "agent", "token", value, [],
+                now="2026-07-11T00:00:01Z")),
+            ("message", lambda state, value: aq.fail_task(
+                state, "T-000001", "agent", "token", value, terminal=True,
+                now="2026-07-11T00:00:01Z")),
+        ):
+            with self.subTest(field=field):
+                state = aq.new_state("demo", aq.fixed_config())
+                aq.add_task(state, {"title": field})
+                task = state["tasks"]["T-000001"]
+                task["created_at"] = task["updated_at"] = "2026-07-11T00:00:00Z"
+                task["status"] = "leased"
+                task["attempts"] = 1
+                task["claim"] = canonical_claim(
+                    agent_id="agent",
+                    lease_token="token",
+                    claimed_at="2026-07-11T00:00:00Z",
+                    heartbeat_at="2026-07-11T00:00:00Z",
+                    expires_at="2026-07-11T01:00:00Z",
+                )
+                operation(state, exact)
+                self.assertEqual(
+                    exact,
+                    state["tasks"]["T-000001"][
+                        "result" if field == "summary" else "last_error"
+                    ]["summary" if field == "summary" else "message"],
+                )
+
+                state = aq.new_state("demo", aq.fixed_config())
+                aq.add_task(state, {"title": field})
+                task = state["tasks"]["T-000001"]
+                task["created_at"] = task["updated_at"] = "2026-07-11T00:00:00Z"
+                task["status"] = "leased"
+                task["attempts"] = 1
+                task["claim"] = canonical_claim(
+                    agent_id="agent",
+                    lease_token="token",
+                    claimed_at="2026-07-11T00:00:00Z",
+                    heartbeat_at="2026-07-11T00:00:00Z",
+                    expires_at="2026-07-11T01:00:00Z",
+                )
+                before = copy.deepcopy(state)
+                with self.assertRaisesRegex(aq.InvariantError, "16384 UTF-8 bytes"):
+                    operation(state, over)
+                self.assertEqual(before, state)
+
+        state = aq.new_state("demo", aq.fixed_config())
+        aq.add_task(state, {"title": "block"})
+        before = copy.deepcopy(state)
+        with self.assertRaisesRegex(aq.InvariantError, "reason.*16384 UTF-8 bytes"):
+            aq.block_task(state, "T-000001", over)
+        self.assertEqual(before, state)
+        aq.block_task(state, "T-000001", exact)
+        self.assertEqual(exact, state["tasks"]["T-000001"]["last_error"]["message"])
+
+    def test_persisted_oversize_text_is_corruption(self):
+        for field in ("description", "summary", "error", "reason"):
+            with self.subTest(field=field):
+                state = aq.new_state("demo", aq.fixed_config())
+                created = aq.add_task(state, {"title": "stored"})
+                task = state["tasks"][created["id"]]
+                oversized = "x" * (aq.MAX_TEXT_BYTES + 1)
+                if field == "description":
+                    task["description"] = oversized
+                elif field == "summary":
+                    task["status"] = "completed"
+                    task["result"] = {"summary": oversized, "artifacts": []}
+                else:
+                    task["status"] = "failed" if field == "error" else "blocked"
+                    task["last_error"] = {
+                        "message": oversized,
+                        "at": task["updated_at"],
+                        **({"kind": "blocked"} if field == "reason" else {}),
+                    }
+                with self.assertRaisesRegex(
+                    aq.InvariantError, "16384 UTF-8 bytes"
+                ):
+                    aq.validate_state(state)
+
+    def test_lone_surrogate_runtime_inputs_are_code_two_and_atomic(self):
+        lone_surrogate = "\ud800"
+
+        def invoke(queue, *arguments):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = aq.main(["--queue", str(queue), *arguments])
+            return code, stdout.getvalue(), stderr.getvalue()
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            description_queue = directory / "description.json"
+            aq.initialize_queue(description_queue, "demo", aq.fixed_config())
+            raw_path = directory / "surrogate.json"
+            raw_path.write_text(
+                json.dumps({"title": "bad", "description": lone_surrogate}),
+                encoding="utf-8",
+            )
+            before = (
+                description_queue.read_bytes(),
+                description_queue.with_suffix(".tsv").read_bytes(),
+            )
+            code, stdout, stderr = invoke(
+                description_queue, "task", "add", "--from-json", str(raw_path)
+            )
+            self.assertEqual(2, code)
+            self.assertEqual("", stdout)
+            self.assertNotIn("Traceback", stderr)
+            self.assertIn("description", stderr)
+            self.assertEqual(before[0], description_queue.read_bytes())
+            self.assertEqual(before[1], description_queue.with_suffix(".tsv").read_bytes())
+
+            for field, command in (
+                ("summary", "complete"),
+                ("message", "fail"),
+                ("reason", "block"),
+            ):
+                with self.subTest(field=field):
+                    queue = directory / f"{field}.json"
+                    aq.initialize_queue(queue, "demo", aq.fixed_config())
+                    state = aq.load_state(queue)
+                    task = aq.add_task(state, {"title": field})
+                    aq.write_json(queue, state)
+                    aq.atomic_write_text(
+                        queue.with_suffix(".tsv"),
+                        aq.render_tsv(state, state["updated_at"]),
+                    )
+                    if command in {"complete", "fail"}:
+                        claim = aq.mutate_queue(
+                            queue, lambda value: aq.claim_task(value, "agent")
+                        )
+                        arguments = [
+                            command, "--task", task["id"], "--agent", "agent",
+                            "--token", claim["lease_token"],
+                            "--summary" if command == "complete" else "--error",
+                            lone_surrogate,
+                        ]
+                    else:
+                        arguments = ["block", task["id"], "--reason", lone_surrogate]
+                    before = (
+                        queue.read_bytes(), queue.with_suffix(".tsv").read_bytes()
+                    )
+                    code, stdout, stderr = invoke(queue, *arguments)
+                    self.assertEqual(2, code)
+                    self.assertEqual("", stdout)
+                    self.assertNotIn("Traceback", stderr)
+                    self.assertIn(field, stderr)
+                    self.assertEqual(before[0], queue.read_bytes())
+                    self.assertEqual(before[1], queue.with_suffix(".tsv").read_bytes())
+
+    def test_lone_surrogate_persisted_fields_are_code_six_for_status_and_doctor(self):
+        lone_surrogate = "\ud800"
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            for field in ("description", "summary", "error", "reason"):
+                with self.subTest(field=field):
+                    queue = directory / f"{field}.json"
+                    state = aq.new_state("demo", aq.fixed_config())
+                    created = aq.add_task(state, {"title": field})
+                    task = state["tasks"][created["id"]]
+                    if field == "description":
+                        task["description"] = lone_surrogate
+                    elif field == "summary":
+                        task["status"] = "completed"
+                        task["result"] = {"summary": lone_surrogate, "artifacts": []}
+                    else:
+                        task["status"] = "failed" if field == "error" else "blocked"
+                        task["last_error"] = {
+                            "message": lone_surrogate,
+                            "at": task["updated_at"],
+                            **({"kind": "blocked"} if field == "reason" else {}),
+                        }
+                    queue.write_text(
+                        json.dumps(state, ensure_ascii=True), encoding="utf-8"
+                    )
+                    queue.with_suffix(".tsv").write_text(
+                        "do not modify\n", encoding="utf-8"
+                    )
+                    before_json = queue.read_bytes()
+                    before_tsv = queue.with_suffix(".tsv").read_bytes()
+                    status = run_cli(
+                        "--queue", queue, "status", "--format", "json"
+                    )
+                    self.assertEqual(6, status.returncode, status.stderr)
+                    self.assertNotIn("Traceback", status.stderr)
+                    doctor = run_cli("--queue", queue, "doctor", "--repair")
+                    self.assertEqual(6, doctor.returncode, doctor.stderr)
+                    self.assertEqual("", doctor.stderr)
+                    report = json.loads(doctor.stdout)
+                    self.assertEqual("source.invalid", report["issues"][0]["code"])
+                    self.assertEqual(before_json, queue.read_bytes())
+                    self.assertEqual(before_tsv, queue.with_suffix(".tsv").read_bytes())
+
+
+class DoctorTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.queue = Path(self.temporary.name) / "queue.json"
+        self.state = aq.initialize_queue(self.queue, "demo", aq.fixed_config())
+
+    def test_healthy_queue_and_exact_tsv_diagnostics(self):
+        report = aq.doctor(self.queue, now=self.state["updated_at"])
+        self.assertEqual({
+            "ok": True,
+            "queue": str(self.queue.absolute()),
+            "revision": 0,
+            "issues": [],
+            "repairs": [],
+        }, report)
+
+        expected_codes = {
+            "missing": "tsv.missing",
+            "malformed": "tsv.malformed",
+            "stale": "tsv.stale",
+        }
+        for kind, code in expected_codes.items():
+            with self.subTest(kind=kind):
+                aq.atomic_write_text(
+                    self.queue.with_suffix(".tsv"),
+                    aq.render_tsv(self.state, self.state["updated_at"]),
+                )
+                if kind == "missing":
+                    self.queue.with_suffix(".tsv").unlink()
+                elif kind == "malformed":
+                    self.queue.with_suffix(".tsv").write_text("bad\n")
+                else:
+                    self.queue.with_suffix(".tsv").write_text(
+                        aq.render_empty_tsv(99), encoding="utf-8"
+                    )
+                report = aq.doctor(self.queue, now=self.state["updated_at"])
+                self.assertFalse(report["ok"])
+                self.assertEqual([code], [issue["code"] for issue in report["issues"]])
+
+    def test_repair_rebuilds_exact_tsv_without_json_revision_or_event_change(self):
+        before_json = self.queue.read_bytes()
+        self.queue.with_suffix(".tsv").write_text("wrong\n", encoding="utf-8")
+
+        report = aq.doctor(
+            self.queue, repair=True, now=self.state["updated_at"]
+        )
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(["tsv.malformed"], [item["code"] for item in report["issues"]])
+        self.assertEqual(["tsv.rebuilt"], [item["code"] for item in report["repairs"]])
+        self.assertEqual(before_json, self.queue.read_bytes())
+        self.assertEqual(
+            aq.render_tsv(self.state, self.state["updated_at"]).encode(),
+            self.queue.with_suffix(".tsv").read_bytes(),
+        )
+        self.assertEqual(0, aq.load_state(self.queue)["revision"])
+        self.assertEqual([], aq.load_state(self.queue)["events"])
+
+    def test_corrupt_source_is_reported_and_never_repaired(self):
+        cases = {
+            "json": b'{"schema_version": NaN}\n',
+            "schema": json.dumps({**self.state, "schema_version": 2}).encode(),
+            "graph": None,
+            "counter": json.dumps({**self.state, "next_task_sequence": 0}).encode(),
+            "event": None,
+        }
+        graph = copy.deepcopy(self.state)
+        created = aq.add_task(graph, {"title": "bad graph"})
+        graph["tasks"][created["id"]]["depends_on"] = ["T-999999"]
+        cases["graph"] = json.dumps(graph).encode()
+        event = copy.deepcopy(self.state)
+        event["events"] = [{
+            "seq": 1, "at": event["updated_at"], "type": "bad",
+            "actor": "test", "task_id": "T-999999", "revision": 1,
+            "details": {},
+        }]
+        event["next_event_sequence"] = 2
+        cases["event"] = json.dumps(event).encode()
+
+        for name, source in cases.items():
+            with self.subTest(name=name):
+                self.queue.write_bytes(source)
+                self.queue.with_suffix(".tsv").write_bytes(b"do not touch\n")
+                before_json = self.queue.read_bytes()
+                before_tsv = self.queue.with_suffix(".tsv").read_bytes()
+                report = aq.doctor(self.queue, repair=True)
+                self.assertFalse(report["ok"])
+                self.assertIsNone(report["revision"])
+                self.assertEqual("source.invalid", report["issues"][0]["code"])
+                self.assertEqual([], report["repairs"])
+                self.assertEqual(before_json, self.queue.read_bytes())
+                self.assertEqual(before_tsv, self.queue.with_suffix(".tsv").read_bytes())
+                aq.write_json(self.queue, self.state)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_hostile_symlink_lock_and_orphan_are_never_followed(self):
+        target = Path(self.temporary.name) / "target"
+        target.mkdir()
+        marker = target / "marker"
+        marker.write_text("safe", encoding="utf-8")
+        lock_path = Path(str(self.queue) + ".lock")
+        os.symlink(target, lock_path, target_is_directory=True)
+        report = aq.doctor(self.queue, repair=True)
+        self.assertEqual(["lock.invalid"], [
+            issue["code"] for issue in report["issues"]
+        ])
+        self.assertEqual("safe", marker.read_text())
+        self.assertTrue(lock_path.is_symlink())
+        lock_path.unlink()
+
+        orphan = lock_path.with_name(f".{lock_path.name}.orphan-{'d' * 24}")
+        os.symlink(target, orphan, target_is_directory=True)
+        report = aq.doctor(self.queue, repair=True, now=self.state["updated_at"])
+        self.assertFalse(report["ok"])
+        self.assertIn("lock_artifact.unsafe", [i["code"] for i in report["issues"]])
+        self.assertTrue(orphan.is_symlink())
+        self.assertEqual("safe", marker.read_text())
+
+    def test_valid_stale_lock_and_orphan_directories_are_cleaned_deterministically(self):
+        lock_path = Path(str(self.queue) + ".lock")
+        lock_path.mkdir()
+        old = time.time() - 120
+        os.utime(lock_path, (old, old))
+        artifact = lock_path.with_name(f".{lock_path.name}.orphan-{'a' * 24}")
+        artifact.mkdir()
+        (artifact / "owner.json").write_text("{}", encoding="utf-8")
+
+        report = aq.doctor(self.queue, repair=True, now=self.state["updated_at"])
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(
+            ["lock.stale", "lock_artifact.orphan"],
+            [item["code"] for item in report["issues"]],
+        )
+        self.assertEqual(
+            ["lock.removed", "lock_artifact.removed"],
+            [item["code"] for item in report["repairs"]],
+        )
+        self.assertFalse(lock_path.exists())
+        self.assertFalse(artifact.exists())
+
+    def test_corrupt_guard_is_fail_closed_and_live_guard_times_out(self):
+        guard = Path(str(self.queue) + ".lock.guard")
+        guard.write_bytes(b"bad")
+        before_json = self.queue.read_bytes()
+        before_tsv = self.queue.with_suffix(".tsv").read_bytes()
+        report = aq.doctor(self.queue, repair=True)
+        self.assertEqual(["guard.invalid"], [
+            issue["code"] for issue in report["issues"]
+        ])
+        self.assertEqual(b"bad", guard.read_bytes())
+        self.assertEqual(before_json, self.queue.read_bytes())
+        self.assertEqual(before_tsv, self.queue.with_suffix(".tsv").read_bytes())
+
+        guard.write_bytes(aq.GUARD_MARKER)
+        self.state["config"]["lock_timeout_seconds"] = 1
+        aq.write_json(self.queue, self.state)
+        with aq.QueueLock(self.queue, lock_timeout=1, stale_seconds=30):
+            report = aq.doctor(self.queue, repair=True)
+        self.assertEqual(["lock.timeout"], [
+            issue["code"] for issue in report["issues"]
+        ])
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_tsv_symlink_is_reported_without_touching_target(self):
+        target = Path(self.temporary.name) / "target.tsv"
+        target.write_text("victim\n", encoding="utf-8")
+        self.queue.with_suffix(".tsv").unlink()
+        os.symlink(target, self.queue.with_suffix(".tsv"))
+
+        report = aq.doctor(
+            self.queue, repair=True, now=self.state["updated_at"]
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(["tsv.unsafe"], [item["code"] for item in report["issues"]])
+        self.assertEqual([], report["repairs"])
+        self.assertEqual("victim\n", target.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_cli_guard_and_lock_failures_always_emit_structured_report(self):
+        expected_base = {
+            "ok": False,
+            "queue": str(self.queue.absolute()),
+            "revision": None,
+            "repairs": [],
+        }
+        guard = Path(str(self.queue) + ".lock.guard")
+        lock_path = Path(str(self.queue) + ".lock")
+        target = Path(self.temporary.name) / "victim"
+        target.write_text("safe", encoding="utf-8")
+
+        for name, setup, issue_code in (
+            ("corrupt_guard", lambda: guard.write_bytes(b"bad"), "guard.invalid"),
+            (
+                "symlink_guard",
+                lambda: os.symlink(target, guard),
+                "guard.invalid",
+            ),
+            (
+                "nonregular_lock",
+                lambda: (guard.write_bytes(aq.GUARD_MARKER),
+                         lock_path.write_text("hostile", encoding="utf-8")),
+                "lock.invalid",
+            ),
+        ):
+            with self.subTest(name=name):
+                if guard.is_symlink() or guard.exists():
+                    guard.unlink()
+                if lock_path.exists() or lock_path.is_symlink():
+                    lock_path.unlink()
+                setup()
+                before_json = self.queue.read_bytes()
+                before_tsv = self.queue.with_suffix(".tsv").read_bytes()
+                result = run_cli(
+                    "--queue", self.queue, "doctor", "--repair", timeout=8
+                )
+                self.assertEqual(6, result.returncode, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(expected_base, {
+                    key: report[key] for key in expected_base
+                })
+                self.assertEqual([issue_code], [
+                    issue["code"] for issue in report["issues"]
+                ])
+                self.assertEqual(before_json, self.queue.read_bytes())
+                self.assertEqual(before_tsv, self.queue.with_suffix(".tsv").read_bytes())
+                self.assertEqual("safe", target.read_text(encoding="utf-8"))
+
+        if lock_path.exists():
+            lock_path.unlink()
+        if guard.is_symlink() or guard.exists():
+            guard.unlink()
+        guard.write_bytes(aq.GUARD_MARKER)
+        self.state["config"]["lock_timeout_seconds"] = 1
+        aq.write_json(self.queue, self.state)
+        with aq.QueueLock(self.queue, lock_timeout=1, stale_seconds=30):
+            result = run_cli(
+                "--queue", self.queue, "doctor", "--repair", timeout=8
+            )
+        self.assertEqual(4, result.returncode, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(expected_base, {key: report[key] for key in expected_base})
+        self.assertEqual(["lock.timeout"], [
+            issue["code"] for issue in report["issues"]
+        ])
+
+    def test_filesystem_inspection_errors_emit_structured_fail_closed_json(self):
+        real_lstat = aq.os.lstat
+
+        def invoke():
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = aq.main([
+                    "--queue", str(self.queue), "doctor", "--repair"
+                ])
+            self.assertEqual(6, code)
+            self.assertEqual("", stderr.getvalue())
+            self.assertNotEqual("", stdout.getvalue())
+            return json.loads(stdout.getvalue())
+
+        selected_paths = (
+            ("source.unreadable", self.queue),
+            ("lock.unreadable", Path(str(self.queue) + ".lock")),
+            ("tsv.unreadable", self.queue.with_suffix(".tsv")),
+        )
+        for expected_code, selected in selected_paths:
+            with self.subTest(expected_code=expected_code):
+                def selective_lstat(path):
+                    if Path(path) == selected:
+                        raise PermissionError("injected unreadable path")
+                    return real_lstat(path)
+
+                before_json = self.queue.read_bytes()
+                before_tsv = self.queue.with_suffix(".tsv").read_bytes()
+                with mock.patch.object(aq.os, "lstat", side_effect=selective_lstat):
+                    report = invoke()
+                self.assertEqual([expected_code], [
+                    issue["code"] for issue in report["issues"]
+                ])
+                self.assertEqual([], report["repairs"])
+                self.assertEqual(before_json, self.queue.read_bytes())
+                self.assertEqual(before_tsv, self.queue.with_suffix(".tsv").read_bytes())
+
+        real_read_text = aq.Path.read_text
+
+        def selective_read_text(selected_path, *args, **kwargs):
+            if selected_path == self.queue:
+                raise PermissionError("injected unreadable source")
+            return real_read_text(selected_path, *args, **kwargs)
+
+        with mock.patch.object(
+            aq.Path, "read_text", selective_read_text
+        ):
+            report = invoke()
+        self.assertEqual(["source.unreadable"], [
+            issue["code"] for issue in report["issues"]
+        ])
+        self.assertEqual([], report["repairs"])
+
+        before_json = self.queue.read_bytes()
+        before_tsv = self.queue.with_suffix(".tsv").read_bytes()
+        with mock.patch.object(
+            aq.Path, "iterdir", side_effect=PermissionError("injected iteration")
+        ):
+            report = invoke()
+        self.assertEqual(["lock_artifacts.unreadable"], [
+            issue["code"] for issue in report["issues"]
+        ])
+        self.assertEqual([], report["repairs"])
+        self.assertEqual(before_json, self.queue.read_bytes())
+        self.assertEqual(before_tsv, self.queue.with_suffix(".tsv").read_bytes())
+
+    def test_stale_lock_cleanup_failure_is_not_reported_as_a_repair(self):
+        lock_path = Path(str(self.queue) + ".lock")
+        lock_path.mkdir()
+        old = time.time() - 120
+        os.utime(lock_path, (old, old))
+
+        with mock.patch.object(
+            aq.QueueLock, "_rename_and_remove", return_value=False
+        ):
+            report = aq.doctor(
+                self.queue, repair=True, now=self.state["updated_at"]
+            )
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            ["lock.stale", "lock.remove_failed"],
+            [issue["code"] for issue in report["issues"]],
+        )
+        self.assertEqual([], report["repairs"])
+        self.assertTrue(lock_path.is_dir())
+
+    def test_stale_lock_quarantine_cleanup_failure_remains_fail_closed(self):
+        lock_path = Path(str(self.queue) + ".lock")
+        lock_path.mkdir()
+        old = time.time() - 120
+        os.utime(lock_path, (old, old))
+
+        with mock.patch.object(
+            aq.shutil, "rmtree", side_effect=OSError("injected cleanup failure")
+        ):
+            report = aq.doctor(
+                self.queue, repair=True, now=self.state["updated_at"]
+            )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("lock.remove_failed", [
+            issue["code"] for issue in report["issues"]
+        ])
+        self.assertNotIn("lock.removed", [
+            repair["code"] for repair in report["repairs"]
+        ])
+        quarantines = [
+            child for child in lock_path.parent.iterdir()
+            if "orphan-" in child.name or "doctor-" in child.name
+        ]
+        self.assertTrue(quarantines)
+
+    def test_guard_release_failures_preserve_structured_doctor_report(self):
+        real_release = aq.QueueLock._release_guard
+        real_close = aq.os.close
+
+        def invoke(queue):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = aq.main(["--queue", str(queue), "doctor"])
+            self.assertEqual(6, code)
+            self.assertEqual("", stderr.getvalue())
+            self.assertNotEqual("", stdout.getvalue())
+            report = json.loads(stdout.getvalue())
+            self.assertFalse(report["ok"])
+            self.assertEqual([], report["repairs"])
+            self.assertNotIn("Traceback", stdout.getvalue())
+            return report
+
+        def release_then_fail(lock):
+            real_release(lock)
+            raise OSError("injected release failure")
+
+        def close_then_fail(descriptor):
+            real_close(descriptor)
+            raise OSError("injected close failure")
+
+        cases = (
+            ("release", mock.patch.object(
+                aq.QueueLock, "_release_guard", release_then_fail
+            )),
+            ("unlock", mock.patch.object(
+                aq.QueueLock, "_unlock_guard",
+                side_effect=OSError("injected unlock failure"),
+            )),
+            ("close", mock.patch.object(
+                aq.os, "close", side_effect=close_then_fail
+            )),
+        )
+        for name, patcher in cases:
+            with self.subTest(name=name), patcher:
+                report = invoke(self.queue)
+            self.assertEqual(["guard.release_failed"], [
+                issue["code"] for issue in report["issues"]
+            ])
+
+        missing_queue = Path(self.temporary.name) / "missing.json"
+        with mock.patch.object(
+            aq.QueueLock, "_release_guard", release_then_fail
+        ):
+            report = invoke(missing_queue)
+        self.assertEqual(
+            ["source.missing", "guard.release_failed"],
+            [issue["code"] for issue in report["issues"]],
+        )
+
+    def test_failed_artifact_cleanup_is_rediscovered_by_next_doctor(self):
+        lock_path = Path(str(self.queue) + ".lock")
+        artifact = lock_path.with_name(
+            f".{lock_path.name}.orphan-{'a' * 24}"
+        )
+        artifact.mkdir()
+
+        with mock.patch.object(
+            aq.shutil, "rmtree", side_effect=OSError("injected cleanup failure")
+        ):
+            first = aq.doctor(
+                self.queue, repair=True, now=self.state["updated_at"]
+            )
+        self.assertFalse(first["ok"])
+        self.assertIn("lock_artifact.remove_failed", [
+            issue["code"] for issue in first["issues"]
+        ])
+
+        second = aq.doctor(
+            self.queue, repair=False, now=self.state["updated_at"]
+        )
+        self.assertFalse(second["ok"])
+        self.assertIn("lock_artifact.orphan", [
+            issue["code"] for issue in second["issues"]
+        ])
+
+        for child in list(self.queue.parent.iterdir()):
+            if child.is_dir() and "orphan-" in child.name:
+                aq.shutil.rmtree(child)
+        legacy = lock_path.with_name(
+            f"..{lock_path.name}.orphan-{'b' * 24}.doctor-{'c' * 24}"
+        )
+        legacy.mkdir()
+        legacy_report = aq.doctor(
+            self.queue, repair=False, now=self.state["updated_at"]
+        )
+        self.assertFalse(legacy_report["ok"])
+        self.assertIn("lock_artifact.orphan", [
+            issue["code"] for issue in legacy_report["issues"]
+        ])
+
+
+class CompactionTests(unittest.TestCase):
+    OLD = "2020-01-01T00:00:00Z"
+    CUTOFF = "2021-01-01T00:00:00Z"
+    NOW = "2026-07-11T00:00:00Z"
+
+    def task(self, state, title, status="completed", workflow_id=None,
+             depends_on=None, updated_at=None):
+        created = aq.add_task(state, {
+            "title": title,
+            "workflow_id": workflow_id,
+            "depends_on": depends_on or [],
+        })
+        task = state["tasks"][created["id"]]
+        task["created_at"] = self.OLD
+        task["updated_at"] = updated_at or self.OLD
+        task["status"] = status
+        if status == "completed":
+            task["result"] = {"summary": "done", "artifacts": []}
+        elif status == "failed":
+            task["last_error"] = {"message": "bad", "at": task["updated_at"]}
+        elif status == "blocked":
+            task["last_error"] = {
+                "message": "wait", "at": task["updated_at"], "kind": "blocked"
+            }
+        elif status == "leased":
+            task["attempts"] = 1
+            task["claim"] = canonical_claim(
+                claimed_at=self.OLD, heartbeat_at=self.OLD,
+                expires_at="2030-01-01T00:00:00Z",
+            )
+        return task
+
+    def test_parse_compaction_cutoff_accepts_date_and_canonical_utc(self):
+        self.assertEqual(self.CUTOFF, aq.parse_compaction_cutoff("2021-01-01"))
+        self.assertEqual(self.CUTOFF, aq.parse_compaction_cutoff(self.CUTOFF))
+        for invalid in ("", "2021-1-1", "2021-01-01T00:00:00+00:00", "no"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(aq.InvariantError):
+                    aq.parse_compaction_cutoff(invalid)
+
+    def test_referenced_completed_dependency_is_retained(self):
+        state = aq.new_state("demo", aq.fixed_config())
+        dependency = self.task(state, "old")
+        self.task(state, "pending", status="pending", depends_on=[dependency["id"]])
+        before = copy.deepcopy(state)
+
+        summary = aq.compact_state(state, self.CUTOFF, now=self.NOW)
+
+        self.assertEqual(0, summary["removed_task_count"])
+        self.assertEqual(before, state)
+
+    def test_prunes_standalone_and_whole_workflow_but_retains_ineligible_groups(self):
+        state = aq.new_state("demo", aq.fixed_config())
+        standalone = self.task(state, "standalone")
+        whole = [
+            self.task(state, "whole-a", workflow_id="W-000001"),
+            self.task(state, "whole-b", status="failed", workflow_id="W-000001"),
+        ]
+        retained = [
+            self.task(state, "partial-old", workflow_id="W-000002"),
+            self.task(state, "partial-new", workflow_id="W-000002", updated_at=self.NOW),
+            self.task(state, "blocked", status="blocked"),
+            self.task(state, "pending", status="pending"),
+            self.task(state, "leased", status="leased"),
+        ]
+
+        summary = aq.compact_state(state, self.CUTOFF, now=self.NOW)
+
+        self.assertEqual(
+            [standalone["id"], *(task["id"] for task in whole)],
+            summary["removed_task_ids"],
+        )
+        self.assertEqual(["W-000001"], summary["removed_workflow_ids"])
+        self.assertTrue(all(task["id"] in state["tasks"] for task in retained))
+        aq.validate_state(state)
+
+    def test_event_cleanup_counts_new_task_events_and_old_unrelated_events(self):
+        state = aq.new_state("demo", aq.fixed_config())
+        removed = self.task(state, "remove")
+        retained = self.task(state, "keep", status="pending")
+        aq.append_event(state, "old.unrelated", "test", None, {}, self.OLD)
+        aq.append_event(state, "new.removed", "test", removed["id"], {}, "2025-01-01T00:00:00Z")
+        aq.append_event(
+            state, "new.details", "test", None,
+            {"task_ids": [removed["id"]]}, "2025-01-01T12:00:00Z",
+        )
+        aq.append_event(state, "new.retained", "test", retained["id"], {}, "2025-01-02T00:00:00Z")
+        counters = (
+            state["next_task_sequence"], state["next_workflow_sequence"],
+            state["next_event_sequence"],
+        )
+
+        summary = aq.compact_state(state, self.CUTOFF, now=self.NOW)
+
+        self.assertEqual(3, summary["removed_event_count"])
+        self.assertEqual([removed["id"]], summary["removed_task_ids"])
+        self.assertEqual(counters[:2], (
+            state["next_task_sequence"], state["next_workflow_sequence"]
+        ))
+        self.assertEqual(counters[2] + 1, state["next_event_sequence"])
+        event = state["events"][-1]
+        self.assertEqual("queue.compacted", event["type"])
+        self.assertIsNone(event["task_id"])
+        self.assertEqual({
+            "removed_event_count": 3,
+            "removed_task_count": 1,
+            "removed_task_ids": [removed["id"]],
+            "removed_workflow_count": 0,
+            "removed_workflow_ids": [],
+        }, event["details"])
+        aq.validate_state(state)
+
+    def test_counters_are_not_reused_and_large_chain_is_iterative(self):
+        state = aq.new_state("demo", aq.fixed_config())
+        first = self.task(state, "task 0")
+        template = copy.deepcopy(first)
+        previous = first["id"]
+        for index in range(1, 1500):
+            task_id = f"T-{index + 1:06d}"
+            task = copy.deepcopy(template)
+            task["id"] = task_id
+            task["title"] = f"task {index}"
+            task["depends_on"] = [previous]
+            state["tasks"][task_id] = task
+            previous = task_id
+        state["next_task_sequence"] = 1501
+        next_task = state["next_task_sequence"]
+
+        summary = aq.compact_state(state, self.CUTOFF, now=self.NOW)
+
+        self.assertEqual(1500, summary["removed_task_count"])
+        new_task = aq.add_task(state, {"title": "new"})
+        self.assertEqual(f"T-{next_task:06d}", new_task["id"])
+
+    def test_invalid_or_corrupt_inputs_leave_state_byte_identical(self):
+        state = aq.new_state("demo", aq.fixed_config())
+        self.task(state, "old")
+        for cutoff in ("bad", "2021-1-1"):
+            before = copy.deepcopy(state)
+            with self.assertRaises(aq.InvariantError):
+                aq.compact_state(state, cutoff, now=self.NOW)
+            self.assertEqual(before, state)
+        state["next_task_sequence"] = 0
+        before = copy.deepcopy(state)
+        with self.assertRaises(aq.InvariantError):
+            aq.compact_state(state, self.CUTOFF, now=self.NOW)
+        self.assertEqual(before, state)
+
+
 class QueueLockTests(unittest.TestCase):
     def assert_hostile_guard_rejected(self, path):
         lock = aq.QueueLock(path, lock_timeout=0.05, stale_seconds=1)
@@ -3643,11 +4468,89 @@ class QueueCliTests(unittest.TestCase):
         self.assertEqual("", result.stdout)
         self.assertIn("invalid choice", result.stderr)
 
+    def test_cli_text_limit_is_code_two_but_persisted_corruption_is_code_six(self):
+        self.init()
+        over = "한" * ((aq.MAX_TEXT_BYTES // 3) + 1)
+        before_json = self.queue.read_bytes()
+        before_tsv = self.queue.with_suffix(".tsv").read_bytes()
+        result = self.cli("task", "add", "--title", "too large", "--description", over)
+        self.assertEqual(2, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout)
+        self.assertEqual(before_json, self.queue.read_bytes())
+        self.assertEqual(before_tsv, self.queue.with_suffix(".tsv").read_bytes())
+
+        state = aq.load_state(self.queue)
+        created = aq.add_task(state, {"title": "corrupt"})
+        state["tasks"][created["id"]]["description"] = "x" * (aq.MAX_TEXT_BYTES + 1)
+        self.queue.write_text(json.dumps(state), encoding="utf-8")
+        corrupt = self.cli("status", "--format", "json")
+        self.assertEqual(6, corrupt.returncode)
+        self.assertEqual("", corrupt.stdout)
+
+    def test_doctor_cli_json_exit_codes_and_repair(self):
+        self.init()
+        healthy = self.cli("doctor")
+        self.assertEqual(0, healthy.returncode, healthy.stderr)
+        self.assertEqual("", healthy.stderr)
+        self.assertTrue(json.loads(healthy.stdout)["ok"])
+
+        self.queue.with_suffix(".tsv").unlink()
+        broken = self.cli("doctor")
+        self.assertEqual(6, broken.returncode)
+        self.assertEqual("", broken.stderr)
+        self.assertFalse(json.loads(broken.stdout)["ok"])
+        repaired = self.cli("doctor", "--repair")
+        self.assertEqual(0, repaired.returncode, repaired.stderr)
+        self.assertTrue(json.loads(repaired.stdout)["ok"])
+
+        self.queue.write_text("{bad", encoding="utf-8")
+        before_tsv = self.queue.with_suffix(".tsv").read_bytes()
+        corrupt = self.cli("doctor", "--repair")
+        self.assertEqual(6, corrupt.returncode)
+        self.assertEqual("", corrupt.stderr)
+        self.assertFalse(json.loads(corrupt.stdout)["ok"])
+        self.assertEqual(before_tsv, self.queue.with_suffix(".tsv").read_bytes())
+
+    def test_compact_cli_commits_once_regenerates_tsv_and_noop_does_not_churn(self):
+        state = aq.new_state("demo", aq.fixed_config())
+        created = aq.add_task(state, {"title": "old"})
+        task = state["tasks"][created["id"]]
+        task["created_at"] = task["updated_at"] = "2020-01-01T00:00:00Z"
+        task["status"] = "completed"
+        task["result"] = {"summary": "done", "artifacts": []}
+        aq.write_json(self.queue, state)
+        aq.atomic_write_text(
+            self.queue.with_suffix(".tsv"), aq.render_tsv(state, state["updated_at"])
+        )
+
+        compacted = self.json_output(
+            self.cli("compact", "--before", "2021-01-01")
+        )
+        self.assertEqual(1, compacted["removed_task_count"])
+        persisted = aq.load_state(self.queue)
+        self.assertEqual(1, persisted["revision"])
+        self.assertEqual("queue.compacted", persisted["events"][-1]["type"])
+        self.assertEqual(1, aq.tsv_revision(self.queue.with_suffix(".tsv")))
+
+        before_json = self.queue.read_bytes()
+        before_tsv = self.queue.with_suffix(".tsv").read_bytes()
+        noop = self.json_output(
+            self.cli("compact", "--before", "2021-01-01T00:00:00Z")
+        )
+        self.assertEqual(0, noop["removed_task_count"])
+        self.assertEqual(0, noop["removed_event_count"])
+        self.assertEqual(before_json, self.queue.read_bytes())
+        self.assertEqual(before_tsv, self.queue.with_suffix(".tsv").read_bytes())
+
+        invalid = self.cli("compact", "--before", "not-a-date")
+        self.assertEqual(2, invalid.returncode)
+        self.assertEqual(before_json, self.queue.read_bytes())
+
     def test_parser_help_and_invalid_arguments_use_argparse_code_two(self):
         for arguments in (
             ("--help",), ("task", "--help"), ("workflow", "--help"),
             ("workflow", "add", "--help"), ("status", "--help"),
-            ("workflow", "add"), ("doctor",), ("compact",),
+            ("workflow", "add"), ("compact",),
         ):
             result = run_cli(*arguments)
             if "--help" in arguments:

@@ -41,6 +41,7 @@ else:
 SCHEMA_VERSION = 1
 MAX_ID_SEQUENCE = 999_999
 MAX_JSON_METADATA_DEPTH = 64
+MAX_TEXT_BYTES = 16 * 1024
 STORED_STATUSES = {
     "pending",
     "leased",
@@ -531,6 +532,24 @@ def _deduplicated_string_list(raw, field):
     return list(dict.fromkeys(raw))
 
 
+def _validate_bounded_text(value, field, *, nonempty=False):
+    """Validate text stored directly in queue state using a UTF-8 byte cap."""
+    if not isinstance(value, str) or (nonempty and not value):
+        qualifier = "nonempty " if nonempty else ""
+        raise InvariantError(f"{field} must be a {qualifier}string")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise InvariantError(
+            f"{field} must contain valid UTF-8 text"
+        ) from error
+    if len(encoded) > MAX_TEXT_BYTES:
+        raise InvariantError(
+            f"{field} must be at most {MAX_TEXT_BYTES} UTF-8 bytes"
+        )
+    return value
+
+
 def normalize_task(state, raw):
     """Create a canonical pending task from generic task input."""
     if not isinstance(raw, dict):
@@ -547,8 +566,7 @@ def normalize_task(state, raw):
     if not isinstance(title, str) or not title.strip():
         raise InvariantError("task title must be a non-blank string")
     description = raw.get("description", "")
-    if not isinstance(description, str):
-        raise InvariantError("task description must be a string")
+    _validate_bounded_text(description, "task description")
 
     priority = raw.get("priority", 0)
     if not isinstance(priority, int) or isinstance(priority, bool):
@@ -691,8 +709,7 @@ def validate_task(task, expected_id=None):
             )
     if not isinstance(task["title"], str) or not task["title"].strip():
         raise InvariantError("task title must be a non-blank string")
-    if not isinstance(task["description"], str):
-        raise InvariantError("task description must be a string")
+    _validate_bounded_text(task["description"], "task description")
     if (
         not isinstance(task["status"], str)
         or task["status"] not in STORED_STATUSES
@@ -774,6 +791,9 @@ def validate_task(task, expected_id=None):
             raise InvariantError("task result keys must be summary and artifacts")
         if not isinstance(result["summary"], str) or not result["summary"]:
             raise InvariantError("task result.summary must be a nonempty string")
+        _validate_bounded_text(
+            result["summary"], "task result.summary", nonempty=True
+        )
         artifacts = result["artifacts"]
         if not isinstance(artifacts, list) or any(
             not isinstance(artifact, str) or not artifact
@@ -799,6 +819,9 @@ def validate_task(task, expected_id=None):
             raise InvariantError(
                 "task last_error.message must be a nonempty string"
             )
+        _validate_bounded_text(
+            last_error["message"], "task last_error.message", nonempty=True
+        )
         _validate_timestamp(last_error["at"], "task last_error.at")
         if "kind" in last_error and last_error["kind"] != "blocked":
             raise InvariantError("task last_error.kind must equal blocked")
@@ -1754,8 +1777,7 @@ def heartbeat_task(
 
 
 def _validate_text(value, field):
-    if not isinstance(value, str) or not value:
-        raise InvariantError(f"{field} must be a nonempty string")
+    _validate_bounded_text(value, field, nonempty=True)
 
 
 def _validate_artifacts(artifacts):
@@ -1996,6 +2018,143 @@ def unblock_task(state, task_id, now=None):
         candidate, "task.unblocked", "operator", task_id, {}, now
     )
     return _commit_transition(state, candidate, task_id)
+
+
+def parse_compaction_cutoff(value):
+    """Parse a date or canonical UTC timestamp into a canonical cutoff."""
+    if not isinstance(value, str):
+        raise InvariantError(
+            "before must be YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ"
+        )
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value, flags=re.ASCII):
+        candidate = value + "T00:00:00Z"
+    else:
+        candidate = value
+    try:
+        _validate_timestamp(candidate, "before")
+    except InvariantError as error:
+        raise InvariantError(
+            "before must be YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ"
+        ) from error
+    return candidate
+
+
+def _contains_task_reference(value, task_ids):
+    """Return whether JSON metadata contains an exact removed task ID value."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if item in task_ids:
+                return True
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return False
+
+
+def compact_state(state, before, now=None):
+    """Prune closed history while preserving all retained dependency closure."""
+    validate_state(state)
+    cutoff = parse_compaction_cutoff(before)
+    now = _canonical_now(now)
+    candidate = copy.deepcopy(state)
+    terminal = {"completed", "failed", "cancelled"}
+
+    workflow_members = {}
+    task_units = {}
+    for task_id, task in candidate["tasks"].items():
+        workflow_id = task["workflow_id"]
+        unit = ("workflow", workflow_id) if workflow_id is not None else (
+            "task", task_id
+        )
+        task_units[task_id] = unit
+        if workflow_id is not None:
+            workflow_members.setdefault(workflow_id, []).append(task_id)
+
+    candidate_units = set()
+    for workflow_id, task_ids in workflow_members.items():
+        if all(
+            candidate["tasks"][task_id]["status"] in terminal
+            and candidate["tasks"][task_id]["updated_at"] < cutoff
+            for task_id in task_ids
+        ):
+            candidate_units.add(("workflow", workflow_id))
+    for task_id, task in candidate["tasks"].items():
+        if (
+            task["workflow_id"] is None
+            and task["status"] in terminal
+            and task["updated_at"] < cutoff
+        ):
+            candidate_units.add(("task", task_id))
+
+    # A candidate unit is retained if any retained unit depends on it. Propagate
+    # that requirement backwards through candidates without recursion.
+    required_units = set()
+    reverse_unit_edges = {unit: set() for unit in candidate_units}
+    for dependent_id, task in candidate["tasks"].items():
+        dependent_unit = task_units[dependent_id]
+        for dependency_id in task["depends_on"]:
+            dependency_unit = task_units[dependency_id]
+            if dependency_unit not in candidate_units:
+                continue
+            if dependent_unit not in candidate_units:
+                required_units.add(dependency_unit)
+            elif dependent_unit != dependency_unit:
+                reverse_unit_edges.setdefault(dependent_unit, set()).add(
+                    dependency_unit
+                )
+    stack = list(required_units)
+    while stack:
+        retained_unit = stack.pop()
+        for dependency_unit in reverse_unit_edges.get(retained_unit, ()):
+            if dependency_unit not in required_units:
+                required_units.add(dependency_unit)
+                stack.append(dependency_unit)
+
+    removed_units = candidate_units.difference(required_units)
+    removed_task_ids = sorted(
+        task_id
+        for task_id, unit in task_units.items()
+        if unit in removed_units
+    )
+    removed_workflow_ids = sorted(
+        unit_id for kind, unit_id in removed_units if kind == "workflow"
+    )
+    removed_task_set = set(removed_task_ids)
+    kept_events = []
+    removed_event_count = 0
+    for event in candidate["events"]:
+        if (
+            event["at"] < cutoff
+            or event["task_id"] in removed_task_set
+            or _contains_task_reference(event["details"], removed_task_set)
+        ):
+            removed_event_count += 1
+        else:
+            kept_events.append(event)
+
+    summary = {
+        "removed_event_count": removed_event_count,
+        "removed_task_count": len(removed_task_ids),
+        "removed_task_ids": removed_task_ids,
+        "removed_workflow_count": len(removed_workflow_ids),
+        "removed_workflow_ids": removed_workflow_ids,
+    }
+    if not removed_task_ids and not removed_event_count:
+        return copy.deepcopy(summary)
+
+    for task_id in removed_task_ids:
+        del candidate["tasks"][task_id]
+    candidate["events"] = kept_events
+    _append_event_to_candidate(
+        candidate, "queue.compacted", "operator", None, summary, now
+    )
+    validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+    return copy.deepcopy(summary)
 
 
 def cancel_task(state, task_id, now=None):
@@ -2345,6 +2504,344 @@ def tsv_revision(path):
     return int(match.group(1)) if match is not None else None
 
 
+def _diagnostic_item(code, path, message):
+    return {"code": code, "path": str(path), "message": message}
+
+
+def _remove_diagnostic_directory(path, lock_path):
+    """Remove one already-validated directory without following replacements."""
+    path = Path(path)
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise InvariantError(f"diagnostic target must be a real directory: {path}")
+    lock_path = Path(lock_path)
+    quarantine = lock_path.with_name(
+        f".{lock_path.name}.orphan-{secrets.token_hex(12)}"
+    )
+    os.replace(path, quarantine)
+    moved = os.lstat(quarantine)
+    if (before.st_dev, before.st_ino) != (moved.st_dev, moved.st_ino):
+        raise InvariantError(f"diagnostic target changed while removing: {path}")
+    try:
+        shutil.rmtree(quarantine)
+    except OSError:
+        return False
+    try:
+        os.lstat(quarantine)
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def doctor(path, repair=False, now=None):
+    """Inspect source truth and derived queue artifacts under the kernel guard."""
+    if not isinstance(repair, bool):
+        raise QueueError("repair must be a boolean")
+    path = Path(path).expanduser().absolute()
+    report = {
+        "ok": False,
+        "queue": str(path),
+        "revision": None,
+        "issues": [],
+        "repairs": [],
+    }
+    timeout, stale = peek_lock_config(path)
+    lock = QueueLock(path, timeout, stale)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        report["issues"].append(_diagnostic_item(
+            "guard.unavailable", lock.guard_path,
+            f"queue lock guard parent is unavailable: {error}",
+        ))
+        return report
+    try:
+        lock._acquire_guard(time.monotonic() + timeout)
+    except LockTimeout as error:
+        report["issues"].append(_diagnostic_item(
+            "lock.timeout", lock.guard_path,
+            f"could not acquire queue lock guard: {error}",
+        ))
+        return report
+    except InvariantError as error:
+        report["issues"].append(_diagnostic_item(
+            "guard.invalid", lock.guard_path,
+            f"queue lock guard is invalid: {error}",
+        ))
+        return report
+    except QueueError as error:
+        report["issues"].append(_diagnostic_item(
+            "guard.unavailable", lock.guard_path,
+            f"queue lock guard is unavailable: {error}",
+        ))
+        return report
+    try:
+        try:
+            source_stat = os.lstat(path)
+        except FileNotFoundError:
+            report["issues"].append(_diagnostic_item(
+                "source.missing", path, "queue source JSON is missing"
+            ))
+            return report
+        except OSError as error:
+            report["issues"].append(_diagnostic_item(
+                "source.unreadable", path,
+                f"cannot inspect queue source JSON: {error}",
+            ))
+            return report
+        if stat.S_ISLNK(source_stat.st_mode) or not stat.S_ISREG(source_stat.st_mode):
+            report["issues"].append(_diagnostic_item(
+                "source.unsafe", path,
+                "queue source JSON must be a real regular file",
+            ))
+            return report
+        try:
+            source_text = path.read_text(encoding="utf-8")
+        except OSError as error:
+            report["issues"].append(_diagnostic_item(
+                "source.unreadable", path,
+                f"cannot read queue source JSON: {error}",
+            ))
+            return report
+        except UnicodeError as error:
+            report["issues"].append(_diagnostic_item(
+                "source.invalid", path,
+                f"queue source JSON is invalid UTF-8: {error}",
+            ))
+            return report
+        try:
+            state = _read_json_text(source_text, path)
+            validate_persisted_state(state)
+        except (UnicodeError, InvariantError) as error:
+            report["issues"].append(_diagnostic_item(
+                "source.invalid", path, f"queue source JSON is invalid: {error}"
+            ))
+            return report
+
+        report["revision"] = state["revision"]
+        projection_now = _canonical_now(now)
+
+        # A lock directory cannot be live while this process owns the kernel
+        # guard. Only stale, safely-identifiable directories may be repaired.
+        try:
+            lock_stat = os.lstat(lock.path)
+        except FileNotFoundError:
+            lock_stat = None
+        except OSError as error:
+            report["issues"].append(_diagnostic_item(
+                "lock.unreadable", lock.path,
+                f"cannot inspect queue lock directory: {error}",
+            ))
+            return report
+        if lock_stat is not None:
+            if stat.S_ISLNK(lock_stat.st_mode) or not stat.S_ISDIR(lock_stat.st_mode):
+                raise InvariantError("queue lock must be a real directory")
+            try:
+                owner_stat = os.lstat(lock.owner_path)
+            except FileNotFoundError:
+                owner_stat = None
+            except OSError as error:
+                report["issues"].append(_diagnostic_item(
+                    "lock.unreadable", lock.owner_path,
+                    f"cannot inspect queue lock owner: {error}",
+                ))
+                return report
+            if owner_stat is not None and (
+                stat.S_ISLNK(owner_stat.st_mode)
+                or not stat.S_ISREG(owner_stat.st_mode)
+            ):
+                report["issues"].append(_diagnostic_item(
+                    "lock.owner_unsafe", lock.owner_path,
+                    "lock owner must be a real regular file",
+                ))
+            else:
+                reclaimable = lock._reclaimable()
+                if reclaimable is not None:
+                    report["issues"].append(_diagnostic_item(
+                        "lock.stale", lock.path, "stale queue lock directory"
+                    ))
+                    if repair:
+                        if lock._rename_and_remove("orphan"):
+                            report["repairs"].append(_diagnostic_item(
+                                "lock.removed", lock.path,
+                                "removed stale queue lock directory",
+                            ))
+                        else:
+                            report["issues"].append(_diagnostic_item(
+                                "lock.remove_failed", lock.path,
+                                "stale queue lock cleanup was not completed",
+                            ))
+                else:
+                    report["issues"].append(_diagnostic_item(
+                        "lock.orphan", lock.path,
+                        "queue lock metadata is not safely stale",
+                    ))
+
+        artifact_pattern = re.compile(
+            rf"^\.{re.escape(lock.path.name)}\.(?:orphan|release)-[0-9a-f]{{24}}$",
+            flags=re.ASCII,
+        )
+        legacy_artifact_pattern = re.compile(
+            rf"^\.\.{re.escape(lock.path.name)}\."
+            rf"(?:orphan|release)-[0-9a-f]{{24}}\.doctor-[0-9a-f]{{24}}$",
+            flags=re.ASCII,
+        )
+        try:
+            artifacts = sorted(
+                child for child in path.parent.iterdir()
+                if (
+                    artifact_pattern.fullmatch(child.name)
+                    or legacy_artifact_pattern.fullmatch(child.name)
+                )
+            )
+        except OSError as error:
+            report["issues"].append(_diagnostic_item(
+                "lock_artifacts.unreadable", path.parent,
+                f"cannot inspect orphan lock artifacts: {error}",
+            ))
+            return report
+        for artifact in artifacts:
+            try:
+                artifact_stat = os.lstat(artifact)
+            except OSError as error:
+                report["issues"].append(_diagnostic_item(
+                    "lock_artifacts.unreadable", artifact,
+                    f"cannot inspect orphan lock artifact: {error}",
+                ))
+                return report
+            if stat.S_ISLNK(artifact_stat.st_mode) or not stat.S_ISDIR(
+                artifact_stat.st_mode
+            ):
+                report["issues"].append(_diagnostic_item(
+                    "lock_artifact.unsafe", artifact,
+                    "orphan lock artifact must be a real directory",
+                ))
+                continue
+            report["issues"].append(_diagnostic_item(
+                "lock_artifact.orphan", artifact,
+                "orphan lock artifact directory",
+            ))
+            if repair:
+                if _remove_diagnostic_directory(artifact, lock.path):
+                    report["repairs"].append(_diagnostic_item(
+                        "lock_artifact.removed", artifact,
+                        "removed orphan lock artifact directory",
+                    ))
+                else:
+                    report["issues"].append(_diagnostic_item(
+                        "lock_artifact.remove_failed", artifact,
+                        "orphan lock artifact cleanup was not completed",
+                    ))
+
+        tsv_path = path.with_suffix(".tsv")
+        expected = render_tsv(state, projection_now)
+        tsv_issue = None
+        try:
+            tsv_stat = os.lstat(tsv_path)
+        except FileNotFoundError:
+            tsv_issue = _diagnostic_item(
+                "tsv.missing", tsv_path, "derived TSV is missing"
+            )
+        except OSError as error:
+            tsv_issue = _diagnostic_item(
+                "tsv.unreadable", tsv_path,
+                f"cannot inspect derived TSV: {error}",
+            )
+        else:
+            if stat.S_ISLNK(tsv_stat.st_mode) or not stat.S_ISREG(tsv_stat.st_mode):
+                tsv_issue = _diagnostic_item(
+                    "tsv.unsafe", tsv_path,
+                    "derived TSV must be a real regular file",
+                )
+            else:
+                try:
+                    actual = tsv_path.read_text(encoding="utf-8")
+                except OSError as error:
+                    tsv_issue = _diagnostic_item(
+                        "tsv.unreadable", tsv_path,
+                        f"cannot read derived TSV: {error}",
+                    )
+                except UnicodeError:
+                    tsv_issue = _diagnostic_item(
+                        "tsv.malformed", tsv_path,
+                        "derived TSV is not readable UTF-8",
+                    )
+                else:
+                    revision = tsv_revision(tsv_path)
+                    if revision is None:
+                        tsv_issue = _diagnostic_item(
+                            "tsv.malformed", tsv_path,
+                            "derived TSV has a malformed revision or header",
+                        )
+                    elif revision != state["revision"]:
+                        tsv_issue = _diagnostic_item(
+                            "tsv.stale", tsv_path,
+                            "derived TSV revision does not match source",
+                        )
+                    elif actual != expected:
+                        tsv_issue = _diagnostic_item(
+                            "tsv.content", tsv_path,
+                            "derived TSV content does not match source",
+                        )
+        if tsv_issue is not None:
+            report["issues"].append(tsv_issue)
+            if repair and tsv_issue["code"] not in {
+                "tsv.unsafe", "tsv.unreadable"
+            }:
+                try:
+                    atomic_write_text(tsv_path, expected)
+                except OSError as error:
+                    report["issues"].append(_diagnostic_item(
+                        "tsv.repair_failed", tsv_path,
+                        f"could not rebuild derived TSV: {error}",
+                    ))
+                else:
+                    report["repairs"].append(_diagnostic_item(
+                        "tsv.rebuilt", tsv_path,
+                        "rebuilt derived TSV from source",
+                    ))
+
+        repaired_codes = {item["code"] for item in report["repairs"]}
+        repair_for_issue = {
+            "lock.stale": "lock.removed",
+            "lock_artifact.orphan": "lock_artifact.removed",
+            "tsv.missing": "tsv.rebuilt",
+            "tsv.malformed": "tsv.rebuilt",
+            "tsv.stale": "tsv.rebuilt",
+            "tsv.content": "tsv.rebuilt",
+        }
+        report["ok"] = not report["issues"] or (
+            repair and all(
+                repair_for_issue.get(issue["code"]) in repaired_codes
+                for issue in report["issues"]
+            )
+        )
+        return report
+    except InvariantError as error:
+        report["revision"] = None
+        report["issues"] = [_diagnostic_item(
+            "lock.invalid", lock.path, f"queue lock is invalid: {error}"
+        )]
+        report["repairs"] = []
+        return report
+    except OSError as error:
+        report["ok"] = False
+        report["issues"].append(_diagnostic_item(
+            "filesystem.error", path,
+            f"queue diagnostic filesystem operation failed: {error}",
+        ))
+        return report
+    finally:
+        try:
+            lock._release_guard()
+        except OSError as error:
+            report["ok"] = False
+            report["issues"].append(_diagnostic_item(
+                "guard.release_failed", lock.guard_path,
+                f"queue lock guard release failed: {error}",
+            ))
+
+
 def peek_lock_config(path):
     """Read only safe lock timing hints from an otherwise untrusted file."""
     defaults = fixed_config()
@@ -2458,7 +2955,7 @@ class QueueLock:
         except OSError as error:
             raise QueueError(f"cannot inspect queue lock guard: {error}") from error
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-            raise QueueError("queue lock guard must be a regular file")
+            raise InvariantError("queue lock guard must be a regular file")
         try:
             descriptor = os.open(self.guard_path, flags)
         except OSError as error:
@@ -2470,9 +2967,9 @@ class QueueLock:
                 or (before.st_dev, before.st_ino)
                 != (opened.st_dev, opened.st_ino)
             ):
-                raise QueueError("queue lock guard changed while opening")
+                raise InvariantError("queue lock guard changed while opening")
             if opened.st_size != len(GUARD_MARKER):
-                raise QueueError(
+                raise InvariantError(
                     "queue lock guard has an invalid marker; manual repair required"
                 )
             os.lseek(descriptor, 0, os.SEEK_SET)
@@ -2483,7 +2980,7 @@ class QueueLock:
                     break
                 marker += chunk
             if marker != GUARD_MARKER:
-                raise QueueError(
+                raise InvariantError(
                     "queue lock guard has an invalid marker; manual repair required"
                 )
             os.lseek(descriptor, 0, os.SEEK_SET)
@@ -2551,9 +3048,11 @@ class QueueLock:
 
     def _lock_identity(self):
         try:
-            directory = self.path.stat()
+            directory = os.lstat(self.path)
         except FileNotFoundError:
             return None
+        if stat.S_ISLNK(directory.st_mode) or not stat.S_ISDIR(directory.st_mode):
+            raise InvariantError("queue lock must be a real directory")
         owner = _parse_lock_owner(self.owner_path)
         try:
             owner_stat = self.owner_path.stat()
@@ -2595,6 +3094,12 @@ class QueueLock:
                 self._release_guard()
 
     def _rename_and_remove(self, kind):
+        try:
+            source = os.lstat(self.path)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(source.st_mode) or not stat.S_ISDIR(source.st_mode):
+            raise InvariantError("queue lock must be a real directory")
         orphan = self.path.with_name(
             f".{self.path.name}.{kind}-{secrets.token_hex(12)}"
         )
@@ -2604,8 +3109,18 @@ class QueueLock:
             return False
         except OSError:
             return False
-        shutil.rmtree(orphan, ignore_errors=True)
-        return True
+        moved = os.lstat(orphan)
+        if (moved.st_dev, moved.st_ino) != (source.st_dev, source.st_ino):
+            raise InvariantError("queue lock changed while removing")
+        try:
+            shutil.rmtree(orphan)
+        except OSError:
+            return False
+        try:
+            os.lstat(orphan)
+        except FileNotFoundError:
+            return True
+        return False
 
     def __enter__(self):
         self.queue_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2977,6 +3492,10 @@ def build_parser():
     commands.add_parser("sweep", help="sweep expired leases")
     export = commands.add_parser("export", help="export queue projection")
     export.add_argument("--format", choices=("tsv",), required=True)
+    doctor_parser = commands.add_parser("doctor", help="diagnose queue artifacts")
+    doctor_parser.add_argument("--repair", action="store_true")
+    compact = commands.add_parser("compact", help="compact closed queue history")
+    compact.add_argument("--before", required=True)
     return parser
 
 
@@ -2996,6 +3515,21 @@ def _run_command(args, path):
             lambda: initialize_queue(path, args.id, config)
         )
         return {"ok": True, "queue_id": state["queue_id"], "revision": 0}
+
+    if args.command == "doctor":
+        return doctor(path, repair=args.repair)
+
+    if args.command == "compact":
+        before = _user_operation(
+            lambda: parse_compaction_cutoff(args.before)
+        )
+        summary = mutate_queue(
+            path,
+            lambda state: compact_state(state, before),
+            auto_sweep=False,
+            user_input_errors=True,
+        )
+        return {"ok": True, **summary}
 
     if args.command == "task" and args.task_command == "show":
         state = read_queue_snapshot(path)
@@ -3177,6 +3711,13 @@ def main(argv=None):
             sys.stdout.write(result)
         else:
             _emit_json(result)
+        if args.command == "doctor" and not result["ok"]:
+            if any(
+                issue["code"] == "lock.timeout"
+                for issue in result["issues"]
+            ):
+                return LockTimeout.exit_code
+            return InvariantError.exit_code
         return 0
     except QueueError as error:
         print(f"error: {error}", file=sys.stderr)
