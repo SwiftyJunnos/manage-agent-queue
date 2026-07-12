@@ -25,6 +25,99 @@ import agent_queue as aq
 SCRIPT_PATH = SCRIPT_DIR / "agent_queue.py"
 
 
+class SkillContractTests(unittest.TestCase):
+    def setUp(self):
+        self.skill_dir = SCRIPT_DIR.parent
+
+    def test_skill_frontmatter_and_routes_match_the_public_contract(self):
+        text = (self.skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        frontmatter = text.split("---", 2)[1].strip().splitlines()
+
+        self.assertEqual(
+            [
+                "name: manage-agent-queue",
+                (
+                    "description: Use when coordinating multiple agents that need "
+                    "shared task claiming, dependency ordering, worktree-safe "
+                    "ownership, progress visibility, or recovery after an agent stops."
+                ),
+            ],
+            frontmatter,
+        )
+        for required in (
+            "scripts/agent_queue.py",
+            "references/queue-schema.md",
+            "references/workflow-templates.md",
+            "claim",
+            "heartbeat",
+            "complete",
+            "fail",
+            "one JSON source of truth",
+            "generated TSV",
+            "stable agent ID",
+            "claim filters",
+            "heartbeat expectation",
+            "scoped task instructions",
+            "Refuse work outside",
+            "Never place secrets in descriptions, summaries, events, or TSV-visible fields",
+        ):
+            self.assertIn(required, text)
+        self.assertLess(len(text.splitlines()), 500)
+
+    def test_schema_reference_names_every_public_state_command_and_column(self):
+        schema = (
+            self.skill_dir / "references" / "queue-schema.md"
+        ).read_text(encoding="utf-8")
+
+        for status in sorted(aq.STORED_STATUSES | aq.DERIVED_STATUSES):
+            self.assertIn(f"`{status}`", schema)
+        for command in (
+            "init",
+            "task add",
+            "task add-batch",
+            "task show",
+            "workflow add",
+            "claim",
+            "heartbeat",
+            "complete",
+            "fail",
+            "release",
+            "retry",
+            "block",
+            "unblock",
+            "cancel",
+            "status",
+            "events",
+            "sweep",
+            "export",
+            "doctor",
+            "compact",
+        ):
+            self.assertIn(f"`{command}`", schema)
+        for column in aq.TSV_COLUMNS:
+            self.assertIn(f"`{column}`", schema)
+        for exit_code in range(7):
+            if exit_code != 1:
+                self.assertIn(f"`{exit_code}`", schema)
+        self.assertIn(
+            "Deduplicate `depends_on`, `resources`, and `labels` while preserving "
+            "first occurrence",
+            schema,
+        )
+
+    def test_workflow_reference_names_templates_roles_and_cli_entrypoint(self):
+        templates = (
+            self.skill_dir / "references" / "workflow-templates.md"
+        ).read_text(encoding="utf-8")
+
+        for template in ("adversarial-review", "parallel-shards"):
+            self.assertIn(f"`{template}`", templates)
+        for role in ("implement", "review", "apply", "verify", "shard", "integrate"):
+            self.assertIn(f"`{role}`", templates)
+        self.assertIn("scripts/agent_queue.py", templates)
+        self.assertIn("--from-json", templates)
+
+
 def run_cli(*arguments, cwd=None, env=None, timeout=10):
     command = [sys.executable, str(SCRIPT_PATH), *map(str, arguments)]
     return subprocess.run(
