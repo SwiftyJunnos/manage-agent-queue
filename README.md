@@ -2,6 +2,12 @@
 
 A small, file-backed queue for coordinating multiple coding agents safely.
 
+<p align="center">
+  <a href="https://skills.sh/SwiftyJunnos/agent-manage-system"><img src="https://skills.sh/b/SwiftyJunnos/agent-manage-system" alt="skills.sh installs" /></a>
+  <img src="https://img.shields.io/badge/Agent%20Skill-agent%20coordination-182235?style=flat-square" alt="Agent Skill: agent coordination" />
+  <img src="https://img.shields.io/badge/runtime-Python%203-D66853?style=flat-square" alt="Runtime: Python 3" />
+</p>
+
 Use it when agents need to claim shared work, respect dependencies, avoid
 overlapping resources, and leave an observable recovery trail. It provides the
 state model and CLI only—it never starts agents or executes their tasks.
