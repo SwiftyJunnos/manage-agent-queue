@@ -1,119 +1,158 @@
-# Manage Agent Queue
+<p align="center">
+  <img src="./assets/readme-hero.svg" width="100%" alt="Manage Agent Queue — make parallel work safely claimable, observable, and recoverable" />
+</p>
 
-A small, file-backed queue for coordinating multiple coding agents safely.
+<h1 align="center">Manage Agent Queue</h1>
+
+<p align="center">
+  Coordinate concurrent coding agents with explicit ownership, dependencies, and recovery.
+</p>
 
 <p align="center">
   <a href="https://skills.sh/SwiftyJunnos/manage-agent-queue"><img src="https://skills.sh/b/SwiftyJunnos/manage-agent-queue" alt="skills.sh installs" /></a>
   <img src="https://img.shields.io/badge/Agent%20Skill-agent%20coordination-182235?style=flat-square" alt="Agent Skill: agent coordination" />
-  <img src="https://img.shields.io/badge/runtime-Python%203-D66853?style=flat-square" alt="Runtime: Python 3" />
+  <img src="https://img.shields.io/badge/runtime-local%20Python%203-D66853?style=flat-square" alt="Runtime: local Python 3" />
 </p>
 
-Use it when agents need to claim shared work, respect dependencies, avoid
-overlapping resources, and leave an observable recovery trail. It provides the
-state model and CLI only—it never starts agents or executes their tasks.
-
-## Quick start
-
-Clone the repository. Python 3 is the only runtime dependency.
-
 ```bash
-git clone https://github.com/SwiftyJunnos/agent-manage-system.git
-cd agent-manage-system
-
-REPO="$(pwd)"
-QUEUE="/absolute/path/to/your-project/.agent-queue/queue.json"
-CLI="python3 $REPO/skills/manage-agent-queue/scripts/agent_queue.py --queue $QUEUE"
+npx skills add SwiftyJunnos/manage-agent-queue --skill manage-agent-queue
 ```
 
-Create one queue:
+## Why this skill exists
 
-```bash
-$CLI init --id checkout-improvements
-```
+Parallel agents are useful only when their work can be claimed independently and their coordination survives interruptions.
 
-When an agent offers live observation and you approve it, open the local dashboard:
+`manage-agent-queue` turns a body of work into one local, file-backed queue with explicit dependencies, priorities, resource ownership, leases, and recovery. Coordinators can see what is ready, workers can prove what they own, and interrupted work remains inspectable instead of disappearing into chat history.
 
-```bash
-$CLI serve --open
-```
+> [!IMPORTANT]
+> This skill manages coordination state only. It does not start agents or execute their tasks; the calling agent remains responsible for dispatch and supervision.
 
-The foreground command prints a private `http://127.0.0.1:...` URL. If the browser cannot be opened automatically, visit that printed URL manually. Stop the command with `Ctrl-C` when coordination ends. The dashboard is read-only; use the normal CLI commands to change tasks.
+## How it works
 
-For terminal-only observation, use `$CLI status` and `$CLI events`.
+<p align="center">
+  <img src="./assets/workflow.svg" width="100%" alt="Five-stage workflow: define, register, claim, execute, and verify, governed by dependencies, atomic ownership, leases, and independent review" />
+</p>
 
-Add work and let a worker claim it.
+| Stage | Produces | Moves on when |
+| --- | --- | --- |
+| **Define** | Verifiable tasks with dependencies, priorities, resources, and acceptance criteria | Each task has one bounded responsibility |
+| **Register** | One shared queue and generated human-readable projection | Eligible work is visible to every worker |
+| **Claim** | Atomic ownership with an agent ID, token, and expiry | The worker can prove an active lease |
+| **Execute** | Heartbeats, artifacts, and a completion or failure record | The claimed scope has fresh evidence |
+| **Verify** | Independent review and an observable terminal state | Required work passes its acceptance criteria |
 
-```bash
-$CLI task add \
-  --title "Document the checkout flow" \
-  --role implementer \
-  --priority 50 \
-  --resource file:README.md \
-  --label docs
+Expired leases, failed work, and stale local artifacts remain explicit recovery cases. They can be inspected and retried without guessing which agent last held the work.
 
-$CLI claim --agent implementer-01 --role implementer --label docs
-```
+## Start from the work you have
 
-The claim response includes a task ID and lease token. Keep the token private,
-then use it to finish the task:
+You do not need to invent a coordination format before using the skill.
 
-```bash
-$CLI complete \
-  --task T-000001 \
-  --agent implementer-01 \
-  --token 'lq_token_returned_by_claim' \
-  --summary "Added and verified the documentation."
-
-$CLI status
-```
-
-Use the actual ID and token returned by your queue; the example values are
-placeholders.
-
-## How to use it
-
-- **Coordinator:** create one shared queue, split work into verifiable tasks,
-  declare dependencies and exact resource keys, then dispatch workers with the
-  same absolute queue path.
-- **Worker:** follow `claim -> work -> heartbeat -> complete or fail`. Work only
-  inside the claimed scope; release work you abandon.
-- **Reviewer:** review independently. Give reviewers the diff and acceptance
-  criteria, not the implementer's reasoning or other review findings.
-
-For work across Git worktrees, pass the same absolute `QUEUE` path to every
-agent. Do not manually edit `queue.json` or generated `queue.tsv`.
-
-## Useful commands
-
-| Need | Command |
+| Situation | Starting point |
 | --- | --- |
-| Add work | `task add`, `task add-batch`, `workflow add` |
-| Inspect live progress | `serve --open` after user approval |
-| Inspect progress | `status`, `events`, `export --format tsv` |
-| Maintain a lease | `heartbeat`, `complete`, `fail`, `release` |
-| Recover work | `sweep`, `retry`, `block`, `unblock`, `cancel` |
-| Diagnose local state | `doctor`, `doctor --repair`, `compact` |
+| Several dependent tasks | Declare their blocking edges before dispatch |
+| Work split across Git worktrees | Give every worker the same absolute queue path |
+| Independent implementation shards | Use the `parallel-shards` workflow |
+| Implementation plus isolated review | Use the `adversarial-review` workflow |
+| An interrupted or stale queue | Inspect with `status`, `events`, `sweep`, and `doctor` |
 
-Two workflow templates are included: `adversarial-review` for independent
-review and `parallel-shards` for safely separated work.
+## What it protects
 
-## Safety
+- **Atomic ownership** — workers claim before side effects and prove ownership with opaque lease tokens.
+- **Dependency order** — blocked tasks do not become eligible until their prerequisites finish successfully.
+- **Resource isolation** — exact resource keys prevent active workers from claiming overlapping scope.
+- **Lease discipline** — heartbeats extend live work; expired results are rejected instead of silently published.
+- **Role independence** — implementers, reviewers, appliers, and verifiers receive only the context their role needs.
+- **Observable recovery** — status, events, generated TSV, and diagnostics preserve a trail after interruption.
 
-- `queue.json` is authoritative; `queue.tsv` is a generated view.
-- Claims and leases are atomic, but assignment is at-least-once. Make external
-  side effects idempotent.
-- Resource keys are exact strings; choose and use a consistent granularity.
-- Do not store secrets in task text, summaries, events, or TSV-visible fields.
-- Version 1 is for one machine and a local filesystem, not distributed locking.
+## Use the skill
 
-## References
+Coordinate a multi-agent change:
 
-- [Skill protocol](skills/manage-agent-queue/SKILL.md)
-- [Queue schema and CLI contract](skills/manage-agent-queue/references/queue-schema.md)
-- [Workflow templates](skills/manage-agent-queue/references/workflow-templates.md)
+```text
+Use $manage-agent-queue to coordinate this work across agents.
+Declare dependencies and exclusive resources before dispatching workers.
+```
 
-Run the test suite from the repository root:
+Run implementation with independent review:
+
+```text
+Use $manage-agent-queue with the adversarial-review workflow.
+Keep implementer and reviewer context isolated, then verify the final result.
+```
+
+Recover interrupted work:
+
+```text
+Use $manage-agent-queue to inspect this existing queue, recover expired work,
+and continue only the tasks that are still eligible.
+```
+
+When the skill offers live observation, approve it to open the read-only local dashboard. Decline it to keep progress in terminal `status` and `events` views.
+
+## Outputs
+
+The skill maintains a compact local coordination record:
+
+- `queue.json` as the authoritative state;
+- `queue.tsv` as a generated human-readable projection;
+- sanitized events for progress and recovery history;
+- task artifacts referenced by path instead of embedded as large queue payloads;
+- explicit completion, failure, blocking, retry, and cancellation states.
+
+## Inside the skill
+
+```text
+skills/manage-agent-queue/
+├── SKILL.md
+├── agents/
+│   └── openai.yaml
+├── references/
+│   ├── queue-schema.md
+│   └── workflow-templates.md
+└── scripts/
+    ├── agent_queue.py
+    ├── queue_dashboard.py
+    └── dashboard/
+```
+
+[`SKILL.md`](skills/manage-agent-queue/SKILL.md) owns the coordination protocol. Read the [queue schema and CLI contract](skills/manage-agent-queue/references/queue-schema.md) before changing state transitions, leases, retries, locks, diagnostics, or compaction. Read the [workflow templates](skills/manage-agent-queue/references/workflow-templates.md) before changing the bundled review or sharding flows.
+
+## Runtime expectations
+
+| Capability | Requirement |
+| --- | --- |
+| Queue state and CLI | Python 3; no third-party package installation |
+| Shared coordination | One local filesystem and one explicit absolute queue path |
+| Live dashboard | Optional browser access to a loopback-only read-only view |
+| Agent execution | A separate agent runtime that can dispatch and supervise workers |
+
+Version 1 is designed for one machine and a local filesystem. It is not a distributed lock service, and assignment remains at-least-once—external side effects must be idempotent.
+
+## Install and update
+
+Install interactively:
 
 ```bash
-python3 -m unittest discover -s skills/manage-agent-queue/scripts -p 'test_*.py' -v
+npx skills add SwiftyJunnos/manage-agent-queue --skill manage-agent-queue
 ```
+
+Install globally for Codex:
+
+```bash
+npx skills add SwiftyJunnos/manage-agent-queue \
+  --skill manage-agent-queue \
+  --agent codex \
+  --global
+```
+
+Update an existing installation:
+
+```bash
+npx skills update manage-agent-queue
+```
+
+---
+
+<p align="center">
+  <strong>Make parallel work claimable before making it concurrent.</strong>
+</p>

@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="280" viewBox="0 0 1200 280" role="img" aria-labelledby="title description">
+  <title id="title">Manage Agent Queue workflow</title>
+  <desc id="description">Five stages from defining scoped work to independent verification, governed by dependencies, atomic claims, leases, and review boundaries.</desc>
+
+  <defs>
+    <pattern id="workflow-grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#182235" stroke-opacity="0.06" stroke-width="1" />
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="280" rx="16" fill="#F4F0E8" />
+  <rect width="1200" height="280" rx="16" fill="url(#workflow-grid)" />
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="54" y="43" fill="#2F6F68" font-size="11" font-weight="700" letter-spacing="1.7">ONE QUEUE · FIVE EXPLICIT STAGES</text>
+    <text x="1146" y="43" text-anchor="end" fill="#7A746B" font-size="10">Ownership stays observable.</text>
+
+    <g transform="translate(54 76)">
+      <g>
+        <rect width="184" height="116" rx="6" fill="#FFFDF8" stroke="#A9BBB5" />
+        <text x="16" y="28" fill="#D66853" font-size="11" font-weight="700">01</text>
+        <text x="16" y="58" fill="#182235" font-size="17" font-weight="700">Define</text>
+        <text x="16" y="82" fill="#617080" font-size="12">Tasks, dependencies,</text>
+        <text x="16" y="100" fill="#617080" font-size="12">resources, and evidence</text>
+      </g>
+
+      <g transform="translate(222 0)">
+        <rect width="184" height="116" rx="6" fill="#FFFDF8" stroke="#A9BBB5" />
+        <text x="16" y="28" fill="#D66853" font-size="11" font-weight="700">02</text>
+        <text x="16" y="58" fill="#182235" font-size="17" font-weight="700">Register</text>
+        <text x="16" y="82" fill="#617080" font-size="12">One shared queue with</text>
+        <text x="16" y="100" fill="#617080" font-size="12">eligible work made visible</text>
+      </g>
+
+      <g transform="translate(444 0)">
+        <rect width="184" height="116" rx="6" fill="#E3EBE8" stroke="#7F9F98" />
+        <text x="16" y="28" fill="#D66853" font-size="11" font-weight="700">03</text>
+        <text x="16" y="58" fill="#182235" font-size="17" font-weight="700">Claim</text>
+        <text x="16" y="82" fill="#526E69" font-size="12">Atomic ownership with</text>
+        <text x="16" y="100" fill="#526E69" font-size="12">an expiring lease token</text>
+      </g>
+
+      <g transform="translate(666 0)">
+        <rect width="184" height="116" rx="6" fill="#FFFDF8" stroke="#A9BBB5" />
+        <text x="16" y="28" fill="#D66853" font-size="11" font-weight="700">04</text>
+        <text x="16" y="58" fill="#182235" font-size="17" font-weight="700">Execute</text>
+        <text x="16" y="82" fill="#617080" font-size="12">Heartbeat, produce artifacts,</text>
+        <text x="16" y="100" fill="#617080" font-size="12">then complete or fail</text>
+      </g>
+
+      <g transform="translate(888 0)">
+        <rect width="184" height="116" rx="6" fill="#182235" stroke="#182235" />
+        <text x="16" y="28" fill="#D66853" font-size="11" font-weight="700">05</text>
+        <text x="16" y="58" fill="#FFFDF8" font-size="17" font-weight="700">Verify</text>
+        <text x="16" y="82" fill="#C8D0DB" font-size="12">Independent review and</text>
+        <text x="16" y="100" fill="#C8D0DB" font-size="12">observable terminal state</text>
+      </g>
+
+      <g fill="#D66853">
+        <rect x="202" y="49" width="14" height="14" transform="rotate(45 209 56)" />
+        <rect x="424" y="49" width="14" height="14" transform="rotate(45 431 56)" />
+        <rect x="646" y="49" width="14" height="14" transform="rotate(45 653 56)" />
+        <rect x="868" y="49" width="14" height="14" transform="rotate(45 875 56)" />
+      </g>
+      <g fill="#8A5A4C" font-size="8" font-weight="700" letter-spacing="0.8" text-anchor="middle">
+        <text x="209" y="83">DEPEND</text>
+        <text x="431" y="83">ATOMIC</text>
+        <text x="653" y="83">LEASE</text>
+        <text x="875" y="83">REVIEW</text>
+      </g>
+    </g>
+
+    <path d="M54 222H1146" stroke="#A9BBB5" stroke-dasharray="4 6" />
+    <circle cx="54" cy="222" r="4" fill="#2F6F68" />
+    <circle cx="1146" cy="222" r="4" fill="#D66853" />
+    <text x="54" y="249" fill="#617080" font-size="11">Every worker receives the same absolute queue path.</text>
+    <text x="1146" y="249" text-anchor="end" fill="#617080" font-size="11">Expired work stays visible and recoverable.</text>
+  </g>
+</svg>
