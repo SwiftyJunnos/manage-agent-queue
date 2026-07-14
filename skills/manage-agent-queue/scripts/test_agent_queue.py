@@ -20,6 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import agent_queue as aq
+import queue_dashboard as qd
 
 
 SCRIPT_PATH = SCRIPT_DIR / "agent_queue.py"
@@ -4674,6 +4675,125 @@ class QueueCliTests(unittest.TestCase):
         self.assertFalse(Path(str(self.queue) + ".lock").exists())
         self.assertTrue(Path(str(self.queue) + ".lock.guard").is_file())
         self.assertEqual([], list(self.queue.parent.glob("*.tmp")))
+
+
+class DashboardProjectionTests(unittest.TestCase):
+    NOW = "2026-07-10T06:00:00Z"
+
+    def row(self, task_id, workflow, state, **overrides):
+        row = {
+            "id": task_id,
+            "workflow": workflow,
+            "role": "implement",
+            "state": state,
+            "priority": 10,
+            "assignee": "",
+            "lease_until": "",
+            "attempts": "0/3",
+            "depends_on": "",
+            "blocked_by": "",
+            "resources": "",
+            "title": task_id,
+        }
+        row.update(overrides)
+        return row
+
+    def test_projection_groups_workflows_and_computes_counts(self):
+        rows = [
+            self.row("T-000001", "W-000001", "completed", title="Done"),
+            self.row(
+                "T-000002",
+                "W-000001",
+                "leased",
+                title="Working",
+                assignee="agent-1",
+                lease_until="2026-07-10T06:01:30Z",
+            ),
+            self.row("T-000003", "", "ready", title="Loose"),
+        ]
+
+        value = qd.build_snapshot("demo", 7, rows, self.NOW)
+
+        self.assertEqual("demo", value["queue_id"])
+        self.assertEqual(7, value["revision"])
+        self.assertEqual(
+            {
+                "total": 3,
+                "completed": 1,
+                "active": 1,
+                "ready": 1,
+                "attention": 1,
+            },
+            value["counts"],
+        )
+        self.assertEqual(
+            ["W-000001", "unassigned"],
+            [workflow["id"] for workflow in value["workflows"]],
+        )
+        self.assertEqual(50, value["workflows"][0]["progress_percent"])
+        self.assertEqual("lease_expiring", value["warnings"][0]["kind"])
+
+    def test_projection_warning_precedence_and_redaction_boundary(self):
+        rows = [
+            self.row("T-000004", "W-1", "blocked", blocked_by="T-000001"),
+            self.row(
+                "T-000003",
+                "W-1",
+                "dependency_failed",
+                blocked_by="T-000002",
+            ),
+            self.row("T-000002", "W-1", "failed"),
+            self.row(
+                "T-000001",
+                "W-1",
+                "resource_conflict",
+                blocked_by="T-000009",
+                resources="repo",
+            ),
+        ]
+
+        value = qd.build_snapshot("demo", 8, rows, self.NOW)
+
+        self.assertEqual(
+            ["failed", "blocked", "dependency_failed"],
+            [warning["kind"] for warning in value["warnings"]],
+        )
+        serialized = json.dumps(value)
+        self.assertNotIn("lease_token", serialized)
+        self.assertNotIn("result", serialized)
+        self.assertNotIn("description", serialized)
+
+    def test_events_after_returns_detached_sanitized_sequence(self):
+        events = [
+            {
+                "seq": 1,
+                "at": self.NOW,
+                "type": "task.added",
+                "actor": "operator",
+                "task_id": "T-000001",
+                "revision": 1,
+                "details": {},
+            },
+            {
+                "seq": 2,
+                "at": self.NOW,
+                "type": "task.claimed",
+                "actor": "agent-1",
+                "task_id": "T-000001",
+                "revision": 2,
+                "details": {
+                    "lease_token": "must-not-leak",
+                    "agent_id": "agent-1",
+                },
+            },
+        ]
+
+        value = qd.events_after(events, 1)
+
+        self.assertEqual([2], [event["seq"] for event in value])
+        self.assertNotIn("lease_token", repr(value))
+        value[0]["details"]["agent_id"] = "changed"
+        self.assertEqual("agent-1", events[1]["details"]["agent_id"])
 
 
 if __name__ == "__main__":
