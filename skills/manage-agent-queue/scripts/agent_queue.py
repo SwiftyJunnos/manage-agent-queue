@@ -3543,10 +3543,19 @@ def dashboard_loaders(path):
     """Build queue-backed callbacks for the read-only dashboard."""
     path = Path(path)
 
+    def available(callback):
+        try:
+            return callback()
+        except QueueError as error:
+            raise dashboard.DashboardDataUnavailable() from error
+
     def current():
-        state, now, _projection = _status_transaction_details(path)
-        rows = status_rows(state, now)
-        return state, now, rows
+        def load():
+            state, now, _projection = _status_transaction_details(path)
+            rows = status_rows(state, now)
+            return state, now, rows
+
+        return available(load)
 
     def revision():
         state, _now, _rows = current()
@@ -3562,8 +3571,11 @@ def dashboard_loaders(path):
         )
 
     def events(after):
-        state = read_queue_snapshot(path)
-        return dashboard.events_after(state["events"], after)
+        def load():
+            state = read_queue_snapshot(path)
+            return dashboard.events_after(state["events"], after)
+
+        return available(load)
 
     return SimpleNamespace(
         revision=revision,

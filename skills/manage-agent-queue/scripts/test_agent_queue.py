@@ -154,6 +154,26 @@ def communicate_all(processes, timeout):
         raise
 
 
+def request_server(server, path, host=None):
+    connection = http.client.HTTPConnection(
+        "127.0.0.1",
+        server.server_port,
+        timeout=2,
+    )
+    connection.request(
+        "GET",
+        path,
+        headers={
+            "Host": host or f"127.0.0.1:{server.server_port}"
+        },
+    )
+    response = connection.getresponse()
+    body = response.read()
+    headers = dict(response.getheaders())
+    connection.close()
+    return response.status, headers, body
+
+
 def canonical_claim(
     agent_id="agent-1",
     lease_token="test-lease-token",
@@ -4834,24 +4854,8 @@ class DashboardHttpTests(unittest.TestCase):
         self.thread.join(timeout=2)
 
     def request(self, method, path, host=None):
-        connection = http.client.HTTPConnection(
-            "127.0.0.1",
-            self.server.server_port,
-            timeout=2,
-        )
-        connection.request(
-            method,
-            path,
-            headers={
-                "Host": host
-                or f"127.0.0.1:{self.server.server_port}"
-            },
-        )
-        response = connection.getresponse()
-        body = response.read()
-        headers = dict(response.getheaders())
-        connection.close()
-        return response.status, headers, body
+        self.assertEqual("GET", method)
+        return request_server(self.server, path, host=host)
 
     def test_token_host_and_fixed_routes_are_enforced(self):
         self.assertEqual(
@@ -4920,7 +4924,11 @@ class DashboardHttpTests(unittest.TestCase):
     def test_health_and_loader_errors_do_not_kill_server(self):
         self.server.dashboard.snapshot_loader = lambda: (
             _ for _ in ()
-        ).throw(RuntimeError("private /tmp/queue.json detail"))
+        ).throw(
+            qd.DashboardDataUnavailable(
+                "private /tmp/queue.json detail"
+            )
+        )
         status, _headers, body = self.request(
             "GET",
             "/fixed-token/api/snapshot",
@@ -5066,6 +5074,100 @@ class DashboardAssetTests(unittest.TestCase):
             "document.write",
         ):
             self.assertNotIn(forbidden, javascript)
+
+
+class DashboardLifecycleTests(unittest.TestCase):
+    def test_idle_server_exits_without_browser_requests(self):
+        output = io.StringIO()
+        started = time.monotonic()
+
+        code = qd.serve(
+            "127.0.0.1",
+            0,
+            2,
+            1,
+            False,
+            revision_loader=lambda: 0,
+            snapshot_loader=lambda: {},
+            events_loader=lambda _after: [],
+            asset_dir=SCRIPT_DIR / "dashboard",
+            output=output,
+            browser_open=lambda _url: True,
+        )
+
+        self.assertEqual(0, code)
+        self.assertLess(time.monotonic() - started, 2.5)
+        self.assertIn("dashboard stopped", output.getvalue())
+
+    def test_browser_failure_prints_manual_url_and_keeps_serving(self):
+        output = io.StringIO()
+
+        code = qd.serve(
+            "127.0.0.1",
+            0,
+            2,
+            1,
+            True,
+            revision_loader=lambda: 0,
+            snapshot_loader=lambda: {},
+            events_loader=lambda _after: [],
+            asset_dir=SCRIPT_DIR / "dashboard",
+            output=output,
+            browser_open=lambda _url: False,
+        )
+
+        self.assertEqual(0, code)
+        self.assertIn(
+            "browser did not open; visit http://127.0.0.1:",
+            output.getvalue(),
+        )
+
+    def test_snapshot_loader_recovers_after_one_data_failure(self):
+        attempts = iter(
+            (
+                qd.DashboardDataUnavailable(),
+                {"revision": 2},
+            )
+        )
+
+        def load():
+            result = next(attempts)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        server = qd.create_server(
+            "127.0.0.1",
+            0,
+            "token",
+            2,
+            lambda: 2,
+            load,
+            lambda _after: [],
+            SCRIPT_DIR / "dashboard",
+        )
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        def stop_server():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.addCleanup(stop_server)
+        self.assertEqual(
+            503,
+            request_server(server, "/token/api/snapshot")[0],
+        )
+        status, _headers, body = request_server(
+            server,
+            "/token/api/snapshot",
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, json.loads(body)["revision"])
 
 
 if __name__ == "__main__":

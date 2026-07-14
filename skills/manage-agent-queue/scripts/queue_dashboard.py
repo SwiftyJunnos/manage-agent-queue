@@ -40,6 +40,10 @@ ASSETS = {
 }
 
 
+class DashboardDataUnavailable(Exception):
+    """A bounded client-safe dashboard read failure."""
+
+
 def _parse_utc(value):
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=timezone.utc
@@ -221,7 +225,12 @@ def _handler_class():
                     self._json(200, {"ok": True})
                 else:
                     self._json(404, {"error": "not found"})
-            except (OSError, RuntimeError, ValueError):
+            except (
+                DashboardDataUnavailable,
+                OSError,
+                UnicodeError,
+                ValueError,
+            ):
                 self._json(
                     503,
                     {"error": "queue temporarily unavailable"},
@@ -267,6 +276,7 @@ def serve(
     events_loader,
     asset_dir,
     output,
+    browser_open=webbrowser.open,
 ):
     """Run the dashboard in the foreground until interrupted or idle."""
     token = secrets.token_urlsafe(24)
@@ -283,7 +293,7 @@ def serve(
     url = f"http://{host}:{server.server_port}/{token}/"
     output.write(url + "\n")
     output.flush()
-    if open_browser and not webbrowser.open(url):
+    if open_browser and not browser_open(url):
         output.write(f"browser did not open; visit {url}\n")
         output.flush()
 
