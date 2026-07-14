@@ -18,6 +18,7 @@ const state = {
   interval: 2,
   retryDelay: 2,
   timer: null,
+  lastSuccess: null,
 };
 const byId = (id) => document.getElementById(id);
 const element = (tag, className, text) => {
@@ -63,6 +64,18 @@ const remainingTime = (leaseUntil) => {
   );
   const minutes = Math.floor(seconds / 60);
   return `${minutes}m ${seconds % 60}s left`;
+};
+const updatedTime = () => {
+  if (state.lastSuccess === null) return "No successful refresh yet";
+  const seconds = Math.max(
+    0,
+    Math.floor((Date.now() - state.lastSuccess) / 1000),
+  );
+  return seconds < 2 ? "Updated just now" : `Updated ${seconds}s ago`;
+};
+const updateStatusTime = () => {
+  byId("last-updated").textContent = updatedTime();
+  setTimeout(updateStatusTime, 1000);
 };
 const updateTimes = () => {
   for (const node of document.querySelectorAll("[data-lease-until]")) {
@@ -174,18 +187,22 @@ async function poll() {
       await refreshEvents();
     }
     updateTimes();
+    state.lastSuccess = Date.now();
     state.retryDelay = state.interval;
     nextDelay = state.interval;
     setConnection("Live", "live");
   } catch (_error) {
-    setConnection("Retrying", "retrying");
+    setConnection(
+      "Retrying · queue temporarily unavailable",
+      "retrying",
+    );
     try {
       await api(endpoints.health);
       nextDelay = state.retryDelay;
       state.retryDelay = Math.min(state.retryDelay * 2, 15);
     } catch (_healthError) {
       state.stopped = true;
-      setConnection("Stopped", "stopped");
+      setConnection("Stopped · dashboard server ended", "stopped");
     }
   } finally {
     state.polling = false;
@@ -209,4 +226,5 @@ byId("manual-refresh").addEventListener("click", () => {
   state.retryDelay = state.interval;
   poll();
 });
+updateStatusTime();
 poll();

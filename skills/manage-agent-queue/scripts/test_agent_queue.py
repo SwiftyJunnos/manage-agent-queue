@@ -5131,10 +5131,14 @@ class DashboardAssetTests(unittest.TestCase):
             "setTimeout",
             "data-task-id",
             "manual-refresh",
+            "last-updated",
             "remainingTime",
+            "updatedTime",
             "retryDelay",
             "Retrying",
             "Stopped",
+            "queue temporarily unavailable",
+            "dashboard server ended",
         ):
             self.assertIn(required, javascript)
         for forbidden in (
@@ -5191,6 +5195,33 @@ class DashboardLifecycleTests(unittest.TestCase):
             "browser did not open; visit http://127.0.0.1:",
             output.getvalue(),
         )
+
+    def test_browser_exception_prints_manual_url_and_closes_cleanly(self):
+        output = io.StringIO()
+
+        def fail_to_open(_url):
+            raise qd.webbrowser.Error("no browser")
+
+        code = qd.serve(
+            "127.0.0.1",
+            0,
+            2,
+            1,
+            True,
+            revision_loader=lambda: 0,
+            snapshot_loader=lambda: {},
+            events_loader=lambda _after: [],
+            asset_dir=SCRIPT_DIR / "dashboard",
+            output=output,
+            browser_open=fail_to_open,
+        )
+
+        self.assertEqual(0, code)
+        self.assertIn(
+            "browser did not open; visit http://127.0.0.1:",
+            output.getvalue(),
+        )
+        self.assertIn("dashboard stopped", output.getvalue())
 
     def test_snapshot_loader_recovers_after_one_data_failure(self):
         attempts = iter(

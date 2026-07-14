@@ -293,12 +293,18 @@ def serve(
     url = f"http://{host}:{server.server_port}/{token}/"
     output.write(url + "\n")
     output.flush()
-    if open_browser and not browser_open(url):
-        output.write(f"browser did not open; visit {url}\n")
-        output.flush()
-
-    server.timeout = min(0.5, idle_timeout)
     try:
+        opened = True
+        if open_browser:
+            try:
+                opened = browser_open(url)
+            except (OSError, webbrowser.Error):
+                opened = False
+        if not opened:
+            output.write(f"browser did not open; visit {url}\n")
+            output.flush()
+
+        server.timeout = min(0.5, idle_timeout)
         while (
             time.monotonic() - server.dashboard.last_request
             < idle_timeout
