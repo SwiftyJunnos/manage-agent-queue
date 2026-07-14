@@ -5151,6 +5151,71 @@ class DashboardAssetTests(unittest.TestCase):
 
 
 class DashboardLifecycleTests(unittest.TestCase):
+    def in_flight_server(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def load_snapshot():
+            started.set()
+            release.wait(timeout=2)
+            return {"revision": 1}
+
+        server = qd.create_server(
+            "127.0.0.1",
+            0,
+            "token",
+            2,
+            lambda: 1,
+            load_snapshot,
+            lambda _after: [],
+            SCRIPT_DIR / "dashboard",
+        )
+        serving = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        serving.start()
+        response = {}
+
+        def request_snapshot():
+            response["value"] = request_server(
+                server,
+                "/token/api/snapshot",
+            )
+
+        request = threading.Thread(target=request_snapshot, daemon=True)
+        request.start()
+        self.assertTrue(started.wait(timeout=1))
+        server.shutdown()
+        serving.join(timeout=1)
+        self.assertFalse(serving.is_alive())
+        return server, request, release, response
+
+    def test_server_close_waits_for_inflight_request_within_bound(self):
+        server, request, release, response = self.in_flight_server()
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+
+        drained = server.server_close(timeout=1)
+
+        timer.join(timeout=1)
+        request.join(timeout=1)
+        self.assertTrue(drained)
+        self.assertFalse(request.is_alive())
+        self.assertEqual(200, response["value"][0])
+
+    def test_server_close_returns_after_bound_with_active_request(self):
+        server, request, release, _response = self.in_flight_server()
+        started = time.monotonic()
+
+        drained = server.server_close(timeout=0.05)
+
+        self.assertFalse(drained)
+        self.assertLess(time.monotonic() - started, 0.25)
+        release.set()
+        request.join(timeout=1)
+        self.assertFalse(request.is_alive())
+
     def test_idle_server_exits_without_browser_requests(self):
         output = io.StringIO()
         started = time.monotonic()

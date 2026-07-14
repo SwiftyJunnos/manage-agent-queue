@@ -390,6 +390,7 @@ Extend `queue_dashboard.py` with:
 
 ```python
 import json
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -416,7 +417,50 @@ ASSETS = {
 
 
 class DashboardServer(ThreadingHTTPServer):
+    """Threaded local server with bounded request thread cleanup."""
+
     daemon_threads = True
+    block_on_close = False
+
+    def __init__(self, *args, **kwargs):
+        self._request_threads = set()
+        self._request_threads_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        thread = threading.Thread(
+            target=self._tracked_request,
+            args=(request, client_address),
+            daemon=self.daemon_threads,
+        )
+        with self._request_threads_lock:
+            self._request_threads.add(thread)
+        thread.start()
+
+    def _tracked_request(self, request, client_address):
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            with self._request_threads_lock:
+                self._request_threads.discard(threading.current_thread())
+
+    def server_close(self, timeout=2.0):
+        """Close the socket and wait at most timeout for active requests."""
+        super().server_close()
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._request_threads_lock:
+                active = [
+                    thread
+                    for thread in self._request_threads
+                    if thread.is_alive()
+                ]
+            if not active:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            active[0].join(timeout=remaining)
 
 
 def _handler_class():
@@ -770,7 +814,8 @@ class DashboardAssetTests(unittest.TestCase):
         for required in (
             "api/revision", "api/snapshot", "api/events?after=",
             "textContent", "setTimeout", "data-task-id", "manual-refresh",
-            "remainingTime", "retryDelay", "Retrying", "Stopped",
+            "remainingTime", "updatedTime", "retryDelay", "Retrying", "Stopped",
+            "queue temporarily unavailable", "dashboard server ended",
         ):
             self.assertIn(required, javascript)
         for forbidden in ("innerHTML", "insertAdjacentHTML", "eval(", "document.write"):
@@ -804,7 +849,10 @@ Replace `index.html` with a document containing these fixed IDs and no inline sc
   <header class="topbar">
     <div><p class="eyebrow">Agent queue</p><h1 id="queue-title">Loading…</h1></div>
     <div class="connection-actions">
-      <div id="connection" class="connection" aria-live="polite">Connecting</div>
+      <div>
+        <div id="connection" class="connection" aria-live="polite">Connecting</div>
+        <div id="last-updated" class="muted">No successful refresh yet</div>
+      </div>
       <button id="manual-refresh" type="button">Refresh now</button>
     </div>
   </header>
@@ -883,7 +931,8 @@ In `dashboard.js`, derive the token base from `location.pathname`, create every 
 const base = location.pathname.endsWith("/") ? location.pathname : `${location.pathname}/`;
 const state = {
   revision: null, eventSequence: 0, taskFingerprints: new Map(),
-  stopped: false, polling: false, interval: 2, retryDelay: 2, timer: null
+  stopped: false, polling: false, interval: 2, retryDelay: 2, timer: null,
+  lastSuccess: null
 };
 const byId = (id) => document.getElementById(id);
 const element = (tag, className, text) => {
@@ -917,6 +966,15 @@ const remainingTime = (leaseUntil) => {
   const seconds = Math.max(0, Math.floor((Date.parse(leaseUntil) - Date.now()) / 1000));
   const minutes = Math.floor(seconds / 60);
   return `${minutes}m ${seconds % 60}s left`;
+};
+const updatedTime = () => {
+  if (state.lastSuccess === null) return "No successful refresh yet";
+  const seconds = Math.max(0, Math.floor((Date.now() - state.lastSuccess) / 1000));
+  return seconds < 2 ? "Updated just now" : `Updated ${seconds}s ago`;
+};
+const updateStatusTime = () => {
+  byId("last-updated").textContent = updatedTime();
+  setTimeout(updateStatusTime, 1000);
 };
 const updateTimes = () => {
   for (const node of document.querySelectorAll("[data-lease-until]")) {
@@ -1003,18 +1061,19 @@ async function poll() {
       await refreshEvents();
     }
     updateTimes();
+    state.lastSuccess = Date.now();
     state.retryDelay = state.interval;
     nextDelay = state.interval;
     setConnection("Live", "live");
   } catch (_error) {
-    setConnection("Retrying", "retrying");
+    setConnection("Retrying · queue temporarily unavailable", "retrying");
     try {
       await api("health");
       nextDelay = state.retryDelay;
       state.retryDelay = Math.min(state.retryDelay * 2, 15);
     } catch (_healthError) {
       state.stopped = true;
-      setConnection("Stopped", "stopped");
+      setConnection("Stopped · dashboard server ended", "stopped");
     }
   } finally {
     state.polling = false;
@@ -1038,6 +1097,7 @@ byId("manual-refresh").addEventListener("click", () => {
   state.retryDelay = state.interval;
   poll();
 });
+updateStatusTime();
 poll();
 ```
 
@@ -1079,6 +1139,54 @@ Add tests that use short bounded times and injectable clock/browser functions:
 
 ```python
 class DashboardLifecycleTests(unittest.TestCase):
+    def in_flight_server(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def load_snapshot():
+            started.set()
+            release.wait(timeout=2)
+            return {"revision": 1}
+
+        server = qd.create_server(
+            "127.0.0.1", 0, "token", 2, lambda: 1, load_snapshot,
+            lambda _after: [], SCRIPT_DIR / "dashboard",
+        )
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+        response = {}
+        request = threading.Thread(
+            target=lambda: response.setdefault(
+                "value", request_server(server, "/token/api/snapshot")
+            ),
+            daemon=True,
+        )
+        request.start()
+        self.assertTrue(started.wait(timeout=1))
+        server.shutdown()
+        serving.join(timeout=1)
+        self.assertFalse(serving.is_alive())
+        return server, request, release, response
+
+    def test_server_close_waits_for_inflight_request_within_bound(self):
+        server, request, release, response = self.in_flight_server()
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        self.assertTrue(server.server_close(timeout=1))
+        timer.join(timeout=1)
+        request.join(timeout=1)
+        self.assertFalse(request.is_alive())
+        self.assertEqual(200, response["value"][0])
+
+    def test_server_close_returns_after_bound_with_active_request(self):
+        server, request, release, _response = self.in_flight_server()
+        started = time.monotonic()
+        self.assertFalse(server.server_close(timeout=0.05))
+        self.assertLess(time.monotonic() - started, 0.25)
+        release.set()
+        request.join(timeout=1)
+        self.assertFalse(request.is_alive())
+
     def test_idle_server_exits_without_browser_requests(self):
         output = io.StringIO()
         started = time.monotonic()
@@ -1106,6 +1214,24 @@ class DashboardLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(0, code)
         self.assertIn("browser did not open; visit http://127.0.0.1:", output.getvalue())
+
+    def test_browser_exception_prints_manual_url_and_closes_cleanly(self):
+        output = io.StringIO()
+
+        def fail_to_open(_url):
+            raise qd.webbrowser.Error("no browser")
+
+        code = qd.serve(
+            "127.0.0.1", 0, 2, 1, True,
+            revision_loader=lambda: 0,
+            snapshot_loader=lambda: {},
+            events_loader=lambda _after: [],
+            asset_dir=SCRIPT_DIR / "dashboard", output=output,
+            browser_open=fail_to_open,
+        )
+        self.assertEqual(0, code)
+        self.assertIn("browser did not open; visit http://127.0.0.1:", output.getvalue())
+        self.assertIn("dashboard stopped", output.getvalue())
 
     def test_snapshot_loader_recovers_after_one_failure(self):
         attempts = iter((RuntimeError("corrupt"), {"revision": 2}))
@@ -1150,11 +1276,22 @@ Change the public `serve` signature and call site:
 def serve(host, port, interval, idle_timeout, open_browser,
           revision_loader, snapshot_loader, events_loader, asset_dir,
           output, browser_open=webbrowser.open):
-    # Existing setup remains.
-    if open_browser and not browser_open(url):
-        output.write(f"browser did not open; visit {url}\n")
-        output.flush()
-    # Existing bounded handle_request loop and finally: server_close() remain.
+    # Create the server and print its manual URL before this boundary.
+    try:
+        opened = True
+        if open_browser:
+            try:
+                opened = browser_open(url)
+            except (OSError, webbrowser.Error):
+                opened = False
+        if not opened:
+            output.write(f"browser did not open; visit {url}\n")
+            output.flush()
+        # Run the existing bounded handle_request loop here.
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close(timeout=2.0)
 ```
 
 Catch only expected queue/data exceptions in routes. Let programmer errors fail tests instead of converting every exception into a retry response. Treat `OSError`, `UnicodeError`, JSON validation errors passed in through the data-source adapter, lock timeout, and queue errors as unavailable; have `agent_queue.dashboard_loaders` wrap its existing `QueueError`/`InvariantError` failures as `dashboard.DashboardDataUnavailable("queue temporarily unavailable")`.
@@ -1436,9 +1573,10 @@ Expected: `wait` exits 0, `dashboard.log` contains `dashboard stopped`, and the 
 Run:
 
 ```bash
+BASE_SHA="$(git merge-base main HEAD)"
 git status --short
-git diff --stat HEAD~6..HEAD
-git diff HEAD~6..HEAD -- \
+git diff --stat "$BASE_SHA"...HEAD
+git diff "$BASE_SHA"...HEAD -- \
   skills/manage-agent-queue/scripts/agent_queue.py \
   skills/manage-agent-queue/scripts/queue_dashboard.py \
   skills/manage-agent-queue/scripts/dashboard \
@@ -1447,7 +1585,7 @@ git diff HEAD~6..HEAD -- \
   README.md
 ```
 
-Expected: only the planned dashboard, CLI, tests, and documentation files changed. Check every acceptance criterion in `docs/specs/2026-07-14-local-queue-dashboard-design.md` against the diff and test evidence.
+Expected: the merge-base comparison includes every feature commit, and only the planned dashboard, CLI, tests, and documentation files changed. Check every acceptance criterion in `docs/specs/2026-07-14-local-queue-dashboard-design.md` against the diff and test evidence.
 
 - [ ] **Step 6: Route any verified failure back to its owning task**
 

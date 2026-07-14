@@ -4,6 +4,7 @@
 import copy
 import json
 import secrets
+import threading
 import time
 import webbrowser
 from datetime import datetime, timezone
@@ -148,6 +149,47 @@ class DashboardServer(ThreadingHTTPServer):
     """Threaded local server with bounded request thread cleanup."""
 
     daemon_threads = True
+    block_on_close = False
+
+    def __init__(self, *args, **kwargs):
+        self._request_threads = set()
+        self._request_threads_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        thread = threading.Thread(
+            target=self._tracked_request,
+            args=(request, client_address),
+            daemon=self.daemon_threads,
+        )
+        with self._request_threads_lock:
+            self._request_threads.add(thread)
+        thread.start()
+
+    def _tracked_request(self, request, client_address):
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            with self._request_threads_lock:
+                self._request_threads.discard(threading.current_thread())
+
+    def server_close(self, timeout=2.0):
+        """Close the socket and wait at most timeout for active requests."""
+        super().server_close()
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._request_threads_lock:
+                active = [
+                    thread
+                    for thread in self._request_threads
+                    if thread.is_alive()
+                ]
+            if not active:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            active[0].join(timeout=remaining)
 
 
 def _handler_class():
