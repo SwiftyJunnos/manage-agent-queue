@@ -194,6 +194,8 @@ Creation and transitions emit `task.added`, `workflow.created`, `task.claimed`, 
 
 `serve` runs a tokenized, read-only workflow dashboard on `127.0.0.1`. It binds to loopback only, selects an available port when `--port 0` is used, and stays in the foreground until `Ctrl-C` or `--idle-timeout` elapses without a request. `Ctrl-C` performs a clean exit with code `0`.
 
+The Queue view presents a compact completion summary followed by one light, semantic task table per workflow. Each task row keeps status, task ID and title, attempts, dependencies, resources, assignee, and lease timing visible in a two-line hierarchy. At narrow widths the same fields stack without horizontal scrolling. Activity remains available as a secondary view.
+
 Use `serve --open` only after the user approves opening a browser. If automatic browser opening fails, keep the server running and use the printed URL for manual opening. The access token is generated per process and is part of every allowed route. The server rejects unexpected Host headers, enables no CORS access, serves no external assets, and exposes no queue mutation endpoint.
 
 `--interval` controls revision polling. Revision and snapshot reads use the status transaction, including automatic expired-lease sweep and canonical TSV repair. API responses contain sanitized projections and events, never queue paths, lease tokens, raw results, or lock metadata. Missing, locked, or invalid queue data produces a bounded temporary-unavailable response so a repaired queue can recover without restarting the server.

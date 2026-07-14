@@ -5230,8 +5230,8 @@ class DashboardAssetTests(unittest.TestCase):
 
         for required in (
             'summary.className = "summary-line"',
-            'element("strong", "summary-progress"',
-            'element("span", "summary-counts"',
+            '"summary-progress"',
+            '"summary-counts"',
             'element("progress", "queue-progress")',
             'const waiting = Math.max(',
         ):
@@ -5251,6 +5251,26 @@ class DashboardAssetTests(unittest.TestCase):
         self.assertIn('id="empty-template"', html)
         self.assertIn('byId("empty-template")', javascript)
         self.assertIn("cloneNode(true)", javascript)
+
+    def test_table_redesign_preserves_live_state_contracts(self):
+        html = (self.assets / "index.html").read_text(encoding="utf-8")
+        css = (self.assets / "dashboard.css").read_text(encoding="utf-8")
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+
+        for required in (
+            'setConnection("Live", "live")',
+            '"Retrying · queue temporarily unavailable"',
+            '"Stopped · dashboard server ended"',
+            'row.classList.add("changed")',
+            'byId("empty-template")',
+            'byId("activity-list")',
+            'byId("manual-refresh")',
+        ):
+            self.assertIn(required, javascript)
+        self.assertIn('aria-live="polite"', html)
+        self.assertIn("@media (prefers-reduced-motion: reduce)", css)
 
     def test_plan_uses_long_fence_around_nested_bash_example(self):
         plan = (
