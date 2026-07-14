@@ -2,12 +2,40 @@
 """Render and serve a read-only local dashboard for an agent queue."""
 
 import copy
+import json
+import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 
 WARNING_STATES = ("failed", "blocked", "dependency_failed")
 ACTIVE_STATES = {"leased"}
 READY_STATES = {"ready"}
+SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self'; img-src 'self'; base-uri 'none'; "
+        "form-action 'none'; frame-ancestors 'none'"
+    ),
+}
+ASSETS = {
+    "": ("index.html", "text/html; charset=utf-8"),
+    "assets/dashboard.css": (
+        "dashboard.css",
+        "text/css; charset=utf-8",
+    ),
+    "assets/dashboard.js": (
+        "dashboard.js",
+        "text/javascript; charset=utf-8",
+    ),
+}
 
 
 def _parse_utc(value):
@@ -108,3 +136,119 @@ def events_after(events, sequence):
             event["details"].pop("lease_token", None)
         result.append(event)
     return result
+
+
+class DashboardServer(ThreadingHTTPServer):
+    """Threaded local server with bounded request thread cleanup."""
+
+    daemon_threads = True
+
+
+def _handler_class():
+    class DashboardHandler(BaseHTTPRequestHandler):
+        def log_message(self, _format, *_args):
+            return
+
+        def _send(self, status, body, content_type):
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            for name, value in SECURITY_HEADERS.items():
+                self.send_header(name, value)
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _json(self, status, value):
+            body = json.dumps(
+                value,
+                allow_nan=False,
+                sort_keys=True,
+            ).encode("utf-8")
+            self._send(
+                status,
+                body,
+                "application/json; charset=utf-8",
+            )
+
+        def do_GET(self):
+            app = self.server.dashboard
+            app.last_request = time.monotonic()
+            if self.headers.get("Host") not in {
+                f"127.0.0.1:{self.server.server_port}",
+                f"localhost:{self.server.server_port}",
+            }:
+                self._json(400, {"error": "invalid host"})
+                return
+
+            parsed = urlsplit(self.path)
+            prefix = f"/{app.token}/"
+            if not parsed.path.startswith(prefix):
+                self._json(404, {"error": "not found"})
+                return
+
+            route = parsed.path[len(prefix) :]
+            try:
+                if route in ASSETS:
+                    filename, content_type = ASSETS[route]
+                    self._send(
+                        200,
+                        (app.asset_dir / filename).read_bytes(),
+                        content_type,
+                    )
+                elif route == "api/revision":
+                    self._json(
+                        200,
+                        {
+                            "revision": app.revision_loader(),
+                            "interval": app.interval,
+                        },
+                    )
+                elif route == "api/snapshot":
+                    self._json(200, app.snapshot_loader())
+                elif route == "api/events":
+                    values = parse_qs(parsed.query)
+                    after = int(values.get("after", ["0"])[0])
+                    self._json(
+                        200,
+                        {"events": app.events_loader(after)},
+                    )
+                elif route == "api/health":
+                    self._json(200, {"ok": True})
+                else:
+                    self._json(404, {"error": "not found"})
+            except (OSError, RuntimeError, ValueError):
+                self._json(
+                    503,
+                    {"error": "queue temporarily unavailable"},
+                )
+
+    return DashboardHandler
+
+
+def create_server(
+    host,
+    port,
+    token,
+    interval,
+    revision_loader,
+    snapshot_loader,
+    events_loader,
+    asset_dir,
+):
+    """Create a fixed-route loopback dashboard server."""
+    if host != "127.0.0.1":
+        raise ValueError("dashboard host must be 127.0.0.1")
+    server = DashboardServer((host, port), _handler_class())
+    server.dashboard = SimpleNamespace(
+        token=token,
+        interval=interval,
+        revision_loader=revision_loader,
+        snapshot_loader=snapshot_loader,
+        events_loader=events_loader,
+        asset_dir=Path(asset_dir),
+        last_request=time.monotonic(),
+    )
+    return server

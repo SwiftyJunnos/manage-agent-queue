@@ -2,6 +2,7 @@
 """Tests for the manage-agent-queue CLI."""
 
 import copy
+import http.client
 import io
 import json
 import os
@@ -9,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -4794,6 +4796,144 @@ class DashboardProjectionTests(unittest.TestCase):
         self.assertNotIn("lease_token", repr(value))
         value[0]["details"]["agent_id"] = "changed"
         self.assertEqual("agent-1", events[1]["details"]["agent_id"])
+
+
+class DashboardHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.snapshot = {
+            "queue_id": "demo",
+            "revision": 3,
+            "workflows": [],
+        }
+        self.events = [
+            {"seq": 3, "type": "task.added", "details": {}}
+        ]
+        self.server = qd.create_server(
+            "127.0.0.1",
+            0,
+            "fixed-token",
+            2,
+            revision_loader=lambda: 3,
+            snapshot_loader=lambda: self.snapshot,
+            events_loader=lambda after: [
+                event for event in self.events if event["seq"] > after
+            ],
+            asset_dir=SCRIPT_DIR / "dashboard",
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.thread.start()
+        self.addCleanup(self.stop_server)
+
+    def stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def request(self, method, path, host=None):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.server.server_port,
+            timeout=2,
+        )
+        connection.request(
+            method,
+            path,
+            headers={
+                "Host": host
+                or f"127.0.0.1:{self.server.server_port}"
+            },
+        )
+        response = connection.getresponse()
+        body = response.read()
+        headers = dict(response.getheaders())
+        connection.close()
+        return response.status, headers, body
+
+    def test_token_host_and_fixed_routes_are_enforced(self):
+        self.assertEqual(
+            404,
+            self.request("GET", "/wrong/api/revision")[0],
+        )
+        self.assertEqual(
+            400,
+            self.request(
+                "GET",
+                "/fixed-token/api/revision",
+                host="evil.test",
+            )[0],
+        )
+        status, _headers, body = self.request(
+            "GET",
+            "/fixed-token/api/revision",
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {"revision": 3, "interval": 2},
+            json.loads(body),
+        )
+        status, _headers, body = self.request(
+            "GET",
+            "/fixed-token/api/events?after=2",
+        )
+        self.assertEqual(
+            [3],
+            [event["seq"] for event in json.loads(body)["events"]],
+        )
+        self.assertEqual(
+            404,
+            self.request(
+                "GET",
+                "/fixed-token/assets/../agent_queue.py",
+            )[0],
+        )
+
+    def test_every_success_response_has_security_headers(self):
+        for path in (
+            "/fixed-token/",
+            "/fixed-token/assets/dashboard.css",
+            "/fixed-token/assets/dashboard.js",
+            "/fixed-token/api/snapshot",
+        ):
+            with self.subTest(path=path):
+                status, headers, _body = self.request("GET", path)
+                self.assertEqual(200, status)
+                self.assertEqual("no-store", headers["Cache-Control"])
+                self.assertEqual(
+                    "no-referrer",
+                    headers["Referrer-Policy"],
+                )
+                self.assertEqual(
+                    "nosniff",
+                    headers["X-Content-Type-Options"],
+                )
+                self.assertEqual("DENY", headers["X-Frame-Options"])
+                self.assertIn(
+                    "default-src 'none'",
+                    headers["Content-Security-Policy"],
+                )
+                self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_health_and_loader_errors_do_not_kill_server(self):
+        self.server.dashboard.snapshot_loader = lambda: (
+            _ for _ in ()
+        ).throw(RuntimeError("private /tmp/queue.json detail"))
+        status, _headers, body = self.request(
+            "GET",
+            "/fixed-token/api/snapshot",
+        )
+        self.assertEqual(503, status)
+        self.assertEqual(
+            {"error": "queue temporarily unavailable"},
+            json.loads(body),
+        )
+        self.assertNotIn(b"/tmp/queue.json", body)
+        self.assertEqual(
+            200,
+            self.request("GET", "/fixed-token/api/health")[0],
+        )
 
 
 if __name__ == "__main__":
