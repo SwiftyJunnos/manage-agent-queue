@@ -390,6 +390,7 @@ Extend `queue_dashboard.py` with:
 
 ```python
 import json
+import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -495,7 +496,10 @@ def _handler_class():
                 return
             parsed = urlsplit(self.path)
             prefix = f"/{app.token}/"
-            if not parsed.path.startswith(prefix):
+            provided_prefix = parsed.path[: len(prefix)]
+            if len(provided_prefix) != len(prefix) or not secrets.compare_digest(
+                provided_prefix, prefix
+            ):
                 self._json(404, {"error": "not found"})
                 return
             route = parsed.path[len(prefix):]
@@ -512,7 +516,11 @@ def _handler_class():
                     self._json(200, app.snapshot_loader())
                 elif route == "api/events":
                     values = parse_qs(parsed.query)
-                    after = int(values.get("after", ["0"])[0])
+                    try:
+                        after = int(values.get("after", ["0"])[0])
+                    except ValueError:
+                        self._json(400, {"error": "invalid after parameter"})
+                        return
                     self._json(200, {"events": app.events_loader(after)})
                 elif route == "api/health":
                     self._json(200, {"ok": True})
@@ -982,9 +990,10 @@ const updateTimes = () => {
   }
 };
 
-function renderTask(task) {
+function renderTask(task, openTasks) {
   const row = element("details", "task-row");
   row.setAttribute("data-task-id", task.id);
+  if (openTasks.has(task.id)) row.open = true;
   const previous = state.taskFingerprints.get(task.id);
   const next = fingerprint(task);
   if (previous !== undefined && previous !== next) row.classList.add("changed");
@@ -1018,7 +1027,16 @@ function renderSnapshot(snapshot) {
     warnings.append(element("article", "warning", `${warning.kind} · ${warning.task_id} · ${warning.title}`));
   }
   const workflows = byId("workflow-view");
+  const openTasks = new Set(
+    Array.from(
+      document.querySelectorAll("details[data-task-id][open]"),
+      (node) => node.dataset.taskId
+    )
+  );
   workflows.replaceChildren();
+  if (snapshot.workflows.length === 0) {
+    workflows.append(byId("empty-template").content.cloneNode(true));
+  }
   for (const workflow of snapshot.workflows) {
     const section = element("section", "workflow");
     const header = element("header", "workflow-header");
@@ -1028,7 +1046,7 @@ function renderSnapshot(snapshot) {
       element("span", "workflow-secondary", `${workflow.active} active`),
       element("span", "workflow-secondary", `${workflow.attention} attention`)
     );
-    section.append(header, ...workflow.tasks.map(renderTask));
+    section.append(header, ...workflow.tasks.map((task) => renderTask(task, openTasks)));
     workflows.append(section);
   }
 }
@@ -1057,8 +1075,8 @@ async function poll() {
     if (current.revision !== state.revision) {
       const snapshot = await api("snapshot");
       renderSnapshot(snapshot);
-      state.revision = snapshot.revision;
       await refreshEvents();
+      state.revision = snapshot.revision;
     }
     updateTimes();
     state.lastSuccess = Date.now();
@@ -1458,7 +1476,7 @@ Keep `status --format json` and TSV byte-for-byte compatible. In `main`, append 
 
 In README Quick start, after `$CLI` definition and queue initialization, add:
 
-```markdown
+````markdown
 When an agent offers live observation and you approve it, open the local dashboard:
 
 ```bash
@@ -1468,7 +1486,7 @@ $CLI serve --open
 The foreground command prints a private `http://127.0.0.1:...` URL. If the browser cannot be opened automatically, visit that printed URL manually. Stop the command with `Ctrl-C` when coordination ends. The dashboard is read-only; use the normal CLI commands to change tasks.
 
 For terminal-only observation, use `$CLI status` and `$CLI events`.
-```
+````
 
 Add the `serve` row to the schema command table:
 

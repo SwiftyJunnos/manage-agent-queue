@@ -233,7 +233,11 @@ def _handler_class():
 
             parsed = urlsplit(self.path)
             prefix = f"/{app.token}/"
-            if not parsed.path.startswith(prefix):
+            provided_prefix = parsed.path[: len(prefix)]
+            if len(provided_prefix) != len(prefix) or not secrets.compare_digest(
+                provided_prefix,
+                prefix,
+            ):
                 self._json(404, {"error": "not found"})
                 return
 
@@ -258,7 +262,14 @@ def _handler_class():
                     self._json(200, app.snapshot_loader())
                 elif route == "api/events":
                     values = parse_qs(parsed.query)
-                    after = int(values.get("after", ["0"])[0])
+                    try:
+                        after = int(values.get("after", ["0"])[0])
+                    except ValueError:
+                        self._json(
+                            400,
+                            {"error": "invalid after parameter"},
+                        )
+                        return
                     self._json(
                         200,
                         {"events": app.events_loader(after)},

@@ -83,9 +83,12 @@ const updateTimes = () => {
   }
 };
 
-function renderTask(task) {
+function renderTask(task, openTasks) {
   const row = element("details", "task-row");
   row.setAttribute("data-task-id", task.id);
+  if (openTasks.has(task.id)) {
+    row.open = true;
+  }
   const previous = state.taskFingerprints.get(task.id);
   const next = fingerprint(task);
   if (previous !== undefined && previous !== next) {
@@ -132,7 +135,16 @@ function renderSnapshot(snapshot) {
   }
 
   const workflows = byId("workflow-view");
+  const openTasks = new Set(
+    Array.from(
+      document.querySelectorAll("details[data-task-id][open]"),
+      (node) => node.dataset.taskId,
+    ),
+  );
   workflows.replaceChildren();
+  if (snapshot.workflows.length === 0) {
+    workflows.append(byId("empty-template").content.cloneNode(true));
+  }
   for (const workflow of snapshot.workflows) {
     const section = element("section", "workflow");
     const header = element("header", "workflow-header");
@@ -150,7 +162,10 @@ function renderSnapshot(snapshot) {
         `${workflow.attention} attention`,
       ),
     );
-    section.append(header, ...workflow.tasks.map(renderTask));
+    section.append(
+      header,
+      ...workflow.tasks.map((task) => renderTask(task, openTasks)),
+    );
     workflows.append(section);
   }
 }
@@ -183,8 +198,8 @@ async function poll() {
     if (current.revision !== state.revision) {
       const snapshot = await api(endpoints.snapshot);
       renderSnapshot(snapshot);
-      state.revision = snapshot.revision;
       await refreshEvents();
+      state.revision = snapshot.revision;
     }
     updateTimes();
     state.lastSuccess = Date.now();

@@ -4965,6 +4965,37 @@ class DashboardHttpTests(unittest.TestCase):
             )[0],
         )
 
+    def test_token_prefix_uses_constant_time_comparison(self):
+        with mock.patch.object(
+            qd.secrets,
+            "compare_digest",
+            wraps=qd.secrets.compare_digest,
+        ) as compare:
+            self.assertEqual(
+                200,
+                self.request(
+                    "GET",
+                    "/fixed-token/api/revision",
+                )[0],
+            )
+
+        compare.assert_called_once_with(
+            "/fixed-token/",
+            "/fixed-token/",
+        )
+
+    def test_invalid_event_cursor_is_a_bad_request(self):
+        status, _headers, body = self.request(
+            "GET",
+            "/fixed-token/api/events?after=invalid",
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual(
+            {"error": "invalid after parameter"},
+            json.loads(body),
+        )
+
     def test_every_success_response_has_security_headers(self):
         for path in (
             "/fixed-token/",
@@ -5148,6 +5179,51 @@ class DashboardAssetTests(unittest.TestCase):
             "document.write",
         ):
             self.assertNotIn(forbidden, javascript)
+
+    def test_client_commits_revision_after_events_refresh(self):
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+        poll = javascript[javascript.index("async function poll()") :]
+
+        self.assertLess(
+            poll.index("await refreshEvents();"),
+            poll.index("state.revision = snapshot.revision;"),
+        )
+
+    def test_client_preserves_expanded_tasks_across_snapshots(self):
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+
+        for required in (
+            'details[data-task-id][open]',
+            "openTasks",
+            "row.open = true",
+        ):
+            self.assertIn(required, javascript)
+
+    def test_client_uses_empty_template_for_empty_workflows(self):
+        html = (self.assets / "index.html").read_text(encoding="utf-8")
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('id="empty-template"', html)
+        self.assertIn('byId("empty-template")', javascript)
+        self.assertIn("cloneNode(true)", javascript)
+
+    def test_plan_uses_long_fence_around_nested_bash_example(self):
+        plan = (
+            SCRIPT_DIR.parents[2]
+            / "docs"
+            / "plans"
+            / "2026-07-14-local-queue-dashboard.md"
+        ).read_text(encoding="utf-8")
+        example = plan[plan.index("In README Quick start") :]
+
+        self.assertIn("````markdown\n", example)
+        self.assertIn("\n````\n\nAdd the `serve` row", example)
 
 
 class DashboardLifecycleTests(unittest.TestCase):
