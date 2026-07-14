@@ -5147,7 +5147,15 @@ class DashboardAssetTests(unittest.TestCase):
         self.assertIn('id="workflow-view"', html)
         self.assertIn('id="activity-view"', html)
         self.assertIn('aria-live="polite"', html)
-        self.assertIn("@media (max-width: 720px)", css)
+        self.assertIn('>Queue</button>', html)
+        self.assertIn("color-scheme: light", css)
+        self.assertIn(".queue-table", css)
+        self.assertIn(".task-primary", css)
+        self.assertIn(".task-meta", css)
+        self.assertIn(".active-row", css)
+        self.assertIn("@media (max-width: 760px)", css)
+        self.assertNotIn(".summary-grid", css)
+        self.assertNotIn(".workflow-header", css)
         self.assertNotRegex(combined, r"https?://")
 
     def test_client_polls_revision_and_uses_safe_dom_apis(self):
@@ -5191,17 +5199,48 @@ class DashboardAssetTests(unittest.TestCase):
             poll.index("state.revision = snapshot.revision;"),
         )
 
-    def test_client_preserves_expanded_tasks_across_snapshots(self):
+    def test_client_renders_semantic_two_line_queue_tables(self):
         javascript = (self.assets / "dashboard.js").read_text(
             encoding="utf-8"
         )
 
         for required in (
-            'details[data-task-id][open]',
-            "openTasks",
-            "row.open = true",
+            'element("table", "queue-table")',
+            'element("thead")',
+            'element("tbody")',
+            'heading.scope = "col"',
+            '["Status", "Task", "Assignee", "Timing"]',
+            'element("div", "task-primary")',
+            'element("div", "task-meta")',
+            'row.classList.add("active-row")',
         ):
             self.assertIn(required, javascript)
+        for forbidden in (
+            'element("details"',
+            "openTasks",
+            'element("article", "card"',
+            'element("header", "workflow-header"',
+        ):
+            self.assertNotIn(forbidden, javascript)
+
+    def test_client_renders_one_compact_queue_summary(self):
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+
+        for required in (
+            'summary.className = "summary-line"',
+            'element("strong", "summary-progress"',
+            'element("span", "summary-counts"',
+            'element("progress", "queue-progress")',
+            'const waiting = Math.max(',
+        ):
+            self.assertIn(required, javascript)
+        for forbidden in (
+            'summary.className = "summary-grid"',
+            'element("article", "card"',
+        ):
+            self.assertNotIn(forbidden, javascript)
 
     def test_client_uses_empty_template_for_empty_workflows(self):
         html = (self.assets / "index.html").read_text(encoding="utf-8")
