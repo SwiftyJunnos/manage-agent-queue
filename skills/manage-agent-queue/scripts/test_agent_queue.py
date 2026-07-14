@@ -121,6 +121,33 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("scripts/agent_queue.py", templates)
         self.assertIn("--from-json", templates)
 
+    def test_dashboard_requires_consent_fallback_and_cleanup(self):
+        skill = (self.skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        readme = (self.skill_dir.parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+        schema = (
+            self.skill_dir / "references" / "queue-schema.md"
+        ).read_text(encoding="utf-8")
+        for required in (
+            "실시간 큐 진행 상황을 브라우저에서 볼까요?",
+            "serve --open",
+            "ask once",
+            "status",
+            "events",
+            "stop",
+        ):
+            self.assertIn(required, skill)
+        self.assertLess(
+            skill.index("실시간 큐 진행 상황을 브라우저에서 볼까요?"),
+            skill.index("serve --open"),
+        )
+        self.assertIn("$CLI serve --open", readme)
+        self.assertIn("manual", readme.lower())
+        self.assertIn("`serve`", schema)
+        self.assertIn("127.0.0.1", schema)
+        self.assertIn("read-only", schema)
+
 
 def run_cli(*arguments, cwd=None, env=None, timeout=10):
     command = [sys.executable, str(SCRIPT_PATH), *map(str, arguments)]
@@ -4194,6 +4221,49 @@ class QueueCliTests(unittest.TestCase):
         self.assertEqual("", result.stdout)
         self.assertNotEqual("", result.stderr)
         self.assertEqual(before, self.queue.read_bytes())
+
+    def test_init_and_machine_status_discover_dashboard_safely(self):
+        output = self.init()
+        self.assertEqual(
+            ["serve --open", "status"],
+            output["next_actions"],
+        )
+        self.add("work")
+        table = self.cli("status")
+        self.assertNotIn("serve --open", table.stdout)
+        machine = self.json_output(
+            self.cli("status", "--format", "json")
+        )
+        self.assertNotIn("hint", machine)
+
+    def test_help_names_live_local_dashboard(self):
+        top = run_cli("--help")
+        serve = run_cli("serve", "--help")
+        self.assertEqual(0, top.returncode)
+        self.assertIn("live workflow dashboard", top.stdout)
+        self.assertEqual(0, serve.returncode)
+        self.assertIn("127.0.0.1", serve.stdout)
+        self.assertIn("--idle-timeout", serve.stdout)
+
+    def test_human_tty_status_points_to_live_dashboard(self):
+        class TtyOutput(io.StringIO):
+            def isatty(self):
+                return True
+
+        self.init()
+        self.add("work")
+        output = TtyOutput()
+
+        with redirect_stdout(output):
+            code = aq.main(
+                ["--queue", str(self.queue), "status"]
+            )
+
+        self.assertEqual(0, code)
+        self.assertIn(
+            "Live dashboard: agent_queue.py serve --open",
+            output.getvalue(),
+        )
 
     def test_task_add_batch_show_and_json_errors_are_atomic(self):
         self.init()

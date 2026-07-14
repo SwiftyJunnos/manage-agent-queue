@@ -3522,6 +3522,10 @@ def build_parser():
     serve = commands.add_parser(
         "serve",
         help="show the live workflow dashboard in a local browser",
+        description=(
+            "Serve the read-only live workflow dashboard on 127.0.0.1. "
+            "Run in the foreground until Ctrl-C or the idle timeout."
+        ),
     )
     serve.add_argument(
         "--open",
@@ -3532,10 +3536,26 @@ def build_parser():
         "--host",
         type=_loopback_host,
         default="127.0.0.1",
+        help="loopback host; only 127.0.0.1 is accepted",
     )
-    serve.add_argument("--port", type=_port, default=0)
-    serve.add_argument("--interval", type=_positive, default=2)
-    serve.add_argument("--idle-timeout", type=_positive, default=300)
+    serve.add_argument(
+        "--port",
+        type=_port,
+        default=0,
+        help="port from 0 to 65535; 0 selects an available port",
+    )
+    serve.add_argument(
+        "--interval",
+        type=_positive,
+        default=2,
+        help="polling interval in seconds",
+    )
+    serve.add_argument(
+        "--idle-timeout",
+        type=_positive,
+        default=300,
+        help="exit after this many seconds without a request",
+    )
     return parser
 
 
@@ -3599,7 +3619,12 @@ def _run_command(args, path):
         state = _user_operation(
             lambda: initialize_queue(path, args.id, config)
         )
-        return {"ok": True, "queue_id": state["queue_id"], "revision": 0}
+        return {
+            "ok": True,
+            "queue_id": state["queue_id"],
+            "revision": 0,
+            "next_actions": ["serve --open", "status"],
+        }
 
     if args.command == "doctor":
         return doctor(path, repair=args.repair)
@@ -3813,6 +3838,14 @@ def main(argv=None):
         result = _run_command(args, path)
         if isinstance(result, str):
             sys.stdout.write(result)
+            if (
+                args.command == "status"
+                and args.format == "table"
+                and sys.stdout.isatty()
+            ):
+                sys.stdout.write(
+                    "Live dashboard: agent_queue.py serve --open\n"
+                )
         else:
             _emit_json(result)
         if args.command == "doctor" and not result["ok"]:
