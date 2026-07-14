@@ -6,6 +6,7 @@ import http.client
 import io
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -4934,6 +4935,93 @@ class DashboardHttpTests(unittest.TestCase):
             200,
             self.request("GET", "/fixed-token/api/health")[0],
         )
+
+
+class DashboardCliTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.queue = Path(self.temporary.name) / "queue.json"
+        aq.initialize_queue(self.queue, "demo", aq.fixed_config())
+        result = run_cli(
+            "--queue",
+            self.queue,
+            "task",
+            "add",
+            "--title",
+            "Visible",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_parser_exposes_bounded_serve_options(self):
+        args = aq.build_parser().parse_args(
+            [
+                "serve",
+                "--open",
+                "--port",
+                "0",
+                "--interval",
+                "1",
+                "--idle-timeout",
+                "30",
+            ]
+        )
+        self.assertTrue(args.open_browser)
+        self.assertEqual("127.0.0.1", args.host)
+        self.assertEqual(0, args.port)
+        self.assertEqual(1, args.interval)
+        self.assertEqual(30, args.idle_timeout)
+        for arguments in (
+            ("serve", "--port", "-1"),
+            ("serve", "--port", "65536"),
+            ("serve", "--host", "0.0.0.0"),
+        ):
+            self.assertEqual(2, run_cli(*arguments).returncode)
+
+    def test_dashboard_loaders_return_current_sanitized_data(self):
+        loaders = aq.dashboard_loaders(self.queue)
+
+        revision = loaders.revision()
+        snapshot = loaders.snapshot()
+        events = loaders.events(0)
+
+        self.assertEqual(snapshot["revision"], revision)
+        self.assertEqual(
+            "Visible",
+            snapshot["workflows"][0]["tasks"][0]["title"],
+        )
+        serialized = json.dumps(snapshot) + json.dumps(events)
+        self.assertNotIn("lease_token", serialized)
+
+    def test_serve_prints_ready_url_and_stops_on_sigint(self):
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--queue",
+                str(self.queue),
+                "serve",
+                "--port",
+                "0",
+                "--idle-timeout",
+                "30",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(
+            lambda: process.poll() is None and process.kill()
+        )
+        ready = process.stdout.readline().strip()
+        self.assertRegex(
+            ready,
+            r"^http://127\.0\.0\.1:\d+/[A-Za-z0-9_-]+/$",
+        )
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=3)
+        self.assertEqual(0, process.returncode, stderr)
+        self.assertIn("dashboard stopped", stdout)
 
 
 if __name__ == "__main__":

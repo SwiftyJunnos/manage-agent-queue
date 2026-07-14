@@ -3,7 +3,9 @@
 
 import copy
 import json
+import secrets
 import time
+import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -252,3 +254,51 @@ def create_server(
         last_request=time.monotonic(),
     )
     return server
+
+
+def serve(
+    host,
+    port,
+    interval,
+    idle_timeout,
+    open_browser,
+    revision_loader,
+    snapshot_loader,
+    events_loader,
+    asset_dir,
+    output,
+):
+    """Run the dashboard in the foreground until interrupted or idle."""
+    token = secrets.token_urlsafe(24)
+    server = create_server(
+        host,
+        port,
+        token,
+        interval,
+        revision_loader,
+        snapshot_loader,
+        events_loader,
+        asset_dir,
+    )
+    url = f"http://{host}:{server.server_port}/{token}/"
+    output.write(url + "\n")
+    output.flush()
+    if open_browser and not webbrowser.open(url):
+        output.write(f"browser did not open; visit {url}\n")
+        output.flush()
+
+    server.timeout = min(0.5, idle_timeout)
+    try:
+        while (
+            time.monotonic() - server.dashboard.last_request
+            < idle_timeout
+        ):
+            server.handle_request()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+    output.write("dashboard stopped\n")
+    output.flush()
+    return 0

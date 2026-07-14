@@ -18,6 +18,9 @@ import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+
+import queue_dashboard as dashboard
 
 try:
     import fcntl as _fcntl
@@ -3343,6 +3346,26 @@ def _positive(value):
     return number
 
 
+def _port(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "must be an integer from 0 to 65535"
+        ) from error
+    if not 0 <= number <= 65535:
+        raise argparse.ArgumentTypeError(
+            "must be an integer from 0 to 65535"
+        )
+    return number
+
+
+def _loopback_host(value):
+    if value != "127.0.0.1":
+        raise argparse.ArgumentTypeError("must be 127.0.0.1")
+    return value
+
+
 def _task_input_from_args(args):
     if args.from_json is not None:
         direct_values = (
@@ -3496,7 +3519,57 @@ def build_parser():
     doctor_parser.add_argument("--repair", action="store_true")
     compact = commands.add_parser("compact", help="compact closed queue history")
     compact.add_argument("--before", required=True)
+    serve = commands.add_parser(
+        "serve",
+        help="show the live workflow dashboard in a local browser",
+    )
+    serve.add_argument(
+        "--open",
+        dest="open_browser",
+        action="store_true",
+    )
+    serve.add_argument(
+        "--host",
+        type=_loopback_host,
+        default="127.0.0.1",
+    )
+    serve.add_argument("--port", type=_port, default=0)
+    serve.add_argument("--interval", type=_positive, default=2)
+    serve.add_argument("--idle-timeout", type=_positive, default=300)
     return parser
+
+
+def dashboard_loaders(path):
+    """Build queue-backed callbacks for the read-only dashboard."""
+    path = Path(path)
+
+    def current():
+        state, now, _projection = _status_transaction_details(path)
+        rows = status_rows(state, now)
+        return state, now, rows
+
+    def revision():
+        state, _now, _rows = current()
+        return state["revision"]
+
+    def snapshot():
+        state, now, rows = current()
+        return dashboard.build_snapshot(
+            state["queue_id"],
+            state["revision"],
+            rows,
+            now,
+        )
+
+    def events(after):
+        state = read_queue_snapshot(path)
+        return dashboard.events_after(state["events"], after)
+
+    return SimpleNamespace(
+        revision=revision,
+        snapshot=snapshot,
+        events=events,
+    )
 
 
 def _run_command(args, path):
@@ -3706,6 +3779,25 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         path = resolve_queue_path(args.queue)
+        if args.command == "serve":
+            loaders = dashboard_loaders(path)
+            try:
+                return dashboard.serve(
+                    args.host,
+                    args.port,
+                    args.interval,
+                    args.idle_timeout,
+                    args.open_browser,
+                    loaders.revision,
+                    loaders.snapshot,
+                    loaders.events,
+                    Path(__file__).with_name("dashboard"),
+                    sys.stdout,
+                )
+            except OSError as error:
+                raise QueueError(
+                    f"cannot start dashboard: {error}"
+                ) from error
         result = _run_command(args, path)
         if isinstance(result, str):
             sys.stdout.write(result)
