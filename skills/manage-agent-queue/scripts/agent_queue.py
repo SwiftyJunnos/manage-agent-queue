@@ -18,6 +18,7 @@ import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     import fcntl as _fcntl
@@ -3343,6 +3344,26 @@ def _positive(value):
     return number
 
 
+def _port(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "must be an integer from 0 to 65535"
+        ) from error
+    if not 0 <= number <= 65535:
+        raise argparse.ArgumentTypeError(
+            "must be an integer from 0 to 65535"
+        )
+    return number
+
+
+def _loopback_host(value):
+    if value != "127.0.0.1":
+        raise argparse.ArgumentTypeError("must be 127.0.0.1")
+    return value
+
+
 def _task_input_from_args(args):
     if args.from_json is not None:
         direct_values = (
@@ -3496,7 +3517,91 @@ def build_parser():
     doctor_parser.add_argument("--repair", action="store_true")
     compact = commands.add_parser("compact", help="compact closed queue history")
     compact.add_argument("--before", required=True)
+    serve = commands.add_parser(
+        "serve",
+        help="show the live workflow dashboard in a local browser",
+        description=(
+            "Serve the read-only live workflow dashboard on 127.0.0.1. "
+            "Run in the foreground until Ctrl-C or the idle timeout."
+        ),
+    )
+    serve.add_argument(
+        "--open",
+        dest="open_browser",
+        action="store_true",
+    )
+    serve.add_argument(
+        "--host",
+        type=_loopback_host,
+        default="127.0.0.1",
+        help="loopback host; only 127.0.0.1 is accepted",
+    )
+    serve.add_argument(
+        "--port",
+        type=_port,
+        default=0,
+        help="port from 0 to 65535; 0 selects an available port",
+    )
+    serve.add_argument(
+        "--interval",
+        type=_positive,
+        default=2,
+        help="polling interval in seconds",
+    )
+    serve.add_argument(
+        "--idle-timeout",
+        type=_positive,
+        default=300,
+        help="exit after this many seconds without a request",
+    )
     return parser
+
+
+def dashboard_loaders(path):
+    """Build queue-backed callbacks for the read-only dashboard."""
+    import queue_dashboard as dashboard
+
+    path = Path(path)
+
+    def available(callback):
+        try:
+            return callback()
+        except QueueError as error:
+            raise dashboard.DashboardDataUnavailable() from error
+
+    def current():
+        def load():
+            state, now, _projection = _status_transaction_details(path)
+            rows = status_rows(state, now)
+            return state, now, rows
+
+        return available(load)
+
+    def revision():
+        state, _now, _rows = current()
+        return state["revision"]
+
+    def snapshot():
+        state, now, rows = current()
+        return dashboard.build_snapshot(
+            state["queue_id"],
+            state["revision"],
+            rows,
+            now,
+        )
+
+    def events(after):
+        def load():
+            state = read_queue_snapshot(path)
+            return dashboard.events_after(state["events"], after)
+
+        return available(load)
+
+    return SimpleNamespace(
+        revision=revision,
+        snapshot=snapshot,
+        events=events,
+    )
 
 
 def _run_command(args, path):
@@ -3514,7 +3619,12 @@ def _run_command(args, path):
         state = _user_operation(
             lambda: initialize_queue(path, args.id, config)
         )
-        return {"ok": True, "queue_id": state["queue_id"], "revision": 0}
+        return {
+            "ok": True,
+            "queue_id": state["queue_id"],
+            "revision": 0,
+            "next_actions": ["serve --open", "status"],
+        }
 
     if args.command == "doctor":
         return doctor(path, repair=args.repair)
@@ -3706,9 +3816,38 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         path = resolve_queue_path(args.queue)
+        if args.command == "serve":
+            import queue_dashboard as dashboard
+
+            loaders = dashboard_loaders(path)
+            try:
+                return dashboard.serve(
+                    args.host,
+                    args.port,
+                    args.interval,
+                    args.idle_timeout,
+                    args.open_browser,
+                    loaders.revision,
+                    loaders.snapshot,
+                    loaders.events,
+                    Path(__file__).with_name("dashboard"),
+                    sys.stdout,
+                )
+            except OSError as error:
+                raise QueueError(
+                    f"cannot start dashboard: {error}"
+                ) from error
         result = _run_command(args, path)
         if isinstance(result, str):
             sys.stdout.write(result)
+            if (
+                args.command == "status"
+                and args.format == "table"
+                and sys.stdout.isatty()
+            ):
+                sys.stdout.write(
+                    "Live dashboard: agent_queue.py serve --open\n"
+                )
         else:
             _emit_json(result)
         if args.command == "doctor" and not result["ok"]:

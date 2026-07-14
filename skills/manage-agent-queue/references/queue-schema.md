@@ -190,6 +190,14 @@ Each event has exactly `seq`, `at`, `type`, `actor`, `task_id`, `revision`, and 
 
 Creation and transitions emit `task.added`, `workflow.created`, `task.claimed`, `task.heartbeat`, `task.completed`, `task.failed`, `task.released`, `task.lease_expired`, `task.retried`, `task.blocked`, `task.unblocked`, `task.cancelled`, and `queue.compacted` as applicable. Recursively remove every `lease_token` key from event details. `task show`, status, TSV, and events never expose the token; only successful `claim` returns it. Events also omit result bodies and include bounded metadata such as counts and states.
 
+## Local Dashboard
+
+`serve` runs a tokenized, read-only workflow dashboard on `127.0.0.1`. It binds to loopback only, selects an available port when `--port 0` is used, and stays in the foreground until `Ctrl-C` or `--idle-timeout` elapses without a request. `Ctrl-C` performs a clean exit with code `0`.
+
+Use `serve --open` only after the user approves opening a browser. If automatic browser opening fails, keep the server running and use the printed URL for manual opening. The access token is generated per process and is part of every allowed route. The server rejects unexpected Host headers, enables no CORS access, serves no external assets, and exposes no queue mutation endpoint.
+
+`--interval` controls revision polling. Revision and snapshot reads use the status transaction, including automatic expired-lease sweep and canonical TSV repair. API responses contain sanitized projections and events, never queue paths, lease tokens, raw results, or lock metadata. Missing, locked, or invalid queue data produces a bounded temporary-unavailable response so a repaired queue can recover without restarting the server.
+
 ## Public Commands
 
 Invoke `python3 scripts/agent_queue.py [--queue PATH] COMMAND`. Run `--help` for complete flags.
@@ -216,6 +224,7 @@ Invoke `python3 scripts/agent_queue.py [--queue PATH] COMMAND`. Run `--help` for
 | `export` | Print canonical `--format tsv`. |
 | `doctor` | Diagnose source, guard, locks, artifacts, and TSV. |
 | `compact` | Remove eligible closed history before a cutoff. |
+| `serve` | Run the tokenized, read-only workflow dashboard on `127.0.0.1`; foreground until `Ctrl-C` or idle timeout. |
 
 Mutating commands emit JSON on stdout. Normal errors use stderr, except `doctor`, which always emits its structured report on stdout for known diagnostics.
 

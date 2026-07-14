@@ -1,0 +1,98 @@
+:root {
+  color-scheme: light dark;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --surface: #15171a;
+  --panel: #202328;
+  --text: #f4f5f6;
+  --muted: #a8afb8;
+  --line: #343943;
+  --accent: #70a7ff;
+  --ok: #59c98b;
+  --warn: #f1bd62;
+  --danger: #ff7777;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--surface); color: var(--text); }
+button { font: inherit; }
+.topbar, main, .tabs {
+  width: min(1120px, calc(100% - 32px));
+  margin-inline: auto;
+}
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 28px 0 18px;
+}
+.eyebrow {
+  margin: 0;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+h1 { margin: 4px 0 0; font-size: 1.5rem; }
+.connection-actions { display: flex; align-items: center; gap: 10px; }
+.connection { color: var(--muted); }
+.connection.live { color: var(--ok); }
+.connection.retrying { color: var(--warn); }
+.connection.stopped { color: var(--danger); }
+.tabs { display: flex; gap: 8px; border-bottom: 1px solid var(--line); }
+.tabs button {
+  padding: 10px 14px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+.tabs button[aria-selected="true"] {
+  color: var(--text);
+  border-bottom: 2px solid var(--accent);
+}
+main { padding: 20px 0 48px; }
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+.card, .workflow, .warning {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.card { padding: 14px; }
+.workflow { margin-top: 14px; overflow: hidden; }
+.workflow-header, .task-row {
+  display: grid;
+  grid-template-columns: 110px minmax(220px, 1fr) 160px 130px;
+  gap: 12px;
+  padding: 12px 14px;
+  align-items: center;
+}
+.task-row { border-top: 1px solid var(--line); }
+.task-row.changed { animation: changed 2.5s ease-out; }
+.task-details { grid-column: 1 / -1; color: var(--muted); }
+.warning {
+  margin: 10px 0;
+  padding: 12px 14px;
+  border-color: var(--warn);
+}
+.state-completed { color: var(--ok); }
+.state-failed, .state-blocked, .state-dependency_failed {
+  color: var(--danger);
+}
+.activity-item { margin-block: 8px; }
+.muted, .empty { color: var(--muted); }
+@keyframes changed {
+  from { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .task-row.changed { animation: none; }
+}
+@media (max-width: 720px) {
+  .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .workflow-header, .task-row {
+    grid-template-columns: 86px minmax(0, 1fr);
+  }
+  .task-assignee, .task-time, .workflow-secondary { display: none; }
+  .topbar { align-items: flex-start; flex-direction: column; gap: 8px; }
+}

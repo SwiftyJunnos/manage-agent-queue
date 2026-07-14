@@ -25,11 +25,25 @@ QUEUE="/absolute/path/to/your-project/.agent-queue/queue.json"
 CLI="python3 $REPO/skills/manage-agent-queue/scripts/agent_queue.py --queue $QUEUE"
 ```
 
-Create one queue, add work, and let a worker claim it.
+Create one queue:
 
 ```bash
 $CLI init --id checkout-improvements
+```
 
+When an agent offers live observation and you approve it, open the local dashboard:
+
+```bash
+$CLI serve --open
+```
+
+The foreground command prints a private `http://127.0.0.1:...` URL. If the browser cannot be opened automatically, visit that printed URL manually. Stop the command with `Ctrl-C` when coordination ends. The dashboard is read-only; use the normal CLI commands to change tasks.
+
+For terminal-only observation, use `$CLI status` and `$CLI events`.
+
+Add work and let a worker claim it.
+
+```bash
 $CLI task add \
   --title "Document the checkout flow" \
   --role implementer \
@@ -74,6 +88,7 @@ agent. Do not manually edit `queue.json` or generated `queue.tsv`.
 | Need | Command |
 | --- | --- |
 | Add work | `task add`, `task add-batch`, `workflow add` |
+| Inspect live progress | `serve --open` after user approval |
 | Inspect progress | `status`, `events`, `export --format tsv` |
 | Maintain a lease | `heartbeat`, `complete`, `fail`, `release` |
 | Recover work | `sweep`, `retry`, `block`, `unblock`, `cancel` |

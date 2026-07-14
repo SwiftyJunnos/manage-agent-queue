@@ -2,13 +2,16 @@
 """Tests for the manage-agent-queue CLI."""
 
 import copy
+import http.client
 import io
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -20,6 +23,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import agent_queue as aq
+import queue_dashboard as qd
 
 
 SCRIPT_PATH = SCRIPT_DIR / "agent_queue.py"
@@ -117,6 +121,33 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("scripts/agent_queue.py", templates)
         self.assertIn("--from-json", templates)
 
+    def test_dashboard_requires_consent_fallback_and_cleanup(self):
+        skill = (self.skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        readme = (self.skill_dir.parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+        schema = (
+            self.skill_dir / "references" / "queue-schema.md"
+        ).read_text(encoding="utf-8")
+        for required in (
+            "실시간 큐 진행 상황을 브라우저에서 볼까요?",
+            "serve --open",
+            "ask once",
+            "status",
+            "events",
+            "stop",
+        ):
+            self.assertIn(required, skill)
+        self.assertLess(
+            skill.index("실시간 큐 진행 상황을 브라우저에서 볼까요?"),
+            skill.index("serve --open"),
+        )
+        self.assertIn("$CLI serve --open", readme)
+        self.assertIn("manual", readme.lower())
+        self.assertIn("`serve`", schema)
+        self.assertIn("127.0.0.1", schema)
+        self.assertIn("read-only", schema)
+
 
 def run_cli(*arguments, cwd=None, env=None, timeout=10):
     command = [sys.executable, str(SCRIPT_PATH), *map(str, arguments)]
@@ -148,6 +179,26 @@ def communicate_all(processes, timeout):
         for process in processes:
             process.communicate()
         raise
+
+
+def request_server(server, path, host=None):
+    connection = http.client.HTTPConnection(
+        "127.0.0.1",
+        server.server_port,
+        timeout=2,
+    )
+    connection.request(
+        "GET",
+        path,
+        headers={
+            "Host": host or f"127.0.0.1:{server.server_port}"
+        },
+    )
+    response = connection.getresponse()
+    body = response.read()
+    headers = dict(response.getheaders())
+    connection.close()
+    return response.status, headers, body
 
 
 def canonical_claim(
@@ -4171,6 +4222,49 @@ class QueueCliTests(unittest.TestCase):
         self.assertNotEqual("", result.stderr)
         self.assertEqual(before, self.queue.read_bytes())
 
+    def test_init_and_machine_status_discover_dashboard_safely(self):
+        output = self.init()
+        self.assertEqual(
+            ["serve --open", "status"],
+            output["next_actions"],
+        )
+        self.add("work")
+        table = self.cli("status")
+        self.assertNotIn("serve --open", table.stdout)
+        machine = self.json_output(
+            self.cli("status", "--format", "json")
+        )
+        self.assertNotIn("hint", machine)
+
+    def test_help_names_live_local_dashboard(self):
+        top = run_cli("--help")
+        serve = run_cli("serve", "--help")
+        self.assertEqual(0, top.returncode)
+        self.assertIn("live workflow dashboard", top.stdout)
+        self.assertEqual(0, serve.returncode)
+        self.assertIn("127.0.0.1", serve.stdout)
+        self.assertIn("--idle-timeout", serve.stdout)
+
+    def test_human_tty_status_points_to_live_dashboard(self):
+        class TtyOutput(io.StringIO):
+            def isatty(self):
+                return True
+
+        self.init()
+        self.add("work")
+        output = TtyOutput()
+
+        with redirect_stdout(output):
+            code = aq.main(
+                ["--queue", str(self.queue), "status"]
+            )
+
+        self.assertEqual(0, code)
+        self.assertIn(
+            "Live dashboard: agent_queue.py serve --open",
+            output.getvalue(),
+        )
+
     def test_task_add_batch_show_and_json_errors_are_atomic(self):
         self.init()
         added = self.add(
@@ -4674,6 +4768,648 @@ class QueueCliTests(unittest.TestCase):
         self.assertFalse(Path(str(self.queue) + ".lock").exists())
         self.assertTrue(Path(str(self.queue) + ".lock.guard").is_file())
         self.assertEqual([], list(self.queue.parent.glob("*.tmp")))
+
+
+class DashboardProjectionTests(unittest.TestCase):
+    NOW = "2026-07-10T06:00:00Z"
+
+    def row(self, task_id, workflow, state, **overrides):
+        row = {
+            "id": task_id,
+            "workflow": workflow,
+            "role": "implement",
+            "state": state,
+            "priority": 10,
+            "assignee": "",
+            "lease_until": "",
+            "attempts": "0/3",
+            "depends_on": "",
+            "blocked_by": "",
+            "resources": "",
+            "title": task_id,
+        }
+        row.update(overrides)
+        return row
+
+    def test_projection_groups_workflows_and_computes_counts(self):
+        rows = [
+            self.row("T-000001", "W-000001", "completed", title="Done"),
+            self.row(
+                "T-000002",
+                "W-000001",
+                "leased",
+                title="Working",
+                assignee="agent-1",
+                lease_until="2026-07-10T06:01:30Z",
+            ),
+            self.row("T-000003", "", "ready", title="Loose"),
+        ]
+
+        value = qd.build_snapshot("demo", 7, rows, self.NOW)
+
+        self.assertEqual("demo", value["queue_id"])
+        self.assertEqual(7, value["revision"])
+        self.assertEqual(
+            {
+                "total": 3,
+                "completed": 1,
+                "active": 1,
+                "ready": 1,
+                "attention": 1,
+            },
+            value["counts"],
+        )
+        self.assertEqual(
+            ["W-000001", "unassigned"],
+            [workflow["id"] for workflow in value["workflows"]],
+        )
+        self.assertEqual(50, value["workflows"][0]["progress_percent"])
+        self.assertEqual("lease_expiring", value["warnings"][0]["kind"])
+
+    def test_projection_warning_precedence_and_redaction_boundary(self):
+        rows = [
+            self.row("T-000004", "W-1", "blocked", blocked_by="T-000001"),
+            self.row(
+                "T-000003",
+                "W-1",
+                "dependency_failed",
+                blocked_by="T-000002",
+            ),
+            self.row("T-000002", "W-1", "failed"),
+            self.row(
+                "T-000001",
+                "W-1",
+                "resource_conflict",
+                blocked_by="T-000009",
+                resources="repo",
+            ),
+        ]
+
+        value = qd.build_snapshot("demo", 8, rows, self.NOW)
+
+        self.assertEqual(
+            ["failed", "blocked", "dependency_failed"],
+            [warning["kind"] for warning in value["warnings"]],
+        )
+        serialized = json.dumps(value)
+        self.assertNotIn("lease_token", serialized)
+        self.assertNotIn("result", serialized)
+        self.assertNotIn("description", serialized)
+
+    def test_events_after_returns_detached_sanitized_sequence(self):
+        events = [
+            {
+                "seq": 1,
+                "at": self.NOW,
+                "type": "task.added",
+                "actor": "operator",
+                "task_id": "T-000001",
+                "revision": 1,
+                "details": {},
+            },
+            {
+                "seq": 2,
+                "at": self.NOW,
+                "type": "task.claimed",
+                "actor": "agent-1",
+                "task_id": "T-000001",
+                "revision": 2,
+                "details": {
+                    "lease_token": "must-not-leak",
+                    "agent_id": "agent-1",
+                },
+            },
+        ]
+
+        value = qd.events_after(events, 1)
+
+        self.assertEqual([2], [event["seq"] for event in value])
+        self.assertNotIn("lease_token", repr(value))
+        value[0]["details"]["agent_id"] = "changed"
+        self.assertEqual("agent-1", events[1]["details"]["agent_id"])
+
+
+class DashboardHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.snapshot = {
+            "queue_id": "demo",
+            "revision": 3,
+            "workflows": [],
+        }
+        self.events = [
+            {"seq": 3, "type": "task.added", "details": {}}
+        ]
+        self.server = qd.create_server(
+            "127.0.0.1",
+            0,
+            "fixed-token",
+            2,
+            revision_loader=lambda: 3,
+            snapshot_loader=lambda: self.snapshot,
+            events_loader=lambda after: [
+                event for event in self.events if event["seq"] > after
+            ],
+            asset_dir=SCRIPT_DIR / "dashboard",
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.thread.start()
+        self.addCleanup(self.stop_server)
+
+    def stop_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def request(self, method, path, host=None):
+        self.assertEqual("GET", method)
+        return request_server(self.server, path, host=host)
+
+    def test_token_host_and_fixed_routes_are_enforced(self):
+        self.assertEqual(
+            404,
+            self.request("GET", "/wrong/api/revision")[0],
+        )
+        self.assertEqual(
+            400,
+            self.request(
+                "GET",
+                "/fixed-token/api/revision",
+                host="evil.test",
+            )[0],
+        )
+        status, _headers, body = self.request(
+            "GET",
+            "/fixed-token/api/revision",
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {"revision": 3, "interval": 2},
+            json.loads(body),
+        )
+        status, _headers, body = self.request(
+            "GET",
+            "/fixed-token/api/events?after=2",
+        )
+        self.assertEqual(
+            [3],
+            [event["seq"] for event in json.loads(body)["events"]],
+        )
+        self.assertEqual(
+            404,
+            self.request(
+                "GET",
+                "/fixed-token/assets/../agent_queue.py",
+            )[0],
+        )
+
+    def test_token_prefix_uses_constant_time_comparison(self):
+        with mock.patch.object(
+            qd.secrets,
+            "compare_digest",
+            wraps=qd.secrets.compare_digest,
+        ) as compare:
+            self.assertEqual(
+                200,
+                self.request(
+                    "GET",
+                    "/fixed-token/api/revision",
+                )[0],
+            )
+
+        compare.assert_called_once_with(
+            "/fixed-token/",
+            "/fixed-token/",
+        )
+
+    def test_invalid_event_cursor_is_a_bad_request(self):
+        status, _headers, body = self.request(
+            "GET",
+            "/fixed-token/api/events?after=invalid",
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual(
+            {"error": "invalid after parameter"},
+            json.loads(body),
+        )
+
+    def test_every_success_response_has_security_headers(self):
+        for path in (
+            "/fixed-token/",
+            "/fixed-token/assets/dashboard.css",
+            "/fixed-token/assets/dashboard.js",
+            "/fixed-token/api/snapshot",
+        ):
+            with self.subTest(path=path):
+                status, headers, _body = self.request("GET", path)
+                self.assertEqual(200, status)
+                self.assertEqual("no-store", headers["Cache-Control"])
+                self.assertEqual(
+                    "no-referrer",
+                    headers["Referrer-Policy"],
+                )
+                self.assertEqual(
+                    "nosniff",
+                    headers["X-Content-Type-Options"],
+                )
+                self.assertEqual("DENY", headers["X-Frame-Options"])
+                self.assertIn(
+                    "default-src 'none'",
+                    headers["Content-Security-Policy"],
+                )
+                self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_health_and_loader_errors_do_not_kill_server(self):
+        self.server.dashboard.snapshot_loader = lambda: (
+            _ for _ in ()
+        ).throw(
+            qd.DashboardDataUnavailable(
+                "private /tmp/queue.json detail"
+            )
+        )
+        status, _headers, body = self.request(
+            "GET",
+            "/fixed-token/api/snapshot",
+        )
+        self.assertEqual(503, status)
+        self.assertEqual(
+            {"error": "queue temporarily unavailable"},
+            json.loads(body),
+        )
+        self.assertNotIn(b"/tmp/queue.json", body)
+        self.assertEqual(
+            200,
+            self.request("GET", "/fixed-token/api/health")[0],
+        )
+
+
+class DashboardCliTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.queue = Path(self.temporary.name) / "queue.json"
+        aq.initialize_queue(self.queue, "demo", aq.fixed_config())
+        result = run_cli(
+            "--queue",
+            self.queue,
+            "task",
+            "add",
+            "--title",
+            "Visible",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_parser_exposes_bounded_serve_options(self):
+        args = aq.build_parser().parse_args(
+            [
+                "serve",
+                "--open",
+                "--port",
+                "0",
+                "--interval",
+                "1",
+                "--idle-timeout",
+                "30",
+            ]
+        )
+        self.assertTrue(args.open_browser)
+        self.assertEqual("127.0.0.1", args.host)
+        self.assertEqual(0, args.port)
+        self.assertEqual(1, args.interval)
+        self.assertEqual(30, args.idle_timeout)
+        for arguments in (
+            ("serve", "--port", "-1"),
+            ("serve", "--port", "65536"),
+            ("serve", "--host", "0.0.0.0"),
+        ):
+            self.assertEqual(2, run_cli(*arguments).returncode)
+
+    def test_dashboard_loaders_return_current_sanitized_data(self):
+        loaders = aq.dashboard_loaders(self.queue)
+
+        revision = loaders.revision()
+        snapshot = loaders.snapshot()
+        events = loaders.events(0)
+
+        self.assertEqual(snapshot["revision"], revision)
+        self.assertEqual(
+            "Visible",
+            snapshot["workflows"][0]["tasks"][0]["title"],
+        )
+        serialized = json.dumps(snapshot) + json.dumps(events)
+        self.assertNotIn("lease_token", serialized)
+
+    def test_serve_prints_ready_url_and_stops_on_sigint(self):
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--queue",
+                str(self.queue),
+                "serve",
+                "--port",
+                "0",
+                "--idle-timeout",
+                "30",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(
+            lambda: process.poll() is None and process.kill()
+        )
+        ready = process.stdout.readline().strip()
+        self.assertRegex(
+            ready,
+            r"^http://127\.0\.0\.1:\d+/[A-Za-z0-9_-]+/$",
+        )
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=3)
+        self.assertEqual(0, process.returncode, stderr)
+        self.assertIn("dashboard stopped", stdout)
+
+
+class DashboardAssetTests(unittest.TestCase):
+    def setUp(self):
+        self.assets = SCRIPT_DIR / "dashboard"
+
+    def test_assets_are_build_free_local_and_accessible(self):
+        html = (self.assets / "index.html").read_text(encoding="utf-8")
+        css = (self.assets / "dashboard.css").read_text(encoding="utf-8")
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+        combined = html + css + javascript
+        self.assertIn('id="workflow-view"', html)
+        self.assertIn('id="activity-view"', html)
+        self.assertIn('aria-live="polite"', html)
+        self.assertIn("@media (max-width: 720px)", css)
+        self.assertNotRegex(combined, r"https?://")
+
+    def test_client_polls_revision_and_uses_safe_dom_apis(self):
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "api/revision",
+            "api/snapshot",
+            "api/events?after=",
+            "textContent",
+            "setTimeout",
+            "data-task-id",
+            "manual-refresh",
+            "last-updated",
+            "remainingTime",
+            "updatedTime",
+            "retryDelay",
+            "Retrying",
+            "Stopped",
+            "queue temporarily unavailable",
+            "dashboard server ended",
+        ):
+            self.assertIn(required, javascript)
+        for forbidden in (
+            "innerHTML",
+            "insertAdjacentHTML",
+            "eval(",
+            "document.write",
+        ):
+            self.assertNotIn(forbidden, javascript)
+
+    def test_client_commits_revision_after_events_refresh(self):
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+        poll = javascript[javascript.index("async function poll()") :]
+
+        self.assertLess(
+            poll.index("await refreshEvents();"),
+            poll.index("state.revision = snapshot.revision;"),
+        )
+
+    def test_client_preserves_expanded_tasks_across_snapshots(self):
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+
+        for required in (
+            'details[data-task-id][open]',
+            "openTasks",
+            "row.open = true",
+        ):
+            self.assertIn(required, javascript)
+
+    def test_client_uses_empty_template_for_empty_workflows(self):
+        html = (self.assets / "index.html").read_text(encoding="utf-8")
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('id="empty-template"', html)
+        self.assertIn('byId("empty-template")', javascript)
+        self.assertIn("cloneNode(true)", javascript)
+
+    def test_plan_uses_long_fence_around_nested_bash_example(self):
+        plan = (
+            SCRIPT_DIR.parents[2]
+            / "docs"
+            / "plans"
+            / "2026-07-14-local-queue-dashboard.md"
+        ).read_text(encoding="utf-8")
+        example = plan[plan.index("In README Quick start") :]
+
+        self.assertIn("````markdown\n", example)
+        self.assertIn("\n````\n\nAdd the `serve` row", example)
+
+
+class DashboardLifecycleTests(unittest.TestCase):
+    def in_flight_server(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def load_snapshot():
+            started.set()
+            release.wait(timeout=2)
+            return {"revision": 1}
+
+        server = qd.create_server(
+            "127.0.0.1",
+            0,
+            "token",
+            2,
+            lambda: 1,
+            load_snapshot,
+            lambda _after: [],
+            SCRIPT_DIR / "dashboard",
+        )
+        serving = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        serving.start()
+        response = {}
+
+        def request_snapshot():
+            response["value"] = request_server(
+                server,
+                "/token/api/snapshot",
+            )
+
+        request = threading.Thread(target=request_snapshot, daemon=True)
+        request.start()
+        self.assertTrue(started.wait(timeout=1))
+        server.shutdown()
+        serving.join(timeout=1)
+        self.assertFalse(serving.is_alive())
+        return server, request, release, response
+
+    def test_server_close_waits_for_inflight_request_within_bound(self):
+        server, request, release, response = self.in_flight_server()
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+
+        drained = server.server_close(timeout=1)
+
+        timer.join(timeout=1)
+        request.join(timeout=1)
+        self.assertTrue(drained)
+        self.assertFalse(request.is_alive())
+        self.assertEqual(200, response["value"][0])
+
+    def test_server_close_returns_after_bound_with_active_request(self):
+        server, request, release, _response = self.in_flight_server()
+        started = time.monotonic()
+
+        drained = server.server_close(timeout=0.05)
+
+        self.assertFalse(drained)
+        self.assertLess(time.monotonic() - started, 0.25)
+        release.set()
+        request.join(timeout=1)
+        self.assertFalse(request.is_alive())
+
+    def test_idle_server_exits_without_browser_requests(self):
+        output = io.StringIO()
+        started = time.monotonic()
+
+        code = qd.serve(
+            "127.0.0.1",
+            0,
+            2,
+            1,
+            False,
+            revision_loader=lambda: 0,
+            snapshot_loader=lambda: {},
+            events_loader=lambda _after: [],
+            asset_dir=SCRIPT_DIR / "dashboard",
+            output=output,
+            browser_open=lambda _url: True,
+        )
+
+        self.assertEqual(0, code)
+        self.assertLess(time.monotonic() - started, 2.5)
+        self.assertIn("dashboard stopped", output.getvalue())
+
+    def test_browser_failure_prints_manual_url_and_keeps_serving(self):
+        output = io.StringIO()
+
+        code = qd.serve(
+            "127.0.0.1",
+            0,
+            2,
+            1,
+            True,
+            revision_loader=lambda: 0,
+            snapshot_loader=lambda: {},
+            events_loader=lambda _after: [],
+            asset_dir=SCRIPT_DIR / "dashboard",
+            output=output,
+            browser_open=lambda _url: False,
+        )
+
+        self.assertEqual(0, code)
+        self.assertIn(
+            "browser did not open; visit http://127.0.0.1:",
+            output.getvalue(),
+        )
+
+    def test_browser_exception_prints_manual_url_and_closes_cleanly(self):
+        output = io.StringIO()
+
+        def fail_to_open(_url):
+            raise qd.webbrowser.Error("no browser")
+
+        code = qd.serve(
+            "127.0.0.1",
+            0,
+            2,
+            1,
+            True,
+            revision_loader=lambda: 0,
+            snapshot_loader=lambda: {},
+            events_loader=lambda _after: [],
+            asset_dir=SCRIPT_DIR / "dashboard",
+            output=output,
+            browser_open=fail_to_open,
+        )
+
+        self.assertEqual(0, code)
+        self.assertIn(
+            "browser did not open; visit http://127.0.0.1:",
+            output.getvalue(),
+        )
+        self.assertIn("dashboard stopped", output.getvalue())
+
+    def test_snapshot_loader_recovers_after_one_data_failure(self):
+        attempts = iter(
+            (
+                qd.DashboardDataUnavailable(),
+                {"revision": 2},
+            )
+        )
+
+        def load():
+            result = next(attempts)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        server = qd.create_server(
+            "127.0.0.1",
+            0,
+            "token",
+            2,
+            lambda: 2,
+            load,
+            lambda _after: [],
+            SCRIPT_DIR / "dashboard",
+        )
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        def stop_server():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.addCleanup(stop_server)
+        self.assertEqual(
+            503,
+            request_server(server, "/token/api/snapshot")[0],
+        )
+        status, _headers, body = request_server(
+            server,
+            "/token/api/snapshot",
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, json.loads(body)["revision"])
 
 
 if __name__ == "__main__":
