@@ -73,21 +73,34 @@ const updatedTime = () => {
   );
   return seconds < 2 ? "Updated just now" : `Updated ${seconds}s ago`;
 };
+const tableCell = (className, label) => {
+  const cell = element("td", className);
+  cell.dataset.label = label;
+  return cell;
+};
+const metadataItem = (label, value) => {
+  const item = element("span", "meta-item");
+  item.append(
+    element("span", "meta-label", label),
+    element("strong", "", value || "none"),
+  );
+  return item;
+};
 const updateStatusTime = () => {
   byId("last-updated").textContent = updatedTime();
   setTimeout(updateStatusTime, 1000);
 };
 const updateTimes = () => {
   for (const node of document.querySelectorAll("[data-lease-until]")) {
-    node.textContent = remainingTime(node.dataset.leaseUntil);
+    node.textContent = remainingTime(node.dataset.leaseUntil) || "—";
   }
 };
 
-function renderTask(task, openTasks) {
-  const row = element("details", "task-row");
+function renderTaskRow(task) {
+  const row = element("tr", "task-row");
   row.setAttribute("data-task-id", task.id);
-  if (openTasks.has(task.id)) {
-    row.open = true;
+  if (task.state === "leased") {
+    row.classList.add("active-row");
   }
   const previous = state.taskFingerprints.get(task.id);
   const next = fingerprint(task);
@@ -95,34 +108,93 @@ function renderTask(task, openTasks) {
     row.classList.add("changed");
   }
   state.taskFingerprints.set(task.id, next);
-  const time = element(
-    "span",
-    "task-time",
-    remainingTime(task.lease_until),
+
+  const status = tableCell(`task-status state-${task.state}`, "Status");
+  status.textContent = stateLabel(task.state);
+
+  const taskCell = tableCell("task-cell", "Task");
+  const primary = element("div", "task-primary");
+  primary.append(
+    element("span", "task-id", task.id),
+    element("span", "task-title", task.title),
   );
-  time.dataset.leaseUntil = task.lease_until || "";
-  row.append(
-    element("summary", `state-${task.state}`, stateLabel(task.state)),
-    element("span", "task-title", `${task.id}  ${task.title}`),
-    element("span", "task-assignee", task.assignee || "Unassigned"),
-    time,
+  const metadata = element("div", "task-meta");
+  metadata.append(
+    metadataItem("Attempts", task.attempts),
+    metadataItem("Depends on", task.depends_on),
+    metadataItem("Resources", task.resources),
   );
-  row.append(element(
-    "div",
-    "task-details",
-    `Attempts ${task.attempts} · Depends on ${task.depends_on || "none"} · Resources ${task.resources || "none"}`,
-  ));
+  taskCell.append(primary, metadata);
+
+  const assignee = tableCell("task-assignee", "Assignee");
+  assignee.textContent = task.assignee || "Unassigned";
+
+  const timing = tableCell("task-time", "Timing");
+  timing.textContent = remainingTime(task.lease_until) || "—";
+  timing.dataset.leaseUntil = task.lease_until || "";
+
+  row.append(status, taskCell, assignee, timing);
   return row;
+}
+
+function renderWorkflow(workflow) {
+  const section = element("section", "workflow-group");
+  const heading = element("div", "workflow-heading");
+  heading.append(
+    element("h2", "workflow-name", workflow.id),
+    element(
+      "span",
+      "workflow-progress",
+      `${workflow.completed}/${workflow.total} completed · ` +
+        `${workflow.active} active · ${workflow.attention} attention`,
+    ),
+  );
+
+  const table = element("table", "queue-table");
+  const tableHead = element("thead");
+  const headingRow = element("tr");
+  for (const label of ["Status", "Task", "Assignee", "Timing"]) {
+    const heading = element("th", "", label);
+    heading.scope = "col";
+    headingRow.append(heading);
+  }
+  tableHead.append(headingRow);
+
+  const tableBody = element("tbody");
+  tableBody.append(...workflow.tasks.map(renderTaskRow));
+  table.append(tableHead, tableBody);
+  section.append(heading, table);
+  return section;
 }
 
 function renderSnapshot(snapshot) {
   byId("queue-title").textContent = `${snapshot.queue_id} · rev ${snapshot.revision}`;
   const summary = byId("summary");
   summary.replaceChildren();
-  summary.className = "summary-grid";
-  for (const [label, value] of Object.entries(snapshot.counts)) {
-    summary.append(element("article", "card", `${label}  ${value}`));
-  }
+  summary.className = "summary-line";
+  const waiting = Math.max(
+    0,
+    snapshot.counts.total - snapshot.counts.completed - snapshot.counts.active,
+  );
+  const summaryText = element("div", "summary-text");
+  summaryText.append(
+    element(
+      "strong",
+      "summary-progress",
+      `${snapshot.counts.completed} of ${snapshot.counts.total} completed`,
+    ),
+    element(
+      "span",
+      "summary-counts",
+      `${snapshot.counts.active} active · ${waiting} waiting · ` +
+        `${snapshot.counts.attention} attention`,
+    ),
+  );
+  const progress = element("progress", "queue-progress");
+  progress.max = Math.max(1, snapshot.counts.total);
+  progress.value = snapshot.counts.completed;
+  progress.setAttribute("aria-label", "Queue completion");
+  summary.append(summaryText, progress);
 
   const warnings = byId("warnings");
   warnings.replaceChildren();
@@ -135,38 +207,12 @@ function renderSnapshot(snapshot) {
   }
 
   const workflows = byId("workflow-view");
-  const openTasks = new Set(
-    Array.from(
-      document.querySelectorAll("details[data-task-id][open]"),
-      (node) => node.dataset.taskId,
-    ),
-  );
   workflows.replaceChildren();
   if (snapshot.workflows.length === 0) {
     workflows.append(byId("empty-template").content.cloneNode(true));
   }
   for (const workflow of snapshot.workflows) {
-    const section = element("section", "workflow");
-    const header = element("header", "workflow-header");
-    header.append(
-      element("strong", "", workflow.id),
-      element(
-        "span",
-        "",
-        `${workflow.completed}/${workflow.total} · ${workflow.progress_percent}%`,
-      ),
-      element("span", "workflow-secondary", `${workflow.active} active`),
-      element(
-        "span",
-        "workflow-secondary",
-        `${workflow.attention} attention`,
-      ),
-    );
-    section.append(
-      header,
-      ...workflow.tasks.map((task) => renderTask(task, openTasks)),
-    );
-    workflows.append(section);
+    workflows.append(renderWorkflow(workflow));
   }
 }
 
