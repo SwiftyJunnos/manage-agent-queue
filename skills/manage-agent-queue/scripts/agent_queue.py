@@ -20,8 +20,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-import queue_dashboard as dashboard
-
 try:
     import fcntl as _fcntl
 except ImportError:  # pragma: no cover - exercised by isolated import test
@@ -3561,6 +3559,8 @@ def build_parser():
 
 def dashboard_loaders(path):
     """Build queue-backed callbacks for the read-only dashboard."""
+    import queue_dashboard as dashboard
+
     path = Path(path)
 
     def available(callback):
@@ -3817,6 +3817,8 @@ def main(argv=None):
     try:
         path = resolve_queue_path(args.queue)
         if args.command == "serve":
+            import queue_dashboard as dashboard
+
             loaders = dashboard_loaders(path)
             try:
                 return dashboard.serve(
