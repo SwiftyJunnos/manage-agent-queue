@@ -5024,5 +5024,49 @@ class DashboardCliTests(unittest.TestCase):
         self.assertIn("dashboard stopped", stdout)
 
 
+class DashboardAssetTests(unittest.TestCase):
+    def setUp(self):
+        self.assets = SCRIPT_DIR / "dashboard"
+
+    def test_assets_are_build_free_local_and_accessible(self):
+        html = (self.assets / "index.html").read_text(encoding="utf-8")
+        css = (self.assets / "dashboard.css").read_text(encoding="utf-8")
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+        combined = html + css + javascript
+        self.assertIn('id="workflow-view"', html)
+        self.assertIn('id="activity-view"', html)
+        self.assertIn('aria-live="polite"', html)
+        self.assertIn("@media (max-width: 720px)", css)
+        self.assertNotRegex(combined, r"https?://")
+
+    def test_client_polls_revision_and_uses_safe_dom_apis(self):
+        javascript = (self.assets / "dashboard.js").read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "api/revision",
+            "api/snapshot",
+            "api/events?after=",
+            "textContent",
+            "setTimeout",
+            "data-task-id",
+            "manual-refresh",
+            "remainingTime",
+            "retryDelay",
+            "Retrying",
+            "Stopped",
+        ):
+            self.assertIn(required, javascript)
+        for forbidden in (
+            "innerHTML",
+            "insertAdjacentHTML",
+            "eval(",
+            "document.write",
+        ):
+            self.assertNotIn(forbidden, javascript)
+
+
 if __name__ == "__main__":
     unittest.main()

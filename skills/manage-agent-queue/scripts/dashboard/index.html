@@ -1,5 +1,35 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Agent Queue</title><link rel="stylesheet" href="assets/dashboard.css"></head>
-<body><main id="app"></main><script src="assets/dashboard.js"></script></body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Queue</title>
+  <link rel="stylesheet" href="assets/dashboard.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Agent queue</p>
+      <h1 id="queue-title">Loading…</h1>
+    </div>
+    <div class="connection-actions">
+      <div id="connection" class="connection" aria-live="polite">Connecting</div>
+      <button id="manual-refresh" type="button">Refresh now</button>
+    </div>
+  </header>
+  <nav class="tabs" aria-label="Dashboard views">
+    <button id="workflow-tab" type="button" aria-controls="workflow-view" aria-selected="true">Workflows</button>
+    <button id="activity-tab" type="button" aria-controls="activity-view" aria-selected="false">Activity</button>
+  </nav>
+  <main>
+    <section id="summary" aria-label="Queue summary"></section>
+    <section id="warnings" aria-label="Attention"></section>
+    <section id="workflow-view" aria-labelledby="workflow-tab"></section>
+    <section id="activity-view" aria-labelledby="activity-tab" hidden>
+      <ol id="activity-list"></ol>
+    </section>
+  </main>
+  <template id="empty-template"><p class="empty">No queue activity yet.</p></template>
+  <script src="assets/dashboard.js"></script>
+</body>
 </html>
