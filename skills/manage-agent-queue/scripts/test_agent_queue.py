@@ -2787,6 +2787,150 @@ class LifecycleTransitionTests(unittest.TestCase):
         self.assertNotIn(token, repr(rows) + tsv)
 
 
+class GitRecoveryTests(unittest.TestCase):
+    CREATED = "2026-07-10T05:00:00Z"
+    NOW = "2026-07-10T06:00:00Z"
+    EXPIRES = "2026-07-10T06:01:00Z"
+    LATER = "2026-07-10T06:01:31Z"
+
+    def setUp(self):
+        self.clock = mock.patch.object(aq, "utc_now", return_value=self.CREATED)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.state = aq.new_state("demo", aq.fixed_config())
+        self.observation = git_snapshot(head="a" * 40)
+
+    def add_git(self, max_attempts=2):
+        created = aq.add_task(
+            self.state,
+            {
+                "title": "Git task",
+                "git_mode": "commit",
+                "resources": ["dir:src/"],
+                "max_attempts": max_attempts,
+            },
+        )
+        return self.state["tasks"][created["id"]]
+
+    def claim_git(self, task, agent="worker", now=None, **extra):
+        with mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value=f"SECRET-{agent}"
+        ):
+            return aq.claim_task(
+                self.state,
+                agent,
+                now=now or self.NOW,
+                lease_seconds=60,
+                git_observation=self.observation,
+                task_id=task["id"],
+                **extra,
+            )
+
+    def expire(self, task):
+        self.claim_git(task)
+        aq.sweep_expired(self.state, now=self.EXPIRES)
+        return self.state["tasks"][task["id"]]
+
+    def test_expired_git_lease_preserves_private_recovery_binding(self):
+        task = self.add_git(max_attempts=2)
+
+        stored = self.expire(task)
+
+        self.assertEqual("pending", stored["status"])
+        self.assertIsNone(stored["claim"])
+        self.assertEqual(
+            self.observation["head"], stored["git_recovery"]["base"]
+        )
+        self.assertEqual(
+            "git_recovery",
+            aq.derive_state(self.state, stored, self.LATER),
+        )
+        safe = json.dumps(aq._safe_task(stored))
+        self.assertNotIn("/private/repository", safe)
+        self.assertNotIn("/private/worktrees", safe)
+
+    def test_exhausted_git_attempt_keeps_recovery_across_retry(self):
+        task = self.add_git(max_attempts=1)
+        stored = self.expire(task)
+        self.assertEqual("failed", stored["status"])
+        recovery = copy.deepcopy(stored["git_recovery"])
+        self.assertIsNotNone(recovery)
+
+        aq.retry_task(self.state, task["id"], now=self.LATER)
+
+        self.assertEqual(
+            recovery, self.state["tasks"][task["id"]]["git_recovery"]
+        )
+
+    def test_retryable_failure_preserves_recovery(self):
+        task = self.add_git(max_attempts=2)
+        claimed = self.claim_git(task)
+
+        failed = aq.fail_task(
+            self.state,
+            task["id"],
+            "worker",
+            claimed["lease_token"],
+            "retry",
+            now="2026-07-10T06:00:30Z",
+        )
+
+        self.assertEqual("pending", failed["status"])
+        self.assertEqual(
+            self.observation["head"], failed["git_recovery"]["base"]
+        )
+
+    def test_ordinary_claim_skips_recovery_and_explicit_resume_keeps_base(self):
+        task = self.add_git(max_attempts=3)
+        stored = self.expire(task)
+        recovery = copy.deepcopy(stored["git_recovery"])
+        with self.assertRaises(aq.NoTaskAvailable):
+            self.claim_git(task, agent="ordinary", now=self.LATER)
+
+        context = {"binding": recovery, "head": self.observation["head"]}
+        resumed = self.claim_git(
+            task,
+            agent="resumer",
+            now=self.LATER,
+            resume_git=True,
+            git_resume=context,
+        )
+
+        self.assertEqual(recovery, resumed["task"]["claim"]["git"])
+        self.assertIsNone(resumed["task"]["git_recovery"])
+        self.assertEqual(2, resumed["task"]["attempts"])
+        self.assertTrue(self.state["events"][-1]["details"]["resumed_git"])
+
+    def test_invalid_resume_context_is_atomic(self):
+        task = self.add_git(max_attempts=3)
+        stored = self.expire(task)
+        before = copy.deepcopy(self.state)
+        invalid = {
+            "binding": copy.deepcopy(stored["git_recovery"]),
+            "head": "b" * 40,
+        }
+
+        with self.assertRaisesRegex(aq.InvariantError, "recovery"):
+            self.claim_git(
+                task,
+                agent="resumer",
+                now=self.LATER,
+                resume_git=True,
+                git_resume=invalid,
+            )
+
+        self.assertEqual(before, self.state)
+
+    def test_cancel_clears_recovery_binding(self):
+        task = self.add_git(max_attempts=2)
+        self.expire(task)
+
+        cancelled = aq.cancel_task(self.state, task["id"], now=self.LATER)
+
+        self.assertEqual("cancelled", cancelled["status"])
+        self.assertIsNone(cancelled["git_recovery"])
+
+
 class StatusProjectionTests(unittest.TestCase):
     NOW = "2026-07-10T06:00:00Z"
 
@@ -5057,6 +5201,195 @@ class QueueCliTests(unittest.TestCase):
         stored = aq.load_state(self.queue)["tasks"][task["id"]]
         self.assertEqual("pending", stored["status"])
         self.assertIsNone(stored["claim"])
+
+    def test_cli_requires_explicit_resume_and_restores_original_base(self):
+        self.init(retry_backoff=1)
+        task = self.add(
+            "Git recovery",
+            "--git-commit",
+            "--resource",
+            "dir:src/",
+        )["task"]
+        observation = git_snapshot(head="a" * 40)
+        started_at = aq.load_state(self.queue)["tasks"][task["id"]][
+            "updated_at"
+        ]
+        expires_at = aq.add_seconds(started_at, 60)
+        resume_at = aq.add_seconds(expires_at, 2)
+
+        def claim_then_expire(state):
+            claimed = aq.claim_task(
+                state,
+                "first-worker",
+                now=started_at,
+                lease_seconds=60,
+                git_observation=observation,
+                task_id=task["id"],
+            )
+            aq.sweep_expired(
+                state, now=claimed["expires_at"]
+            )
+
+        aq.mutate_queue(
+            self.queue,
+            claim_then_expire,
+            auto_sweep=False,
+        )
+
+        def invoke(*arguments):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                aq.gq, "observe", return_value=observation
+            ), mock.patch.object(
+                aq, "utc_now", return_value=resume_at
+            ), redirect_stdout(stdout), redirect_stderr(stderr):
+                code = aq.main([
+                    "--queue", str(self.queue), "claim", *arguments
+                ])
+            return code, stdout.getvalue(), stderr.getvalue()
+
+        code, stdout, stderr = invoke(
+            "--agent", "ordinary", "--task", task["id"]
+        )
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout)
+        self.assertIn("git_recovery_required", stderr)
+
+        code, stdout, stderr = invoke(
+            "--agent", "resumer", "--task", task["id"], "--resume-git"
+        )
+        self.assertEqual(0, code, stderr)
+        output = json.loads(stdout)
+        self.assertEqual(
+            observation["head"], output["task"]["claim"]["git"]["base"]
+        )
+        self.assertIsNone(output["task"]["git_recovery"])
+        stored = aq.load_state(self.queue)["tasks"][task["id"]]
+        self.assertEqual(
+            observation["head"], stored["claim"]["git"]["base"]
+        )
+
+    def test_cli_resume_drift_restores_recovery_binding(self):
+        self.init(retry_backoff=1)
+        task = self.add(
+            "Git recovery drift",
+            "--git-commit",
+            "--resource",
+            "dir:src/",
+        )["task"]
+        observation = git_snapshot(head="a" * 40)
+        started_at = aq.load_state(self.queue)["tasks"][task["id"]][
+            "updated_at"
+        ]
+        expires_at = aq.add_seconds(started_at, 60)
+        resume_at = aq.add_seconds(expires_at, 2)
+
+        def claim_then_expire(state):
+            claimed = aq.claim_task(
+                state,
+                "first-worker",
+                now=started_at,
+                lease_seconds=60,
+                git_observation=observation,
+                task_id=task["id"],
+            )
+            aq.sweep_expired(state, now=claimed["expires_at"])
+
+        aq.mutate_queue(
+            self.queue,
+            claim_then_expire,
+            auto_sweep=False,
+        )
+        recovery = copy.deepcopy(
+            aq.load_state(self.queue)["tasks"][task["id"]]["git_recovery"]
+        )
+        drifted = dict(observation, head="b" * 40)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            aq.gq, "observe", side_effect=(observation, drifted)
+        ), mock.patch.object(
+            aq, "utc_now", return_value=resume_at
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = aq.main([
+                "--queue",
+                str(self.queue),
+                "claim",
+                "--agent",
+                "resumer",
+                "--task",
+                task["id"],
+                "--resume-git",
+            ])
+
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("git_claim_drift", stderr.getvalue())
+        stored = aq.load_state(self.queue)["tasks"][task["id"]]
+        self.assertEqual("pending", stored["status"])
+        self.assertIsNone(stored["claim"])
+        self.assertEqual(recovery, stored["git_recovery"])
+
+    def test_cli_git_release_rejects_advanced_head(self):
+        root = self.make_git_repo()
+        self.init()
+        task = self.add(
+            "Git release",
+            "--git-commit",
+            "--resource",
+            "file:scoped.txt",
+        )["task"]
+        claim = self.json_output(run_cli(
+            "--queue",
+            self.queue,
+            "claim",
+            "--agent",
+            "git-worker",
+            "--task",
+            task["id"],
+            cwd=root,
+        ))
+        base = claim["task"]["claim"]["git"]["base"]
+        (root / "scoped.txt").write_text("committed\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(root), "add", "scoped.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-m", "advance"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        release_args = (
+            "--queue", self.queue,
+            "release",
+            "--task", task["id"],
+            "--agent", "git-worker",
+            "--token", claim["lease_token"],
+        )
+
+        rejected = run_cli(*release_args, cwd=root)
+        self.assertEqual(2, rejected.returncode)
+        self.assertIn("git_head_mismatch", rejected.stderr)
+        self.assertEqual(
+            "leased",
+            aq.load_state(self.queue)["tasks"][task["id"]]["status"],
+        )
+
+        subprocess.run(
+            ["git", "-C", str(root), "reset", "--hard", base],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        released = self.json_output(run_cli(*release_args, cwd=root))
+        self.assertEqual("pending", released["task"]["status"])
+        self.assertIsNone(released["task"]["git_recovery"])
 
     def test_cli_complete_validates_commit_and_persists_counts_only(self):
         root = self.make_git_repo()

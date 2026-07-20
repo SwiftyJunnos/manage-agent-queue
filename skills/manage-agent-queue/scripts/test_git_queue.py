@@ -297,5 +297,93 @@ class GitCompletionTests(GitRepositoryTestCase):
         )
 
 
+class GitRecoveryObservationTests(GitRepositoryTestCase):
+    def binding(self):
+        return gq.claim_binding(gq.observe(self.root))
+
+    def commit_file(self, path, message):
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{message}\n", encoding="utf-8")
+        run_git(self.root, "add", "-A")
+        run_git(self.root, "commit", "-m", message)
+        return run_git(self.root, "rev-parse", "HEAD").stdout.strip()
+
+    def assert_git_error(self, code, callback):
+        with self.assertRaises(gq.GitContextError) as raised:
+            callback()
+        self.assertEqual(code, raised.exception.code)
+
+    def test_recovery_accepts_unchanged_base_and_scoped_descendants(self):
+        binding = self.binding()
+        unchanged = gq.validate_recovery(
+            binding, ["dir:src/"], gq.observe(self.root)
+        )
+        self.assertEqual(
+            {"binding": binding, "head": binding["base"]},
+            unchanged,
+        )
+
+        head = self.commit_file("src/recovered.py", "survived")
+        descendant = gq.validate_recovery(
+            binding, ["dir:src/"], gq.observe(self.root)
+        )
+        self.assertEqual(binding, descendant["binding"])
+        self.assertEqual(head, descendant["head"])
+
+    def test_recovery_rejects_dirty_wrong_identity_branch_and_scope(self):
+        binding = self.binding()
+        observed = gq.observe(self.root)
+        for field, value, code in (
+            ("worktree_id", "wrong-worktree", "git_binding_mismatch"),
+            ("branch", "refs/heads/other", "git_binding_mismatch"),
+            ("clean", False, "git_dirty"),
+        ):
+            with self.subTest(field=field):
+                changed = dict(observed)
+                changed[field] = value
+                self.assert_git_error(
+                    code,
+                    lambda changed=changed: gq.validate_recovery(
+                        binding, ["dir:src/"], changed
+                    ),
+                )
+
+        self.commit_file("outside.txt", "outside")
+        self.assert_git_error(
+            "git_path_scope",
+            lambda: gq.validate_recovery(
+                binding, ["dir:src/"], gq.observe(self.root)
+            ),
+        )
+
+    def test_recovery_rejects_divergent_head(self):
+        binding = self.binding()
+        tree = run_git(
+            self.root, "rev-parse", f"{binding['base']}^{{tree}}"
+        ).stdout.strip()
+        divergent = run_git(
+            self.root, "commit-tree", tree, "-m", "divergent"
+        ).stdout.strip()
+        run_git(self.root, "reset", "--hard", divergent)
+
+        self.assert_git_error(
+            "git_recovery_mismatch",
+            lambda: gq.validate_recovery(
+                binding, ["file:README.md"], gq.observe(self.root)
+            ),
+        )
+
+    def test_release_requires_clean_original_head(self):
+        binding = self.binding()
+        gq.validate_release(binding)
+
+        self.commit_file("README.md", "advance")
+        self.assert_git_error(
+            "git_head_mismatch",
+            lambda: gq.validate_release(binding),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,7 @@ DERIVED_STATUSES = {
     "waiting_dependency",
     "dependency_failed",
     "waiting_retry",
+    "git_recovery",
     "resource_conflict",
     "leased",
 }
@@ -608,6 +609,15 @@ def _validate_git_evidence(evidence, field="Git evidence"):
     return evidence
 
 
+def _validate_git_binding(binding, field="Git binding"):
+    if not isinstance(binding, dict) or set(binding) != GIT_BINDING_FIELDS:
+        raise InvariantError(f"{field} fields must match the binding schema")
+    for name in GIT_BINDING_FIELDS:
+        if not isinstance(binding[name], str) or not binding[name]:
+            raise InvariantError(f"{field}.{name} must be nonempty")
+    return binding
+
+
 def normalize_task(state, raw):
     """Create a canonical pending task from generic task input."""
     if not isinstance(raw, dict):
@@ -818,8 +828,7 @@ def validate_task(task, expected_id=None, schema_version=SCHEMA_VERSION):
                 raise InvariantError(
                     "task git_recovery requires pending or failed status"
                 )
-            if not isinstance(recovery, dict):
-                raise InvariantError("task git_recovery must be an object or null")
+            _validate_git_binding(recovery, "task git_recovery")
 
     for field in ("depends_on", "resources", "labels"):
         values = task[field]
@@ -887,19 +896,7 @@ def validate_task(task, expected_id=None, schema_version=SCHEMA_VERSION):
                 raise InvariantError("Git-aware task claim.git must be an object")
             if task["git_mode"] == "commit":
                 git_binding = claim["git"]
-                if not isinstance(git_binding, dict) or set(
-                    git_binding
-                ) != GIT_BINDING_FIELDS:
-                    raise InvariantError(
-                        "Git-aware task claim.git fields must match binding schema"
-                    )
-                for field in GIT_BINDING_FIELDS:
-                    if not isinstance(
-                        git_binding[field], str
-                    ) or not git_binding[field]:
-                        raise InvariantError(
-                            f"task claim.git.{field} must be nonempty"
-                        )
+                _validate_git_binding(git_binding, "task claim.git")
     elif claim is not None:
         raise InvariantError("non-leased task claim must be null")
 
@@ -1772,6 +1769,8 @@ def _derive_state_with_resources(
         return "waiting_dependency"
     if task["available_at"] is not None and task["available_at"] > now:
         return "waiting_retry"
+    if task.get("git_recovery") is not None:
+        return "git_recovery"
     if resource_conflict_probe is None:
         resource_conflict_probe = _resource_conflicts
     if resource_conflict_probe(task, active_resources):
@@ -1816,6 +1815,7 @@ def claim_task(
     git_observation=None,
     task_id=None,
     resume_git=False,
+    git_resume=None,
 ):
     """Claim the highest-priority eligible task with an in-memory lease."""
     validate_state(state)
@@ -1835,6 +1835,14 @@ def claim_task(
         raise InvariantError("resume_git must be a boolean")
     if resume_git and task_id is None:
         raise InvariantError("resume_git requires task_id")
+    if git_resume is not None and not resume_git:
+        raise InvariantError("git_resume requires resume_git")
+    if resume_git:
+        target = state["tasks"][task_id]
+        if target.get("git_mode") != "commit":
+            raise InvariantError("resume_git requires a Git-aware task")
+        if not isinstance(target.get("git_recovery"), dict):
+            raise InvariantError("Git recovery binding is required")
     if labels is None:
         required_labels = set()
     elif isinstance(labels, (list, set)):
@@ -1865,16 +1873,15 @@ def claim_task(
             continue
         if task["updated_at"] > now:
             continue
-        if (
-            _derive_state_with_resources(
-                state,
-                task,
-                now,
-                active_resources,
-                resource_conflict_probe=_has_resource_conflict,
-            )
-            != "ready"
-        ):
+        derived = _derive_state_with_resources(
+            state,
+            task,
+            now,
+            active_resources,
+            resource_conflict_probe=_has_resource_conflict,
+        )
+        expected_state = "git_recovery" if resume_git else "ready"
+        if derived != expected_state:
             continue
         if task.get("git_mode") == "commit":
             try:
@@ -1883,8 +1890,21 @@ def claim_task(
                 if task_id is not None:
                     raise InvariantError(str(error)) from error
                 continue
-            if task.get("git_recovery") is not None and not resume_git:
-                continue
+            if resume_git:
+                recovery = task["git_recovery"]
+                if (
+                    not isinstance(git_resume, dict)
+                    or set(git_resume) != {"binding", "head"}
+                    or git_resume["binding"] != recovery
+                    or git_resume["head"] != git_observation.get("head")
+                ):
+                    raise InvariantError(
+                        "Git recovery validation does not match current state"
+                    )
+                try:
+                    gq.assert_same_binding(recovery, git_observation)
+                except gq.GitContextError as error:
+                    raise InvariantError(str(error)) from error
             if _has_git_claim_conflict(
                 state, task, git_observation, now
             ):
@@ -1918,18 +1938,28 @@ def claim_task(
         "expires_at": expires_at,
     }
     if candidate["schema_version"] == 2:
-        claimed["claim"]["git"] = (
-            gq.claim_binding(git_observation)
-            if claimed["git_mode"] == "commit"
-            else None
-        )
+        if claimed["git_mode"] == "commit":
+            claimed["claim"]["git"] = (
+                copy.deepcopy(claimed["git_recovery"])
+                if resume_git
+                else gq.claim_binding(git_observation)
+            )
+            claimed["git_recovery"] = None
+        else:
+            claimed["claim"]["git"] = None
     claimed["updated_at"] = now
+    event_details = {
+        "lease_seconds": lease_seconds,
+        "attempt": claimed["attempts"],
+    }
+    if resume_git:
+        event_details["resumed_git"] = True
     append_event(
         candidate,
         "task.claimed",
         agent_id,
         claimed["id"],
-        {"lease_seconds": lease_seconds, "attempt": claimed["attempts"]},
+        event_details,
         now,
     )
     validate_state(candidate)
@@ -2128,8 +2158,16 @@ def complete_task(
     return _commit_transition(state, candidate, task_id)
 
 
+def _preserve_git_recovery(task):
+    claim = task.get("claim")
+    binding = claim.get("git") if isinstance(claim, dict) else None
+    if task.get("git_mode") == "commit" and isinstance(binding, dict):
+        task["git_recovery"] = copy.deepcopy(binding)
+
+
 def apply_retry_rule(state, task, message, now):
     """Apply the queue's retry policy to a failed leased attempt."""
+    _preserve_git_recovery(task)
     task["claim"] = None
     task["last_error"] = {"message": message, "at": now}
     if task["attempts"] < task["max_attempts"]:
@@ -2273,6 +2311,8 @@ def block_task(state, task_id, reason, now=None):
     task = _require_task(state, task_id)
     if task["status"] != "pending":
         raise InvariantError("only a pending task can be blocked")
+    if task.get("git_recovery") is not None:
+        raise InvariantError("Git recovery task cannot be blocked")
     _require_monotonic_task_time(task, now)
 
     candidate = copy.deepcopy(state)
@@ -2471,6 +2511,8 @@ def cancel_task(state, task_id, now=None):
     task["status"] = "cancelled"
     task["available_at"] = None
     task["claim"] = None
+    if candidate["schema_version"] == 2:
+        task["git_recovery"] = None
     task["updated_at"] = now
     append_event(
         candidate, "task.cancelled", "operator", task_id, {}, now
@@ -4066,11 +4108,16 @@ def _run_command(args, path):
         except gq.GitContextError as error:
             git_observation_error = error
 
+        git_resume = None
         if args.task is not None:
             snapshot = read_queue_snapshot(path)
             target = _user_operation(
                 lambda: _require_task(snapshot, args.task)
             )
+            if args.resume_git and target.get("git_mode") != "commit":
+                raise QueueError(
+                    "--resume-git requires a Git-aware task"
+                )
             if target.get("git_mode") == "commit":
                 if git_observation is None:
                     raise QueueError(
@@ -4083,6 +4130,26 @@ def _run_command(args, path):
                     raise QueueError(
                         f"{error.code}: {error}"
                     ) from error
+                recovery = target.get("git_recovery")
+                if args.resume_git:
+                    if not isinstance(recovery, dict):
+                        raise QueueError(
+                            "git_recovery_required: task has no Git recovery binding"
+                        )
+                    try:
+                        git_resume = gq.validate_recovery(
+                            recovery,
+                            target["resources"],
+                            git_observation,
+                        )
+                    except gq.GitContextError as error:
+                        raise QueueError(
+                            f"{error.code}: {error}"
+                        ) from error
+                elif recovery is not None:
+                    raise QueueError(
+                        "git_recovery_required: use --resume-git for this task"
+                    )
 
         claim_result = user_mutation(
             lambda state: claim_task(
@@ -4091,22 +4158,39 @@ def _run_command(args, path):
                 git_observation=git_observation,
                 task_id=args.task,
                 resume_git=args.resume_git,
+                git_resume=git_resume,
             ),
         )
         binding = claim_result["task"]["claim"].get("git")
         if isinstance(binding, dict):
             try:
                 current_observation = gq.observe(Path.cwd())
-                gq.assert_claim_snapshot(binding, current_observation)
+                gq.assert_claim_snapshot(
+                    binding,
+                    current_observation,
+                    expected_head=(
+                        git_resume["head"]
+                        if git_resume is not None
+                        else None
+                    ),
+                )
             except gq.GitContextError as error:
                 try:
-                    user_mutation(
-                        lambda state: release_task(
+                    def rollback_claim(state):
+                        released = release_task(
                             state,
                             claim_result["task"]["id"],
                             args.agent,
                             claim_result["lease_token"],
                         )
+                        if git_resume is not None:
+                            state["tasks"][released["id"]]["git_recovery"] = (
+                                copy.deepcopy(binding)
+                            )
+                        return released
+
+                    user_mutation(
+                        rollback_claim
                     )
                 except QueueError as rollback_error:
                     raise QueueError(
@@ -4180,6 +4264,20 @@ def _run_command(args, path):
             )
         )
     elif args.command == "release":
+        snapshot = read_queue_snapshot(path)
+        leased = require_lease(
+            snapshot,
+            args.task,
+            args.agent,
+            args.token,
+            utc_now(),
+        )
+        binding = leased["claim"].get("git")
+        if isinstance(binding, dict):
+            try:
+                gq.validate_release(binding)
+            except gq.GitContextError as error:
+                raise QueueError(f"{error.code}: {error}") from error
         task_result = user_mutation(
             lambda state: release_task(
                 state, args.task, args.agent, args.token

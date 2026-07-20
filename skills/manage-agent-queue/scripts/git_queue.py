@@ -198,13 +198,15 @@ def claim_binding(observation):
     }
 
 
-def assert_claim_snapshot(binding, observation):
+def assert_claim_snapshot(binding, observation, expected_head=None):
     observed = require_claimable(observation)
+    if expected_head is None:
+        expected_head = binding.get("base")
     expected = {
         "repository_id": binding.get("repository_id"),
         "worktree_id": binding.get("worktree_id"),
         "branch": binding.get("branch"),
-        "head": binding.get("base"),
+        "head": expected_head,
     }
     actual = {
         "repository_id": observed["repository_id"],
@@ -283,6 +285,48 @@ def compact_evidence(branch, base, head, commit_count, changed_path_count):
     }
 
 
+def _is_ancestor(worktree, base, head):
+    result = _git(
+        worktree,
+        "merge-base",
+        "--is-ancestor",
+        base,
+        head,
+        allowed=(0, 1),
+    )
+    return result.returncode == 0
+
+
+def _changed_paths(worktree, base, head):
+    raw = _git(
+        worktree,
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        base,
+        head,
+    ).stdout
+    try:
+        return [
+            path
+            for path in raw.decode("utf-8", "strict").split("\x00")
+            if path
+        ]
+    except UnicodeDecodeError as error:
+        raise GitContextError(
+            "git_path_encoding", "changed paths must be valid UTF-8"
+        ) from error
+
+
+def _require_paths_allowed(changed, resources):
+    offenders = [
+        path for path in changed if not path_is_allowed(path, resources)
+    ]
+    if offenders:
+        raise path_scope_error(offenders)
+
+
 def validate_completion(binding, resources, commit=None, no_change=False):
     if not isinstance(binding, dict):
         raise GitContextError(
@@ -336,44 +380,14 @@ def validate_completion(binding, resources, commit=None, no_change=False):
             "git_head_mismatch", "current HEAD does not match --commit"
         )
 
-    ancestry = _git(
-        binding["worktree"],
-        "merge-base",
-        "--is-ancestor",
-        base,
-        head,
-        allowed=(0, 1),
-    )
-    if ancestry.returncode != 0 or base == head:
+    if not _is_ancestor(binding["worktree"], base, head) or base == head:
         raise GitContextError(
             "git_non_descendant",
             "result must descend from and advance the claimed base",
         )
 
-    changed_raw = _git(
-        binding["worktree"],
-        "diff",
-        "--name-only",
-        "-z",
-        "--no-renames",
-        base,
-        head,
-    ).stdout
-    try:
-        changed = [
-            path
-            for path in changed_raw.decode("utf-8", "strict").split("\x00")
-            if path
-        ]
-    except UnicodeDecodeError as error:
-        raise GitContextError(
-            "git_path_encoding", "changed paths must be valid UTF-8"
-        ) from error
-    offenders = [
-        path for path in changed if not path_is_allowed(path, resources)
-    ]
-    if offenders:
-        raise path_scope_error(offenders)
+    changed = _changed_paths(binding["worktree"], base, head)
+    _require_paths_allowed(changed, resources)
 
     count_output = _git(
         binding["worktree"],
@@ -388,6 +402,38 @@ def validate_completion(binding, resources, commit=None, no_change=False):
         int(count_output),
         len(changed),
     )
+
+
+def validate_recovery(binding, resources, observation):
+    if not isinstance(binding, dict):
+        raise GitContextError(
+            "git_recovery_required", "Git recovery binding is required"
+        )
+    current = assert_same_binding(binding, observation)
+    base = binding.get("base")
+    if not isinstance(base, str) or not base:
+        raise GitContextError(
+            "git_recovery_mismatch", "Git recovery base is invalid"
+        )
+    head = current["head"]
+    if head != base:
+        if not _is_ancestor(binding["worktree"], base, head):
+            raise GitContextError(
+                "git_recovery_mismatch",
+                "current HEAD does not descend from the recovery base",
+            )
+        changed = _changed_paths(binding["worktree"], base, head)
+        _require_paths_allowed(changed, resources)
+    return {"binding": dict(binding), "head": head}
+
+
+def validate_release(binding):
+    if not isinstance(binding, dict):
+        raise GitContextError(
+            "git_binding_invalid", "Git release requires a claim binding"
+        )
+    current = observe(binding.get("worktree", ""))
+    return assert_same_binding(binding, current, require_same_head=True)
 
 
 def assert_completion_snapshot(binding, evidence, observation):
