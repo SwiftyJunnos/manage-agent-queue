@@ -207,6 +207,7 @@ def canonical_claim(
     claimed_at="2026-07-10T05:00:00Z",
     heartbeat_at="2026-07-10T05:00:00Z",
     expires_at="2026-07-10T07:00:00Z",
+    git=None,
 ):
     return {
         "agent_id": agent_id,
@@ -214,6 +215,15 @@ def canonical_claim(
         "claimed_at": claimed_at,
         "heartbeat_at": heartbeat_at,
         "expires_at": expires_at,
+        "git": git,
+    }
+
+
+def canonical_result(summary="done", artifacts=None, git=None):
+    return {
+        "summary": summary,
+        "artifacts": [] if artifacts is None else artifacts,
+        "git": git,
     }
 
 
@@ -221,7 +231,7 @@ class QueueStateTests(unittest.TestCase):
     def test_new_state_has_versioned_monotonic_counters(self):
         state = aq.new_state("demo", aq.fixed_config())
 
-        self.assertEqual(1, state["schema_version"])
+        self.assertEqual(2, state["schema_version"])
         self.assertEqual("demo", state["queue_id"])
         self.assertEqual(0, state["revision"])
         self.assertEqual(1, state["next_task_sequence"])
@@ -233,7 +243,7 @@ class QueueStateTests(unittest.TestCase):
     def test_validate_state_rejects_unknown_schema(self):
         state = aq.new_state("demo", aq.fixed_config())
 
-        for unknown_schema in (2, True):
+        for unknown_schema in (3, True):
             with self.subTest(schema_version=unknown_schema):
                 state["schema_version"] = unknown_schema
                 with self.assertRaisesRegex(aq.InvariantError, "schema_version"):
@@ -241,7 +251,7 @@ class QueueStateTests(unittest.TestCase):
 
     def test_validate_state_rejects_unknown_top_level_field(self):
         state = aq.new_state("demo", aq.fixed_config())
-        state["future_field"] = "not supported by schema version 1"
+        state["future_field"] = "not supported by schema version 2"
 
         with self.assertRaisesRegex(aq.InvariantError, "state.*future_field"):
             aq.validate_state(state)
@@ -385,6 +395,8 @@ class TaskGraphTests(unittest.TestCase):
                 "claim": None,
                 "result": None,
                 "last_error": None,
+                "git_mode": None,
+                "git_recovery": None,
                 "created_at": "2026-07-10T06:00:00Z",
                 "updated_at": "2026-07-10T06:00:00Z",
             },
@@ -867,7 +879,7 @@ class TaskGraphTests(unittest.TestCase):
         created = aq.add_task(self.state, {"title": "Stored"})
         task = self.state["tasks"][created["id"]]
         task["status"] = "completed"
-        task["result"] = {"summary": "done", "artifacts": ["report.txt"]}
+        task["result"] = canonical_result(artifacts=["report.txt"])
         task["last_error"] = {
             "message": "earlier retry",
             "at": "2026-07-10T06:00:00Z",
@@ -878,26 +890,35 @@ class TaskGraphTests(unittest.TestCase):
     def test_validate_state_rejects_malformed_lifecycle_combinations(self):
         created = aq.add_task(self.state, {"title": "Stored"})
         cases = (
-            ({"result": {"summary": "done", "artifacts": []}}, "result.*completed"),
+            ({"result": canonical_result()}, "result.*completed"),
             ({"status": "completed", "result": None}, "completed.*result"),
             (
                 {
                     "status": "completed",
-                    "result": {"summary": "done", "artifacts": [], "extra": 1},
+                    "result": {
+                        "summary": "done",
+                        "artifacts": [],
+                        "git": None,
+                        "extra": 1,
+                    },
                 },
                 "result.*keys",
             ),
             (
                 {
                     "status": "completed",
-                    "result": {"summary": 1, "artifacts": []},
+                    "result": {"summary": 1, "artifacts": [], "git": None},
                 },
                 "result.*summary",
             ),
             (
                 {
                     "status": "completed",
-                    "result": {"summary": "done", "artifacts": [""]},
+                    "result": {
+                        "summary": "done",
+                        "artifacts": [""],
+                        "git": None,
+                    },
                 },
                 "result.*artifacts",
             ),
@@ -996,6 +1017,67 @@ class TaskGraphTests(unittest.TestCase):
             aq.validate_state(self.state)
 
 
+class SchemaMigrationTests(unittest.TestCase):
+    NOW = "2026-07-20T00:00:00Z"
+
+    def legacy_state(self):
+        state = aq.new_state("legacy", aq.fixed_config())
+        state["schema_version"] = 1
+        for task in state["tasks"].values():
+            task.pop("git_mode", None)
+            task.pop("git_recovery", None)
+            if isinstance(task.get("claim"), dict):
+                task["claim"].pop("git", None)
+            if isinstance(task.get("result"), dict):
+                task["result"].pop("git", None)
+        aq.validate_state(state)
+        return state
+
+    def test_new_queues_use_schema_two_with_git_defaults(self):
+        state = aq.new_state("demo", aq.fixed_config())
+        task = aq.add_task(state, {"title": "generic"})
+
+        self.assertEqual(2, state["schema_version"])
+        self.assertIsNone(task["git_mode"])
+        self.assertIsNone(task["git_recovery"])
+
+    def test_version_one_queue_keeps_generic_mutation_semantics(self):
+        state = self.legacy_state()
+
+        task = aq.add_task(state, {"title": "legacy generic"})
+
+        self.assertEqual(1, state["schema_version"])
+        self.assertNotIn("git_mode", task)
+        self.assertNotIn("git_recovery", task)
+        aq.validate_state(state)
+
+    def test_migrate_to_two_adds_defaults_and_one_event_atomically(self):
+        state = self.legacy_state()
+        task = aq.add_task(state, {"title": "legacy generic"})
+
+        result = aq.migrate_state(state, 2, now=self.NOW)
+
+        self.assertEqual({"from": 1, "to": 2}, result)
+        self.assertEqual(2, state["schema_version"])
+        self.assertIsNone(state["tasks"][task["id"]]["git_mode"])
+        self.assertIsNone(state["tasks"][task["id"]]["git_recovery"])
+        self.assertEqual("queue.migrated", state["events"][-1]["type"])
+        self.assertEqual(
+            {"from": 1, "to": 2},
+            state["events"][-1]["details"],
+        )
+
+    def test_failed_migration_leaves_source_unchanged(self):
+        state = self.legacy_state()
+        state["tasks"]["bad"] = {}
+        before = copy.deepcopy(state)
+
+        with self.assertRaises(aq.InvariantError):
+            aq.migrate_state(state, 2, now=self.NOW)
+
+        self.assertEqual(before, state)
+
+
 class WorkflowTemplateTests(unittest.TestCase):
     def setUp(self):
         self.state = aq.new_state("demo", aq.fixed_config())
@@ -1066,9 +1148,7 @@ class WorkflowTemplateTests(unittest.TestCase):
         review_ids = review_and_tail[:3]
         apply_id, verify_id = review_and_tail[3:]
         self.state["tasks"][implement_id]["status"] = "completed"
-        self.state["tasks"][implement_id]["result"] = {
-            "summary": "done", "artifacts": []
-        }
+        self.state["tasks"][implement_id]["result"] = canonical_result()
         rows = {row["id"]: row for row in aq.status_rows(self.state, self.now)}
         self.assertEqual(["ready"] * 3, [rows[task_id]["state"] for task_id in review_ids])
         self.assertEqual([[]] * 3, [self.state["tasks"][task_id]["resources"] for task_id in review_ids])
@@ -1076,9 +1156,7 @@ class WorkflowTemplateTests(unittest.TestCase):
         self.assertEqual("waiting_dependency", rows[verify_id]["state"])
         for task_id in review_ids:
             self.state["tasks"][task_id]["status"] = "completed"
-            self.state["tasks"][task_id]["result"] = {
-                "summary": "done", "artifacts": []
-            }
+            self.state["tasks"][task_id]["result"] = canonical_result()
         rows = {row["id"]: row for row in aq.status_rows(self.state, self.now)}
         self.assertEqual("ready", rows[apply_id]["state"])
         self.assertEqual("waiting_dependency", rows[verify_id]["state"])
@@ -1419,6 +1497,7 @@ class ClaimTaskTests(unittest.TestCase):
                 "claimed_at": self.NOW,
                 "heartbeat_at": self.NOW,
                 "expires_at": "2026-07-10T06:00:30Z",
+                "git": None,
             },
             stored["claim"],
         )
@@ -1954,7 +2033,11 @@ class LifecycleTransitionTests(unittest.TestCase):
         stored = self.state["tasks"][task["id"]]
         self.assertEqual("completed", stored["status"])
         self.assertEqual(
-            {"summary": "Finished", "artifacts": ["a.txt", "b.json"]},
+            {
+                "summary": "Finished",
+                "artifacts": ["a.txt", "b.json"],
+                "git": None,
+            },
             stored["result"],
         )
         self.assertIsNone(stored["claim"])
@@ -2390,7 +2473,7 @@ class StatusProjectionTests(unittest.TestCase):
     def test_completed_dependency_makes_pending_task_ready(self):
         dependency = self.add("Dependency")
         dependency["status"] = "completed"
-        dependency["result"] = {"summary": "done", "artifacts": []}
+        dependency["result"] = canonical_result()
         task = self.add("Ready", depends_on=[dependency["id"]])
 
         self.assertEqual([], aq.dependency_blockers(self.state, task))
@@ -2400,7 +2483,7 @@ class StatusProjectionTests(unittest.TestCase):
         first = self.add("First")
         completed = self.add("Completed")
         completed["status"] = "completed"
-        completed["result"] = {"summary": "done", "artifacts": []}
+        completed["result"] = canonical_result()
         third = self.add("Third")
         third["status"] = "leased"
         third["attempts"] = 1
@@ -2446,7 +2529,7 @@ class StatusProjectionTests(unittest.TestCase):
     def test_future_availability_waits_after_dependencies_complete(self):
         dependency = self.add("Dependency")
         dependency["status"] = "completed"
-        dependency["result"] = {"summary": "done", "artifacts": []}
+        dependency["result"] = canonical_result()
         task = self.add("Retry", depends_on=[dependency["id"]])
         task["available_at"] = "2026-07-10T06:00:01Z"
 
@@ -2501,7 +2584,7 @@ class StatusProjectionTests(unittest.TestCase):
                 task = self.add(status)
                 task["status"] = status
                 if status == "completed":
-                    task["result"] = {"summary": "done", "artifacts": []}
+                    task["result"] = canonical_result()
                 elif status == "failed":
                     task["last_error"] = {
                         "message": "failed",
@@ -2661,6 +2744,7 @@ class StatusProjectionTests(unittest.TestCase):
         completed["result"] = {
             "summary": "RESULT-SECRET",
             "artifacts": [],
+            "git": None,
         }
 
         rows = aq.status_rows(self.state, self.NOW)
@@ -3190,7 +3274,7 @@ class TextLimitTests(unittest.TestCase):
                     task["description"] = oversized
                 elif field == "summary":
                     task["status"] = "completed"
-                    task["result"] = {"summary": oversized, "artifacts": []}
+                    task["result"] = canonical_result(summary=oversized)
                 else:
                     task["status"] = "failed" if field == "error" else "blocked"
                     task["last_error"] = {
@@ -3288,7 +3372,9 @@ class TextLimitTests(unittest.TestCase):
                         task["description"] = lone_surrogate
                     elif field == "summary":
                         task["status"] = "completed"
-                        task["result"] = {"summary": lone_surrogate, "artifacts": []}
+                        task["result"] = canonical_result(
+                            summary=lone_surrogate
+                        )
                     else:
                         task["status"] = "failed" if field == "error" else "blocked"
                         task["last_error"] = {
@@ -3380,7 +3466,7 @@ class DoctorTests(unittest.TestCase):
     def test_corrupt_source_is_reported_and_never_repaired(self):
         cases = {
             "json": b'{"schema_version": NaN}\n',
-            "schema": json.dumps({**self.state, "schema_version": 2}).encode(),
+            "schema": json.dumps({**self.state, "schema_version": 3}).encode(),
             "graph": None,
             "counter": json.dumps({**self.state, "next_task_sequence": 0}).encode(),
             "event": None,
@@ -3796,7 +3882,7 @@ class CompactionTests(unittest.TestCase):
         task["updated_at"] = updated_at or self.OLD
         task["status"] = status
         if status == "completed":
-            task["result"] = {"summary": "done", "artifacts": []}
+            task["result"] = canonical_result()
         elif status == "failed":
             task["last_error"] = {"message": "bad", "at": task["updated_at"]}
         elif status == "blocked":
@@ -4221,6 +4307,33 @@ class QueueCliTests(unittest.TestCase):
         self.assertEqual("", result.stdout)
         self.assertNotEqual("", result.stderr)
         self.assertEqual(before, self.queue.read_bytes())
+
+    def test_cli_migrates_version_one_queue_atomically(self):
+        state = aq.new_state("legacy", aq.fixed_config())
+        state["schema_version"] = 1
+        aq.write_json(self.queue, state)
+        aq.atomic_write_text(
+            self.queue.with_suffix(".tsv"),
+            aq.render_tsv(state, state["updated_at"]),
+        )
+        added = self.add("legacy generic")
+        self.assertNotIn("git_mode", added["task"])
+        before_revision = aq.load_state(self.queue)["revision"]
+
+        migrated = self.json_output(self.cli("migrate", "--to", "2"))
+
+        self.assertEqual(
+            {"ok": True, "from": 1, "to": 2},
+            migrated,
+        )
+        stored = aq.load_state(self.queue)
+        self.assertEqual(2, stored["schema_version"])
+        self.assertEqual(before_revision + 1, stored["revision"])
+        self.assertEqual("queue.migrated", stored["events"][-1]["type"])
+        self.assertEqual(
+            stored["revision"],
+            aq.tsv_revision(self.queue.with_suffix(".tsv")),
+        )
 
     def test_init_and_machine_status_discover_dashboard_safely(self):
         output = self.init()
@@ -4704,7 +4817,7 @@ class QueueCliTests(unittest.TestCase):
         task = state["tasks"][created["id"]]
         task["created_at"] = task["updated_at"] = "2020-01-01T00:00:00Z"
         task["status"] = "completed"
-        task["result"] = {"summary": "done", "artifacts": []}
+        task["result"] = canonical_result()
         aq.write_json(self.queue, state)
         aq.atomic_write_text(
             self.queue.with_suffix(".tsv"), aq.render_tsv(state, state["updated_at"])

@@ -39,7 +39,8 @@ else:
     LOCK_BACKEND = None
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
 MAX_ID_SEQUENCE = 999_999
 MAX_JSON_METADATA_DEPTH = 64
 MAX_TEXT_BYTES = 16 * 1024
@@ -63,7 +64,7 @@ STATUS_FILTER_STATES = tuple(sorted(STORED_STATUSES | DERIVED_STATUSES))
 GUARD_MARKER = b"LQG1"
 TASK_ID_PATTERN = re.compile(r"T-(\d{6})", flags=re.ASCII)
 WORKFLOW_ID_PATTERN = re.compile(r"W-(\d{6})", flags=re.ASCII)
-TASK_FIELDS = {
+TASK_FIELDS_V1 = frozenset({
     "id",
     "workflow_id",
     "role",
@@ -82,8 +83,9 @@ TASK_FIELDS = {
     "last_error",
     "created_at",
     "updated_at",
-}
-TASK_CREATION_FIELDS = {
+})
+TASK_FIELDS_V2 = TASK_FIELDS_V1 | {"git_mode", "git_recovery"}
+TASK_CREATION_FIELDS_V1 = frozenset({
     "id",
     "workflow_id",
     "role",
@@ -94,14 +96,16 @@ TASK_CREATION_FIELDS = {
     "resources",
     "labels",
     "max_attempts",
-}
-CLAIM_FIELDS = {
+})
+TASK_CREATION_FIELDS_V2 = TASK_CREATION_FIELDS_V1 | {"git_mode"}
+CLAIM_FIELDS_V1 = frozenset({
     "agent_id",
     "lease_token",
     "claimed_at",
     "heartbeat_at",
     "expires_at",
-}
+})
+CLAIM_FIELDS_V2 = CLAIM_FIELDS_V1 | {"git"}
 EVENT_FIELDS = {
     "seq",
     "at",
@@ -557,7 +561,13 @@ def normalize_task(state, raw):
         raise InvariantError("task must be an object")
     if any(not isinstance(field, str) for field in raw):
         raise InvariantError("task creation input must use string field names")
-    unknown_fields = sorted(set(raw).difference(TASK_CREATION_FIELDS))
+    schema_version = state["schema_version"]
+    creation_fields = (
+        TASK_CREATION_FIELDS_V1
+        if schema_version == 1
+        else TASK_CREATION_FIELDS_V2
+    )
+    unknown_fields = sorted(set(raw).difference(creation_fields))
     if unknown_fields:
         raise InvariantError(
             f"unknown task creation fields: {', '.join(unknown_fields)}"
@@ -627,7 +637,14 @@ def normalize_task(state, raw):
         "created_at": now,
         "updated_at": now,
     }
-    validate_task(task, expected_id=task_id)
+    if schema_version == 2:
+        task["git_mode"] = None
+        task["git_recovery"] = None
+    validate_task(
+        task,
+        expected_id=task_id,
+        schema_version=schema_version,
+    )
     return task
 
 
@@ -670,14 +687,18 @@ def _json_validation_error(value):
     return None
 
 
-def validate_task(task, expected_id=None):
+def validate_task(task, expected_id=None, schema_version=SCHEMA_VERSION):
     """Validate one stored task's exact canonical schema."""
     if not isinstance(task, dict):
         raise InvariantError("task must be an object")
     if any(not isinstance(field, str) for field in task):
         raise InvariantError("task field names must be strings")
-    missing_fields = sorted(TASK_FIELDS.difference(task))
-    extra_fields = sorted(set(task).difference(TASK_FIELDS))
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise InvariantError(f"unsupported task schema version: {schema_version}")
+    task_fields = TASK_FIELDS_V1 if schema_version == 1 else TASK_FIELDS_V2
+    claim_fields = CLAIM_FIELDS_V1 if schema_version == 1 else CLAIM_FIELDS_V2
+    missing_fields = sorted(task_fields.difference(task))
+    extra_fields = sorted(set(task).difference(task_fields))
     if missing_fields or extra_fields:
         details = []
         if missing_fields:
@@ -719,6 +740,22 @@ def validate_task(task, expected_id=None):
     if not isinstance(task["priority"], int) or isinstance(task["priority"], bool):
         raise InvariantError("task priority must be an integer")
 
+    if schema_version == 2:
+        if task["git_mode"] not in (None, "commit"):
+            raise InvariantError("task git_mode must be commit or null")
+        recovery = task["git_recovery"]
+        if recovery is not None:
+            if task["git_mode"] != "commit":
+                raise InvariantError(
+                    "task git_recovery requires git_mode commit"
+                )
+            if task["status"] not in {"pending", "failed"}:
+                raise InvariantError(
+                    "task git_recovery requires pending or failed status"
+                )
+            if not isinstance(recovery, dict):
+                raise InvariantError("task git_recovery must be an object or null")
+
     for field in ("depends_on", "resources", "labels"):
         values = task[field]
         canonical = _deduplicated_string_list(values, f"task {field}")
@@ -757,8 +794,8 @@ def validate_task(task, expected_id=None):
     if task["status"] == "leased":
         if claim is None:
             raise InvariantError("leased task claim must be an object")
-        missing_claim_fields = sorted(CLAIM_FIELDS.difference(claim))
-        extra_claim_fields = sorted(set(claim).difference(CLAIM_FIELDS))
+        missing_claim_fields = sorted(claim_fields.difference(claim))
+        extra_claim_fields = sorted(set(claim).difference(claim_fields))
         if missing_claim_fields or extra_claim_fields:
             raise InvariantError("task claim keys must match the lease schema")
         for field in ("agent_id", "lease_token"):
@@ -778,6 +815,11 @@ def validate_task(task, expected_id=None):
             )
         if attempts < 1:
             raise InvariantError("leased task attempts must be at least 1")
+        if schema_version == 2:
+            if task["git_mode"] is None and claim["git"] is not None:
+                raise InvariantError("generic task claim.git must be null")
+            if task["git_mode"] == "commit" and claim["git"] is None:
+                raise InvariantError("Git-aware task claim.git must be an object")
     elif claim is not None:
         raise InvariantError("non-leased task claim must be null")
 
@@ -788,8 +830,15 @@ def validate_task(task, expected_id=None):
     elif result is not None:
         raise InvariantError("task result must be null unless status is completed")
     if result is not None:
-        if set(result) != {"summary", "artifacts"}:
-            raise InvariantError("task result keys must be summary and artifacts")
+        result_fields = (
+            {"summary", "artifacts"}
+            if schema_version == 1
+            else {"summary", "artifacts", "git"}
+        )
+        if set(result) != result_fields:
+            raise InvariantError(
+                "task result keys must match the schema version"
+            )
         if not isinstance(result["summary"], str) or not result["summary"]:
             raise InvariantError("task result.summary must be a nonempty string")
         _validate_bounded_text(
@@ -803,6 +852,16 @@ def validate_task(task, expected_id=None):
             raise InvariantError(
                 "task result.artifacts must be a list of nonempty strings"
             )
+        if schema_version == 2:
+            git_result = result["git"]
+            if task["git_mode"] is None and git_result is not None:
+                raise InvariantError("generic task result.git must be null")
+            if task["git_mode"] == "commit" and not isinstance(
+                git_result, dict
+            ):
+                raise InvariantError(
+                    "Git-aware task result.git must be an object"
+                )
 
     last_error = task["last_error"]
     if last_error is not None:
@@ -1166,6 +1225,35 @@ def new_state(queue_id, config):
     return validate_state(state)
 
 
+def migrate_state(state, target_version, now=None):
+    """Atomically transform a valid version-1 candidate into version 2."""
+    validate_state(state)
+    if state["schema_version"] != 1 or target_version != 2:
+        raise InvariantError("only schema version 1 can migrate to 2")
+    now = _canonical_now(now)
+    candidate = copy.deepcopy(state)
+    for task in candidate["tasks"].values():
+        task["git_mode"] = None
+        task["git_recovery"] = None
+        if task["status"] == "leased":
+            task["claim"]["git"] = None
+        if task["status"] == "completed":
+            task["result"]["git"] = None
+    candidate["schema_version"] = 2
+    _append_event_to_candidate(
+        candidate,
+        "queue.migrated",
+        "operator",
+        None,
+        {"from": 1, "to": 2},
+        now,
+    )
+    validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+    return {"from": 1, "to": 2}
+
+
 def validate_state(state):
     """Validate the stored queue invariants and return the state."""
     if not isinstance(state, dict):
@@ -1197,10 +1285,12 @@ def validate_state(state):
     if (
         not isinstance(state["schema_version"], int)
         or isinstance(state["schema_version"], bool)
-        or state["schema_version"] != SCHEMA_VERSION
+        or state["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS
     ):
         raise InvariantError(
-            f"schema_version must be {SCHEMA_VERSION}, got {state['schema_version']!r}"
+            "schema_version must be one of "
+            f"{sorted(SUPPORTED_SCHEMA_VERSIONS)}, "
+            f"got {state['schema_version']!r}"
         )
     if not isinstance(state["queue_id"], str) or not state["queue_id"].strip():
         raise InvariantError("queue_id must be a non-blank string")
@@ -1273,7 +1363,11 @@ def validate_state(state):
     maximum_task_id = None
     maximum_workflow_id = None
     for task_id, task in state["tasks"].items():
-        validate_task(task, expected_id=task_id)
+        validate_task(
+            task,
+            expected_id=task_id,
+            schema_version=state["schema_version"],
+        )
         task_sequence = int(TASK_ID_PATTERN.fullmatch(task_id).group(1))
         if task_sequence > maximum_task_sequence:
             maximum_task_sequence = task_sequence
@@ -1650,6 +1744,8 @@ def claim_task(
         "heartbeat_at": now,
         "expires_at": expires_at,
     }
+    if candidate["schema_version"] == 2:
+        claimed["claim"]["git"] = None
     claimed["updated_at"] = now
     append_event(
         candidate,
@@ -1817,6 +1913,8 @@ def complete_task(
         "summary": summary,
         "artifacts": copy.deepcopy(artifacts),
     }
+    if candidate["schema_version"] == 2:
+        task["result"]["git"] = None
     task["claim"] = None
     task["available_at"] = None
     task["updated_at"] = now
@@ -3430,6 +3528,9 @@ def build_parser():
     init.add_argument("--max-attempts", type=_positive)
     init.add_argument("--retry-backoff", type=_positive)
 
+    migrate = commands.add_parser("migrate", help="migrate queue schema")
+    migrate.add_argument("--to", type=int, choices=(2,), required=True)
+
     task = commands.add_parser("task", help="manage tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True)
     add = task_commands.add_parser("add", help="add one task")
@@ -3625,6 +3726,15 @@ def _run_command(args, path):
             "revision": 0,
             "next_actions": ["serve --open", "status"],
         }
+
+    if args.command == "migrate":
+        summary = mutate_queue(
+            path,
+            lambda state: migrate_state(state, args.to),
+            auto_sweep=False,
+            user_input_errors=True,
+        )
+        return {"ok": True, **summary}
 
     if args.command == "doctor":
         return doctor(path, repair=args.repair)
