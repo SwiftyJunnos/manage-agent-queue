@@ -42,9 +42,8 @@ def _git(cwd, *arguments, allowed=(0,)):
             "git_unavailable", "cannot execute git"
         ) from error
     if completed.returncode not in allowed:
-        message = completed.stderr.decode("utf-8", "replace").strip()
         raise GitContextError(
-            "git_command_failed", message or "git command failed"
+            "git_command_failed", "git command failed"
         )
     return completed
 
@@ -216,5 +215,186 @@ def assert_claim_snapshot(binding, observation):
     if actual != expected:
         raise GitContextError(
             "git_claim_drift", "Git state changed while claiming the task"
+        )
+    return observed
+
+
+def assert_same_binding(binding, observation, require_same_head=False):
+    observed = require_claimable(observation)
+    expected = {
+        "repository_id": binding.get("repository_id"),
+        "worktree_id": binding.get("worktree_id"),
+        "branch": binding.get("branch"),
+    }
+    actual = {
+        "repository_id": observed["repository_id"],
+        "worktree_id": observed["worktree_id"],
+        "branch": observed["branch"],
+    }
+    if actual != expected:
+        raise GitContextError(
+            "git_binding_mismatch",
+            "Git repository, worktree, or branch no longer matches the claim",
+        )
+    if require_same_head and observed["head"] != binding.get("base"):
+        raise GitContextError(
+            "git_head_mismatch", "current HEAD no longer matches the claimed base"
+        )
+    return observed
+
+
+def path_is_allowed(path, resources):
+    if not isinstance(path, str) or not path:
+        return False
+    for scope in path_scopes(resources):
+        if scope.kind == "file" and path == scope.path:
+            return True
+        if scope.kind == "dir" and path.startswith(scope.path):
+            return True
+    return False
+
+
+def _display_path(path, limit=200):
+    escaped = path.encode("unicode_escape", "backslashreplace").decode("ascii")
+    if len(escaped) > limit:
+        return escaped[: limit - 3] + "..."
+    return escaped
+
+
+def path_scope_error(offenders):
+    ordered = sorted(set(offenders))
+    visible = ordered[:MAX_OFFENDING_PATHS]
+    omitted = len(ordered) - len(visible)
+    message = "paths outside declared scope: " + ", ".join(
+        _display_path(path) for path in visible
+    )
+    if omitted:
+        message += f" (+{omitted} more)"
+    return GitContextError("git_path_scope", message)
+
+
+def compact_evidence(branch, base, head, commit_count, changed_path_count):
+    return {
+        "branch": branch,
+        "base": base,
+        "head": head,
+        "commit_count": commit_count,
+        "changed_path_count": changed_path_count,
+    }
+
+
+def validate_completion(binding, resources, commit=None, no_change=False):
+    if not isinstance(binding, dict):
+        raise GitContextError(
+            "git_binding_invalid", "Git completion requires a claim binding"
+        )
+    if not isinstance(no_change, bool):
+        raise GitContextError(
+            "git_completion_mode", "no_change must be a boolean"
+        )
+    if commit is not None and (
+        not isinstance(commit, str) or not commit.strip()
+    ):
+        raise GitContextError(
+            "git_commit_invalid", "commit must be a nonempty revision"
+        )
+
+    current = observe(binding.get("worktree", ""))
+    assert_same_binding(binding, current)
+    base = binding.get("base")
+    if not isinstance(base, str) or not base:
+        raise GitContextError(
+            "git_binding_invalid", "Git claim base must be nonempty"
+        )
+
+    if no_change:
+        if commit is not None:
+            raise GitContextError(
+                "git_completion_mode",
+                "--commit and --no-change cannot be combined",
+            )
+        if current["head"] != base:
+            raise GitContextError(
+                "git_head_mismatch", "no-change requires HEAD at the claimed base"
+            )
+        return compact_evidence(binding["branch"], base, base, 0, 0)
+
+    if commit is None:
+        raise GitContextError(
+            "git_commit_required",
+            "Git-aware completion requires --commit or --no-change",
+        )
+
+    head = _git(
+        binding["worktree"],
+        "rev-parse",
+        "--verify",
+        f"{commit}^{{commit}}",
+    ).stdout.decode("ascii", "strict").strip()
+    if current["head"] != head:
+        raise GitContextError(
+            "git_head_mismatch", "current HEAD does not match --commit"
+        )
+
+    ancestry = _git(
+        binding["worktree"],
+        "merge-base",
+        "--is-ancestor",
+        base,
+        head,
+        allowed=(0, 1),
+    )
+    if ancestry.returncode != 0 or base == head:
+        raise GitContextError(
+            "git_non_descendant",
+            "result must descend from and advance the claimed base",
+        )
+
+    changed_raw = _git(
+        binding["worktree"],
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        base,
+        head,
+    ).stdout
+    try:
+        changed = [
+            path
+            for path in changed_raw.decode("utf-8", "strict").split("\x00")
+            if path
+        ]
+    except UnicodeDecodeError as error:
+        raise GitContextError(
+            "git_path_encoding", "changed paths must be valid UTF-8"
+        ) from error
+    offenders = [
+        path for path in changed if not path_is_allowed(path, resources)
+    ]
+    if offenders:
+        raise path_scope_error(offenders)
+
+    count_output = _git(
+        binding["worktree"],
+        "rev-list",
+        "--count",
+        f"{base}..{head}",
+    ).stdout.decode("ascii", "strict").strip()
+    return compact_evidence(
+        binding["branch"],
+        base,
+        head,
+        int(count_output),
+        len(changed),
+    )
+
+
+def assert_completion_snapshot(binding, evidence, observation):
+    observed = assert_same_binding(binding, observation)
+    if observed["head"] != evidence.get("head"):
+        raise GitContextError(
+            "git_completion_drift",
+            "Git state changed after completion validation",
         )
     return observed

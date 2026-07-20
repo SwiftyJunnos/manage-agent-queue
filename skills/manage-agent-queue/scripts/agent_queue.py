@@ -66,6 +66,9 @@ STATUS_FILTER_STATES = tuple(sorted(STORED_STATUSES | DERIVED_STATUSES))
 GUARD_MARKER = b"LQG1"
 TASK_ID_PATTERN = re.compile(r"T-(\d{6})", flags=re.ASCII)
 WORKFLOW_ID_PATTERN = re.compile(r"W-(\d{6})", flags=re.ASCII)
+GIT_OBJECT_ID_PATTERN = re.compile(
+    r"(?:[0-9a-f]{40}|[0-9a-f]{64})", flags=re.ASCII
+)
 TASK_FIELDS_V1 = frozenset({
     "id",
     "workflow_id",
@@ -117,6 +120,9 @@ GIT_BINDING_FIELDS = frozenset(
         "branch",
         "base",
     }
+)
+GIT_EVIDENCE_FIELDS = frozenset(
+    {"branch", "base", "head", "commit_count", "changed_path_count"}
 )
 EVENT_FIELDS = {
     "seq",
@@ -567,6 +573,41 @@ def _validate_bounded_text(value, field, *, nonempty=False):
     return value
 
 
+def _validate_git_evidence(evidence, field="Git evidence"):
+    if not isinstance(evidence, dict) or set(evidence) != GIT_EVIDENCE_FIELDS:
+        raise InvariantError(f"{field} keys must match the compact schema")
+    branch = evidence["branch"]
+    if not isinstance(branch, str) or not branch.startswith("refs/heads/"):
+        raise InvariantError(f"{field}.branch must name an attached branch")
+    for name in ("base", "head"):
+        value = evidence[name]
+        if (
+            not isinstance(value, str)
+            or GIT_OBJECT_ID_PATTERN.fullmatch(value) is None
+        ):
+            raise InvariantError(
+                f"{field}.{name} must be a full Git object ID"
+            )
+    for name in ("commit_count", "changed_path_count"):
+        value = evidence[name]
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise InvariantError(f"{field}.{name} must be nonnegative")
+    if evidence["base"] == evidence["head"]:
+        if evidence["commit_count"] != 0 or evidence["changed_path_count"] != 0:
+            raise InvariantError(
+                f"{field} no-change counts must both be zero"
+            )
+    elif evidence["commit_count"] < 1:
+        raise InvariantError(
+            f"{field}.commit_count must be positive when HEAD advances"
+        )
+    return evidence
+
+
 def normalize_task(state, raw):
     """Create a canonical pending task from generic task input."""
     if not isinstance(raw, dict):
@@ -900,6 +941,10 @@ def validate_task(task, expected_id=None, schema_version=SCHEMA_VERSION):
             ):
                 raise InvariantError(
                     "Git-aware task result.git must be an object"
+                )
+            if task["git_mode"] == "commit":
+                _validate_git_evidence(
+                    git_result, "task result.git"
                 )
 
     last_error = task["last_error"]
@@ -2029,12 +2074,25 @@ def complete_task(
     token,
     summary,
     artifacts,
+    git_evidence=None,
     now=None,
 ):
     """Complete a live leased task with an exact result payload."""
     validate_state(state)
     _validate_text(summary, "summary")
     _validate_artifacts(artifacts)
+    task = state["tasks"].get(task_id)
+    if task is not None:
+        if task.get("git_mode") == "commit":
+            if git_evidence is None:
+                raise InvariantError(
+                    "Git-aware completion requires Git evidence"
+                )
+            _validate_git_evidence(git_evidence)
+        elif git_evidence is not None:
+            raise InvariantError(
+                "generic task completion must not include Git evidence"
+            )
     now = _canonical_now(now)
     _require_lease_live(state, task_id, agent_id, token, now)
 
@@ -2046,16 +2104,25 @@ def complete_task(
         "artifacts": copy.deepcopy(artifacts),
     }
     if candidate["schema_version"] == 2:
-        task["result"]["git"] = None
+        task["result"]["git"] = copy.deepcopy(git_evidence)
+        task["git_recovery"] = None
     task["claim"] = None
     task["available_at"] = None
     task["updated_at"] = now
+    event_details = {"artifact_count": len(artifacts)}
+    if git_evidence is not None:
+        event_details.update(
+            {
+                "commit_count": git_evidence["commit_count"],
+                "changed_path_count": git_evidence["changed_path_count"],
+            }
+        )
     append_event(
         candidate,
         "task.completed",
         agent_id,
         task_id,
-        {"artifact_count": len(artifacts)},
+        event_details,
         now,
     )
     return _commit_transition(state, candidate, task_id)
@@ -3735,6 +3802,9 @@ def build_parser():
     complete = lease_parser("complete", "complete a task")
     complete.add_argument("--summary", required=True)
     complete.add_argument("--artifact", action="append", default=[])
+    completion = complete.add_mutually_exclusive_group()
+    completion.add_argument("--commit")
+    completion.add_argument("--no-change", action="store_true")
     fail = lease_parser("fail", "fail a task")
     fail.add_argument("--error", required=True)
     fail.add_argument("--terminal", action="store_true")
@@ -4051,6 +4121,7 @@ def _run_command(args, path):
             "expires_at": claim_result["expires_at"],
         }
 
+    completion_warning = None
     if args.command == "heartbeat":
         task_result = user_mutation(
             lambda state: heartbeat_task(
@@ -4059,12 +4130,48 @@ def _run_command(args, path):
             )
         )
     elif args.command == "complete":
+        snapshot = read_queue_snapshot(path)
+        leased = require_lease(
+            snapshot,
+            args.task,
+            args.agent,
+            args.token,
+            utc_now(),
+        )
+        git_evidence = None
+        binding = leased["claim"].get("git")
+        if leased.get("git_mode") == "commit":
+            try:
+                git_evidence = gq.validate_completion(
+                    binding,
+                    leased["resources"],
+                    commit=args.commit,
+                    no_change=args.no_change,
+                )
+            except gq.GitContextError as error:
+                raise QueueError(f"{error.code}: {error}") from error
+        elif args.commit is not None or args.no_change:
+            raise QueueError(
+                "--commit and --no-change require a Git-aware task"
+            )
         task_result = user_mutation(
             lambda state: complete_task(
                 state, args.task, args.agent, args.token,
                 args.summary, args.artifact,
+                git_evidence=git_evidence,
             )
         )
+        if git_evidence is not None:
+            try:
+                current_observation = gq.observe(Path.cwd())
+                gq.assert_completion_snapshot(
+                    binding, git_evidence, current_observation
+                )
+            except gq.GitContextError as error:
+                completion_warning = {
+                    "code": error.code,
+                    "message": str(error),
+                }
     elif args.command == "fail":
         task_result = user_mutation(
             lambda state: fail_task(
@@ -4099,7 +4206,10 @@ def _run_command(args, path):
     else:
         task_result = None
     if task_result is not None:
-        return {"ok": True, "task": _safe_task(task_result)}
+        result = {"ok": True, "task": _safe_task(task_result)}
+        if completion_warning is not None:
+            result["warning"] = completion_warning
+        return result
 
     if args.command == "sweep":
         changed = mutate_queue(

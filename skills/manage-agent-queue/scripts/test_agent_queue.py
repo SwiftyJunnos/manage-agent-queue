@@ -2271,6 +2271,110 @@ class LifecycleTransitionTests(unittest.TestCase):
         )
         self.assertNotIn(token, repr(self.state["events"][-1]))
 
+    def test_git_complete_persists_exact_compact_evidence_and_counts(self):
+        task = self.add(
+            title="Git task",
+            priority=1000,
+            git_mode="commit",
+            resources=["dir:src/"],
+        )
+        observation = git_snapshot(head="a" * 40)
+        with mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value="SECRET"
+        ):
+            claimed = aq.claim_task(
+                self.state,
+                "agent-1",
+                now=self.NOW,
+                git_observation=observation,
+                task_id=task["id"],
+            )
+        evidence = {
+            "branch": observation["branch"],
+            "base": "a" * 40,
+            "head": "b" * 40,
+            "commit_count": 2,
+            "changed_path_count": 27,
+        }
+
+        returned = aq.complete_task(
+            self.state,
+            task["id"],
+            "agent-1",
+            claimed["lease_token"],
+            summary="Finished",
+            artifacts=["report.txt"],
+            git_evidence=evidence,
+            now="2026-07-10T06:00:30Z",
+        )
+
+        self.assertEqual(evidence, returned["result"]["git"])
+        self.assertEqual(
+            {
+                "artifact_count": 1,
+                "commit_count": 2,
+                "changed_path_count": 27,
+            },
+            self.state["events"][-1]["details"],
+        )
+        evidence["changed_path_count"] = 999
+        self.assertEqual(27, returned["result"]["git"]["changed_path_count"])
+        self.assertNotIn("changed_paths", json.dumps(returned))
+
+    def test_complete_requires_evidence_only_for_git_tasks_atomically(self):
+        generic, generic_token = self.claim(title="Generic")
+        evidence = {
+            "branch": "refs/heads/main",
+            "base": "a" * 40,
+            "head": "b" * 40,
+            "commit_count": 1,
+            "changed_path_count": 1,
+        }
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "generic.*Git evidence",
+            lambda: aq.complete_task(
+                self.state,
+                generic["id"],
+                "agent-1",
+                generic_token,
+                "done",
+                [],
+                git_evidence=evidence,
+                now=self.NOW,
+            ),
+        )
+
+        git_task = self.add(
+            title="Git",
+            priority=2000,
+            git_mode="commit",
+            resources=["file:src/a.py"],
+        )
+        with mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value="GIT-SECRET"
+        ):
+            git_claim = aq.claim_task(
+                self.state,
+                "git-agent",
+                now=self.NOW,
+                git_observation=git_snapshot(head="a" * 40),
+                task_id=git_task["id"],
+            )
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "Git-aware.*evidence",
+            lambda: aq.complete_task(
+                self.state,
+                git_task["id"],
+                "git-agent",
+                git_claim["lease_token"],
+                "done",
+                [],
+                now=self.NOW,
+            ),
+        )
+
     def test_complete_validates_payload_before_lease_and_is_atomic(self):
         task, _ = self.claim()
         cases = (
@@ -4953,6 +5057,212 @@ class QueueCliTests(unittest.TestCase):
         stored = aq.load_state(self.queue)["tasks"][task["id"]]
         self.assertEqual("pending", stored["status"])
         self.assertIsNone(stored["claim"])
+
+    def test_cli_complete_validates_commit_and_persists_counts_only(self):
+        root = self.make_git_repo()
+        self.init()
+        task = self.add(
+            "Git complete",
+            "--git-commit",
+            "--resource",
+            "file:scoped.txt",
+        )["task"]
+        claim = self.json_output(run_cli(
+            "--queue",
+            self.queue,
+            "claim",
+            "--agent",
+            "git-worker",
+            "--task",
+            task["id"],
+            cwd=root,
+        ))
+        (root / "scoped.txt").write_text("done\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(root), "add", "scoped.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-m", "complete"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        result = run_cli(
+            "--queue",
+            self.queue,
+            "complete",
+            "--task",
+            task["id"],
+            "--agent",
+            "git-worker",
+            "--token",
+            claim["lease_token"],
+            "--summary",
+            "done",
+            "--commit",
+            head,
+            cwd=root,
+        )
+        output = self.json_output(result)
+
+        self.assertEqual(1, output["task"]["result"]["git"]["commit_count"])
+        self.assertEqual(
+            1, output["task"]["result"]["git"]["changed_path_count"]
+        )
+        self.assertNotIn('"changed_paths"', result.stdout)
+        stored = aq.load_state(self.queue)["tasks"][task["id"]]
+        self.assertNotIn("changed_paths", stored["result"]["git"])
+
+    def test_cli_complete_rejects_git_flags_for_generic_tasks(self):
+        self.init()
+        self.add("Generic")
+        claim = self.json_output(self.cli("claim", "--agent", "worker"))
+
+        result = self.cli(
+            "complete",
+            "--task",
+            "T-000001",
+            "--agent",
+            "worker",
+            "--token",
+            claim["lease_token"],
+            "--summary",
+            "done",
+            "--no-change",
+        )
+
+        self.assertEqual(2, result.returncode)
+        stored = aq.load_state(self.queue)["tasks"]["T-000001"]
+        self.assertEqual("leased", stored["status"])
+
+    def test_cli_git_complete_requires_mode_and_accepts_no_change(self):
+        root = self.make_git_repo()
+        self.init()
+        task = self.add(
+            "Git no change",
+            "--git-commit",
+            "--resource",
+            "file:base.txt",
+        )["task"]
+        claim = self.json_output(run_cli(
+            "--queue",
+            self.queue,
+            "claim",
+            "--agent",
+            "git-worker",
+            "--task",
+            task["id"],
+            cwd=root,
+        ))
+        common = (
+            "--task", task["id"],
+            "--agent", "git-worker",
+            "--token", claim["lease_token"],
+            "--summary", "done",
+        )
+
+        missing = run_cli(
+            "--queue", self.queue, "complete", *common, cwd=root
+        )
+        self.assertEqual(2, missing.returncode)
+        self.assertIn("git_commit_required", missing.stderr)
+        self.assertEqual(
+            "leased",
+            aq.load_state(self.queue)["tasks"][task["id"]]["status"],
+        )
+
+        completed = self.json_output(run_cli(
+            "--queue",
+            self.queue,
+            "complete",
+            *common,
+            "--no-change",
+            cwd=root,
+        ))
+        evidence = completed["task"]["result"]["git"]
+        self.assertEqual(0, evidence["commit_count"])
+        self.assertEqual(0, evidence["changed_path_count"])
+
+    def test_cli_completion_drift_warns_without_reopening_task(self):
+        root = self.make_git_repo()
+        self.init()
+        task = self.add(
+            "Git warning",
+            "--git-commit",
+            "--resource",
+            "file:base.txt",
+        )["task"]
+        claim = self.json_output(run_cli(
+            "--queue",
+            self.queue,
+            "claim",
+            "--agent",
+            "git-worker",
+            "--task",
+            task["id"],
+            cwd=root,
+        ))
+        binding = aq.load_state(self.queue)["tasks"][task["id"]]["claim"]["git"]
+        evidence = {
+            "branch": binding["branch"],
+            "base": binding["base"],
+            "head": binding["base"],
+            "commit_count": 0,
+            "changed_path_count": 0,
+        }
+        drifted = {
+            "common_dir": binding["common_dir"],
+            "worktree": binding["worktree"],
+            "repository_id": binding["repository_id"],
+            "worktree_id": binding["worktree_id"],
+            "branch": binding["branch"],
+            "head": "f" * 40,
+            "attached": True,
+            "clean": True,
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            aq.gq, "validate_completion", return_value=evidence
+        ), mock.patch.object(
+            aq.gq, "observe", return_value=drifted
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = aq.main([
+                "--queue",
+                str(self.queue),
+                "complete",
+                "--task",
+                task["id"],
+                "--agent",
+                "git-worker",
+                "--token",
+                claim["lease_token"],
+                "--summary",
+                "done",
+                "--no-change",
+            ])
+
+        self.assertEqual(0, code, stderr.getvalue())
+        output = json.loads(stdout.getvalue())
+        self.assertEqual("git_completion_drift", output["warning"]["code"])
+        self.assertEqual("completed", output["task"]["status"])
+        self.assertEqual(
+            "completed",
+            aq.load_state(self.queue)["tasks"][task["id"]]["status"],
+        )
+        self.assertNotIn(claim["lease_token"], stdout.getvalue())
+        self.assertNotIn(str(root), stdout.getvalue())
 
     def test_generated_dash_token_round_trips_as_separate_cli_argument(self):
         self.init()

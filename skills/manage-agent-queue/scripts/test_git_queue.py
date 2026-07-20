@@ -140,5 +140,162 @@ class GitObservationTests(GitRepositoryTestCase):
                 self.assertEqual("git_claim_drift", raised.exception.code)
 
 
+class GitCompletionTests(GitRepositoryTestCase):
+    def binding(self):
+        return gq.claim_binding(gq.observe(self.root))
+
+    def commit_files(self, paths, message):
+        for path in paths:
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"{message}: {path}\n", encoding="utf-8")
+        run_git(self.root, "add", "-A")
+        run_git(self.root, "commit", "-m", message)
+        return run_git(self.root, "rev-parse", "HEAD").stdout.strip()
+
+    def assert_git_error(self, code, callback):
+        with self.assertRaises(gq.GitContextError) as raised:
+            callback()
+        self.assertEqual(code, raised.exception.code)
+        return str(raised.exception)
+
+    def test_descendant_commits_return_exact_compact_evidence(self):
+        binding = self.binding()
+        base = binding["base"]
+        self.commit_files(
+            [f"src/first-{index:02d}.txt" for index in range(12)],
+            "first",
+        )
+        head = self.commit_files(
+            [f"src/second-{index:02d}.txt" for index in range(15)],
+            "second",
+        )
+
+        evidence = gq.validate_completion(
+            binding,
+            ["dir:src/"],
+            commit=head,
+        )
+
+        self.assertEqual(
+            {
+                "branch": "refs/heads/main",
+                "base": base,
+                "head": head,
+                "commit_count": 2,
+                "changed_path_count": 27,
+            },
+            evidence,
+        )
+        self.assertNotIn("changed_paths", evidence)
+
+    def test_completion_rejects_wrong_head_non_descendant_and_dirty_tree(self):
+        binding = self.binding()
+        head = self.commit_files(["src/change.txt"], "advance")
+        self.assert_git_error(
+            "git_head_mismatch",
+            lambda: gq.validate_completion(
+                binding, ["dir:src/"], commit=binding["base"]
+            ),
+        )
+
+        tree = run_git(
+            self.root, "rev-parse", f"{binding['base']}^{{tree}}"
+        ).stdout.strip()
+        divergent = run_git(
+            self.root, "commit-tree", tree, "-m", "divergent"
+        ).stdout.strip()
+        run_git(self.root, "reset", "--hard", divergent)
+        self.assert_git_error(
+            "git_non_descendant",
+            lambda: gq.validate_completion(
+                binding, ["dir:src/"], commit=divergent
+            ),
+        )
+
+        run_git(self.root, "reset", "--hard", head)
+        (self.root / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        self.assert_git_error(
+            "git_dirty",
+            lambda: gq.validate_completion(
+                binding, ["dir:src/"], commit=head
+            ),
+        )
+
+    def test_directory_scope_uses_path_boundaries(self):
+        binding = self.binding()
+        head = self.commit_files(["src-other/a.py"], "outside")
+
+        message = self.assert_git_error(
+            "git_path_scope",
+            lambda: gq.validate_completion(
+                binding, ["dir:src/"], commit=head
+            ),
+        )
+
+        self.assertIn("src-other/a.py", message)
+
+    def test_rename_checks_source_and_destination_with_no_rename_diff(self):
+        self.commit_files(["src/inside.txt"], "source")
+        binding = self.binding()
+        run_git(self.root, "mv", "src/inside.txt", "outside.txt")
+        run_git(self.root, "commit", "-m", "rename")
+        head = run_git(self.root, "rev-parse", "HEAD").stdout.strip()
+
+        message = self.assert_git_error(
+            "git_path_scope",
+            lambda: gq.validate_completion(
+                binding, ["file:src/inside.txt"], commit=head
+            ),
+        )
+
+        self.assertIn("outside.txt", message)
+
+    def test_scope_error_caps_displayed_paths_and_reports_omitted_count(self):
+        binding = self.binding()
+        offenders = [f"outside/{index:02d}.txt" for index in range(12)]
+        head = self.commit_files(offenders, "outside")
+
+        message = self.assert_git_error(
+            "git_path_scope",
+            lambda: gq.validate_completion(
+                binding, ["dir:src/"], commit=head
+            ),
+        )
+
+        for path in offenders[:gq.MAX_OFFENDING_PATHS]:
+            self.assertIn(path, message)
+        for path in offenders[gq.MAX_OFFENDING_PATHS:]:
+            self.assertNotIn(path, message)
+        self.assertIn("(+2 more)", message)
+        self.assertNotIn(str(self.root), message)
+
+    def test_no_change_requires_the_original_clean_head(self):
+        binding = self.binding()
+        evidence = gq.validate_completion(
+            binding,
+            ["file:README.md"],
+            no_change=True,
+        )
+        self.assertEqual(
+            {
+                "branch": "refs/heads/main",
+                "base": binding["base"],
+                "head": binding["base"],
+                "commit_count": 0,
+                "changed_path_count": 0,
+            },
+            evidence,
+        )
+
+        self.commit_files(["README.md"], "advance")
+        self.assert_git_error(
+            "git_head_mismatch",
+            lambda: gq.validate_completion(
+                binding, ["file:README.md"], no_change=True
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
