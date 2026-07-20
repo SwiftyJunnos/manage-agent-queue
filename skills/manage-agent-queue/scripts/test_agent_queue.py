@@ -163,6 +163,14 @@ class SkillContractTests(unittest.TestCase):
             templates,
         )
         self.assertIn("git_queue.py", readme)
+        for command in (
+            "$CLI migrate --to 2",
+            "$CLI task add",
+            "$CLI claim",
+            "$CLI complete",
+            "$CLI serve --open",
+        ):
+            self.assertIn(command, readme)
 
     def test_dashboard_requires_consent_fallback_and_cleanup(self):
         skill = (self.skill_dir / "SKILL.md").read_text(encoding="utf-8")

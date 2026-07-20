@@ -40,7 +40,7 @@ The dashboard is a read-only loopback view. Continue all queue mutations through
 
 Opt in only for writer tasks that must produce commits. Add `--git-commit` and declare every writable path as canonical `file:path/to/file` or `dir:path/to/tree/` resources. Typed paths are the single scope source for both claim conflicts and completion validation.
 
-Claim a Git-aware task from its intended clean, attached worktree, preferably with `claim --task T-NNNNNN`. The queue binds repository, worktree, branch, and starting HEAD; it rejects the same worktree, same branch, or overlapping typed scope already held in that repository. The queue does not create worktrees, make commits, merge, reset, or push.
+Claim a Git-aware task from its intended clean, attached worktree, preferably with `claim --task T-NNNNNN`. The queue binds repository, worktree, branch, and starting HEAD; it rejects the same worktree, same branch, or overlapping typed scope already held in that repository. Heartbeat before committing when the lease is near expiry. The queue does not create worktrees, make commits, merge, reset, or push.
 
 Complete with exactly one Git outcome: `complete ... --commit FULL_COMMIT_ID` after one or more scoped descendant commits, or `complete ... --no-change` while clean at the original HEAD. Persist only full base/head IDs and `commit_count`/`changed_path_count`; never store a changed-path list.
 

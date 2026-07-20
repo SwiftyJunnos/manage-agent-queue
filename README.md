@@ -91,10 +91,25 @@ and continue only the tasks that are still eligible.
 
 When the skill offers live observation, approve it to open the read-only local dashboard. Decline it to keep progress in terminal `status` and `events` views.
 
-Manual CLI example for an approved local dashboard:
+Git-aware CLI quick start:
 
 ```bash
-CLI="python3 skills/manage-agent-queue/scripts/agent_queue.py --queue /absolute/path/queue.json"
+QUEUE=/absolute/path/queue.json
+CLI="python3 skills/manage-agent-queue/scripts/agent_queue.py --queue $QUEUE"
+
+# New queues already use v2. Run this line only for an existing v1 queue.
+$CLI migrate --to 2
+
+$CLI task add --title "HTTP shard" --git-commit \
+  --resource file:src/http.py --resource dir:tests/http/
+$CLI claim --agent shard-http --task T-000001
+
+# After capturing TOKEN and committing within the declared scope:
+RESULT_HEAD="$(git rev-parse HEAD)"
+$CLI complete --task T-000001 --agent shard-http \
+  --token "$TOKEN" --commit "$RESULT_HEAD" --summary "HTTP shard complete"
+
+# Optional manual dashboard launch, only after approving the local browser view:
 $CLI serve --open
 ```
 
