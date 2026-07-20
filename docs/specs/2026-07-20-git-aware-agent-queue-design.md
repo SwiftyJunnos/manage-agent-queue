@@ -212,7 +212,7 @@ Schema version 2 adds:
 - Task `git_mode`, either `null` or `"commit"`.
 - Optional private `git_binding` inside a live claim.
 - Optional private `git_recovery` on a pending or failed task; `retry` preserves it and terminal cancellation clears it.
-- Optional compact `git` evidence inside a completed result.
+- Required nullable `git` field inside every version-2 completed result: `null` for generic tasks and compact evidence for Git-aware tasks. Version-1 results retain their original two-field shape.
 - The derived `git_recovery` display state.
 
 New queues initialize as version 2. The new CLI continues to validate, display, and mutate version-1 queues using version-1 semantics. Version-1 queues cannot add Git-aware tasks or Git-aware workflows.
