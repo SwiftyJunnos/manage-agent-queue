@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import git_queue as gq
+
 try:
     import fcntl as _fcntl
 except ImportError:  # pragma: no cover - exercised by isolated import test
@@ -614,6 +616,18 @@ def normalize_task(state, raw):
     resources = _deduplicated_string_list(
         raw.get("resources", []), "task resources"
     )
+    git_mode = raw.get("git_mode") if schema_version == 2 else None
+    if git_mode not in (None, "commit"):
+        raise InvariantError("task git_mode must be commit or null")
+    if git_mode == "commit":
+        try:
+            scopes = gq.path_scopes(resources)
+        except gq.GitContextError as error:
+            raise InvariantError(str(error)) from error
+        if not scopes:
+            raise InvariantError(
+                "Git-aware task requires a file: or dir: resource"
+            )
     labels = _deduplicated_string_list(raw.get("labels", []), "task labels")
     task_id = reserve_task_id(state, raw.get("id"))
     now = utc_now()
@@ -638,7 +652,7 @@ def normalize_task(state, raw):
         "updated_at": now,
     }
     if schema_version == 2:
-        task["git_mode"] = None
+        task["git_mode"] = git_mode
         task["git_recovery"] = None
     validate_task(
         task,
@@ -1045,7 +1059,13 @@ def _commit_workflow(state, raw_tasks, template, details, now):
 
 
 def add_adversarial_review(
-    state, title, priority, resources, reviewer_count, now=None
+    state,
+    title,
+    priority,
+    resources,
+    reviewer_count,
+    git_commit=False,
+    now=None,
 ):
     """Atomically add an implement-review-apply-verify workflow."""
     validate_state(state)
@@ -1064,6 +1084,8 @@ def add_adversarial_review(
         or reviewer_count <= 0
     ):
         raise InvariantError("reviewer_count must be a positive integer")
+    if not isinstance(git_commit, bool):
+        raise InvariantError("git_commit must be a boolean")
 
     task_count = reviewer_count + 3
     workflow_id, task_ids = _workflow_ids(state, task_count)
@@ -1080,6 +1102,7 @@ def add_adversarial_review(
         "priority": priority,
         "depends_on": [],
         "resources": list(resources),
+        **({"git_mode": "commit"} if git_commit else {}),
     }]
     raw_tasks.extend({
         "id": review_id,
@@ -1105,6 +1128,7 @@ def add_adversarial_review(
             "priority": priority - 20,
             "depends_on": review_ids,
             "resources": list(resources),
+            **({"git_mode": "commit"} if git_commit else {}),
         },
         {
             "id": task_ids[-1],
@@ -1121,17 +1145,29 @@ def add_adversarial_review(
         state,
         raw_tasks,
         "adversarial-review",
-        {"reviewer_count": reviewer_count},
+        {
+            "reviewer_count": reviewer_count,
+            **({"git_commit": True} if git_commit else {}),
+        },
         now,
     )
 
 
-def add_parallel_shards(state, title, priority, shard_resources, now=None):
+def add_parallel_shards(
+    state,
+    title,
+    priority,
+    shard_resources,
+    git_commit=False,
+    now=None,
+):
     """Atomically add parallel resource shards followed by integration."""
     validate_state(state)
     title = _workflow_title_priority(title, priority)
     if not isinstance(shard_resources, list) or not shard_resources:
         raise InvariantError("shard_resources must be a nonempty list")
+    if not isinstance(git_commit, bool):
+        raise InvariantError("git_commit must be a boolean")
     normalized_shards = []
     seen_resources = set()
     for shard in shard_resources:
@@ -1150,6 +1186,19 @@ def add_parallel_shards(state, title, priority, shard_resources, now=None):
             raise InvariantError(
                 f"resource appears in more than one shard: {duplicate}"
             )
+        if git_commit:
+            overlapping = next(
+                (
+                    prior
+                    for prior in normalized_shards
+                    if gq.resources_overlap(prior, normalized)
+                ),
+                None,
+            )
+            if overlapping is not None:
+                raise InvariantError(
+                    "Git-aware shard path resources overlap"
+                )
         seen_resources.update(normalized)
         normalized_shards.append(normalized)
 
@@ -1169,6 +1218,7 @@ def add_parallel_shards(state, title, priority, shard_resources, now=None):
         "priority": priority,
         "depends_on": [],
         "resources": shard,
+        **({"git_mode": "commit"} if git_commit else {}),
     } for index, (task_id, shard) in enumerate(
         zip(shard_ids, normalized_shards), start=1
     )]
@@ -1182,6 +1232,7 @@ def add_parallel_shards(state, title, priority, shard_resources, now=None):
             "priority": priority - 10,
             "depends_on": shard_ids,
             "resources": flattened_resources,
+            **({"git_mode": "commit"} if git_commit else {}),
         },
         {
             "id": task_ids[-1],
@@ -1198,7 +1249,10 @@ def add_parallel_shards(state, title, priority, shard_resources, now=None):
         state,
         raw_tasks,
         "parallel-shards",
-        {"shard_count": shard_count},
+        {
+            "shard_count": shard_count,
+            **({"git_commit": True} if git_commit else {}),
+        },
         now,
     )
 
@@ -3474,6 +3528,7 @@ def _task_input_from_args(args):
             args.resource,
             args.label,
             args.max_attempts,
+            args.git_commit,
         )
         if any(value not in (None, []) for value in direct_values):
             raise QueueError("--from-json cannot be combined with task fields")
@@ -3493,6 +3548,7 @@ def _task_input_from_args(args):
         "resources": args.resource,
         "labels": args.label,
         "max_attempts": args.max_attempts,
+        "git_mode": "commit" if args.git_commit else None,
     }
     raw.update({key: value for key, value in mappings.items() if value is not None})
     return raw
@@ -3503,7 +3559,7 @@ def _parallel_workflow_input(path):
     if not isinstance(raw, dict):
         raise QueueError("parallel-shards JSON input must be an object")
     required = {"title", "shards"}
-    allowed = required | {"priority"}
+    allowed = required | {"priority", "git_commit"}
     missing = sorted(required.difference(raw))
     unknown = sorted(set(raw).difference(allowed))
     if missing:
@@ -3514,6 +3570,8 @@ def _parallel_workflow_input(path):
         raise QueueError(
             f"parallel-shards JSON input has unknown keys: {', '.join(unknown)}"
         )
+    if "git_commit" in raw and not isinstance(raw["git_commit"], bool):
+        raise QueueError("parallel-shards git_commit must be a boolean")
     return raw
 
 
@@ -3543,6 +3601,7 @@ def build_parser():
     add.add_argument("--resource", action="append")
     add.add_argument("--label", action="append")
     add.add_argument("--max-attempts", type=_positive)
+    add.add_argument("--git-commit", action="store_const", const=True)
     add.add_argument("--from-json")
     add_batch_parser = task_commands.add_parser(
         "add-batch", help="add a JSON task batch"
@@ -3567,6 +3626,7 @@ def build_parser():
     workflow_add.add_argument("--priority", type=int)
     workflow_add.add_argument("--resource", action="append")
     workflow_add.add_argument("--reviewers", type=_positive)
+    workflow_add.add_argument("--git-commit", action="store_const", const=True)
     workflow_add.add_argument("--from-json")
 
     claim = commands.add_parser("claim", help="claim eligible work")
@@ -3806,6 +3866,7 @@ def _run_command(args, path):
                     0 if args.priority is None else args.priority,
                     [] if args.resource is None else args.resource,
                     2 if args.reviewers is None else args.reviewers,
+                    git_commit=bool(args.git_commit),
                     now=utc_now(),
                 )
             )
@@ -3813,7 +3874,11 @@ def _run_command(args, path):
             if args.from_json is None:
                 raise QueueError("parallel-shards requires --from-json")
             if any(value is not None for value in (
-                args.title, args.priority, args.resource, args.reviewers
+                args.title,
+                args.priority,
+                args.resource,
+                args.reviewers,
+                args.git_commit,
             )):
                 raise QueueError(
                     "parallel-shards --from-json cannot be combined with "
@@ -3826,6 +3891,7 @@ def _run_command(args, path):
                     raw["title"],
                     raw.get("priority", 0),
                     raw["shards"],
+                    git_commit=raw.get("git_commit", False),
                     now=utc_now(),
                 )
             )

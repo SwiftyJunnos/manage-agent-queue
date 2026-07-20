@@ -406,6 +406,39 @@ class TaskGraphTests(unittest.TestCase):
         self.assertEqual(task, self.state["tasks"]["T-000001"])
         self.assertEqual(2, self.state["next_task_sequence"])
 
+    def test_git_task_requires_version_two_and_typed_path_resource(self):
+        with self.assertRaisesRegex(aq.InvariantError, "file: or dir:"):
+            aq.add_task(
+                self.state,
+                {
+                    "title": "Git task",
+                    "git_mode": "commit",
+                    "resources": ["scope:auth"],
+                },
+            )
+
+        valid = aq.add_task(
+            self.state,
+            {
+                "title": "Scoped Git task",
+                "git_mode": "commit",
+                "resources": ["file:src/api.py", "dir:tests/api/"],
+            },
+        )
+        self.assertEqual("commit", valid["git_mode"])
+
+        legacy = aq.new_state("legacy", aq.fixed_config())
+        legacy["schema_version"] = 1
+        with self.assertRaisesRegex(aq.InvariantError, "Git-aware|unknown"):
+            aq.add_task(
+                legacy,
+                {
+                    "title": "Legacy Git task",
+                    "git_mode": "commit",
+                    "resources": ["file:src/api.py"],
+                },
+            )
+
     def test_second_task_has_monotonic_id_timestamp_priority_and_dependency(self):
         with mock.patch.object(
             aq,
@@ -1140,6 +1173,27 @@ class WorkflowTemplateTests(unittest.TestCase):
                     "reviewer_count": reviewer_count,
                 }, state["events"][0]["details"])
 
+    def test_git_enabled_adversarial_review_marks_only_writer_roles(self):
+        result = aq.add_adversarial_review(
+            self.state,
+            "Change",
+            20,
+            ["dir:src/"],
+            2,
+            git_commit=True,
+            now=self.now,
+        )
+        tasks = [
+            self.state["tasks"][task_id]
+            for task_id in result["task_ids"]
+        ]
+
+        self.assertEqual(
+            ["commit", None, None, "commit", None],
+            [task["git_mode"] for task in tasks],
+        )
+        self.assertTrue(self.state["events"][0]["details"]["git_commit"])
+
     def test_adversarial_review_readiness_isolated_by_graph_and_resources(self):
         result = aq.add_adversarial_review(
             self.state, "Change", 0, ["shared"], 3, now=self.now
@@ -1206,6 +1260,36 @@ class WorkflowTemplateTests(unittest.TestCase):
                     "task_count": shard_count + 2,
                     "shard_count": shard_count,
                 }, state["events"][0]["details"])
+
+    def test_git_enabled_parallel_shards_marks_writers_and_rejects_overlap(self):
+        result = aq.add_parallel_shards(
+            self.state,
+            "Build",
+            20,
+            [["file:src/a.py"], ["dir:src/b/"]],
+            git_commit=True,
+            now=self.now,
+        )
+        tasks = [
+            self.state["tasks"][task_id]
+            for task_id in result["task_ids"]
+        ]
+        self.assertEqual(
+            ["commit", "commit", "commit", None],
+            [task["git_mode"] for task in tasks],
+        )
+        self.assertTrue(self.state["events"][0]["details"]["git_commit"])
+
+        other = aq.new_state("overlap", aq.fixed_config())
+        with self.assertRaisesRegex(aq.InvariantError, "overlap"):
+            aq.add_parallel_shards(
+                other,
+                "Unsafe",
+                20,
+                [["dir:src/"], ["file:src/a.py"]],
+                git_commit=True,
+                now=self.now,
+            )
 
     def test_workflow_api_copies_once_and_validates_source_and_candidate_once(self):
         real_deepcopy = aq.copy.deepcopy
@@ -4543,6 +4627,68 @@ class QueueCliTests(unittest.TestCase):
         invalid = run_cli("workflow", "add", "--template", "not-real")
         self.assertEqual(2, invalid.returncode)
         self.assertEqual("", invalid.stdout)
+
+    def test_cli_accepts_git_task_and_workflow_opt_in(self):
+        self.init()
+        task = self.add(
+            "Git task",
+            "--git-commit",
+            "--resource",
+            "file:src/api.py",
+        )["task"]
+        self.assertEqual("commit", task["git_mode"])
+
+        adversarial = self.json_output(
+            self.cli(
+                "workflow",
+                "add",
+                "--template",
+                "adversarial-review",
+                "--title",
+                "Review Git",
+                "--resource",
+                "dir:src/review/",
+                "--git-commit",
+            )
+        )
+        state = aq.load_state(self.queue)
+        self.assertEqual(
+            ["commit", None, None, "commit", None],
+            [
+                state["tasks"][task_id]["git_mode"]
+                for task_id in adversarial["task_ids"]
+            ],
+        )
+
+        input_path = Path(self.temporary.name) / "git-shards.json"
+        input_path.write_text(
+            json.dumps(
+                {
+                    "title": "Git shards",
+                    "shards": [["file:src/a.py"], ["file:src/b.py"]],
+                    "git_commit": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        parallel = self.json_output(
+            self.cli(
+                "workflow",
+                "add",
+                "--template",
+                "parallel-shards",
+                "--from-json",
+                input_path,
+            )
+        )
+        state = aq.load_state(self.queue)
+        self.assertEqual(
+            ["commit", "commit", "commit", None],
+            [
+                state["tasks"][task_id]["git_mode"]
+                for task_id in parallel["task_ids"]
+            ],
+        )
 
     def test_lifecycle_commands_and_token_redaction(self):
         self.init(retry_backoff=1)
