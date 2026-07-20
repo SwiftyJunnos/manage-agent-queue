@@ -4644,7 +4644,8 @@ class QueueLockTests(unittest.TestCase):
 
     def test_module_loads_without_fcntl_and_has_no_unsafe_fallback(self):
         source = "\n".join((
-            "import builtins, runpy, sys",
+            "import builtins, pathlib, runpy, sys",
+            "sys.path.insert(0, str(pathlib.Path(sys.argv[1]).resolve().parent))",
             "real_import = builtins.__import__",
             "def guarded_import(name, *args, **kwargs):",
             "    if name == 'fcntl':",
