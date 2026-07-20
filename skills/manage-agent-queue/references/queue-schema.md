@@ -5,10 +5,12 @@ Use this reference when changing or diagnosing the queue format, state machine, 
 ## Contents
 
 - [Path resolution](#path-resolution)
+- [Schema versions and migration](#schema-versions-and-migration)
 - [Top-level state](#top-level-state)
 - [Task state](#task-state)
 - [Stored and derived states](#stored-and-derived-states)
 - [Graph, priority, and resources](#graph-priority-and-resources)
+- [Git-aware ownership](#git-aware-ownership)
 - [Leases, retries, and transitions](#leases-retries-and-transitions)
 - [Transactions and locking](#transactions-and-locking)
 - [TSV projection](#tsv-projection)
@@ -26,15 +28,27 @@ Resolve one absolute path in this precedence order:
 2. `AGENT_QUEUE_PATH`;
 3. `.agent-queue/queue.json` below the nearest current-directory ancestor containing a `.git` file or directory, or below the current directory when none exists.
 
-Expansion handles `~`; it does not resolve symlinks or invoke Git. Processes in different worktrees must receive the same explicit absolute path. Version 1 supports one local machine and local-filesystem locking, not multi-host or network-filesystem coordination.
+Expansion handles `~`; it does not resolve symlinks or invoke Git. Processes in different worktrees must receive the same explicit absolute path. The queue supports one local machine and local-filesystem locking, not multi-host or network-filesystem coordination.
+
+## Schema Versions and Migration
+
+New queues use schema version 2. The CLI continues to validate and mutate version-1 generic queues without changing their exact task, claim, or result shapes. Version 1 cannot create Git-aware tasks or workflows.
+
+Migration is explicit and one-way:
+
+```bash
+python3 scripts/agent_queue.py --queue "$QUEUE" migrate --to 2
+```
+
+`migrate --to 2` runs under the queue lock, adds nullable Git fields to a detached candidate, emits one `queue.migrated` event, and commits one revision. Failure leaves JSON and TSV unchanged. There is no downgrade command.
 
 ## Top-Level State
 
-The exact schema-version-1 shape is:
+The exact top-level shape for a new schema-version-2 queue is:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "queue_id": "project-port",
   "revision": 17,
   "next_task_sequence": 5,
@@ -80,18 +94,44 @@ Each stored task has every field below:
   "claim": null,
   "result": null,
   "last_error": null,
+  "git_mode": "commit",
+  "git_recovery": null,
   "created_at": "2026-07-10T05:00:00Z",
   "updated_at": "2026-07-10T05:00:00Z"
 }
 ```
 
-Task creation accepts `id`, `workflow_id`, `role`, `title`, `description`, `priority`, `depends_on`, `resources`, `labels`, and `max_attempts`. It defaults description to empty, priority to zero, lists to empty, and attempts from queue configuration. Require a nonblank title, integer priority, positive maximum attempts, and string lists. Deduplicate `depends_on`, `resources`, and `labels` while preserving first occurrence; stored canonical lists must be duplicate-free. Generic tasks may use null workflow and role.
+Task creation accepts `id`, `workflow_id`, `role`, `title`, `description`, `priority`, `depends_on`, `resources`, `labels`, `max_attempts`, and schema-v2 `git_mode`. CLI `--git-commit` maps to `git_mode: "commit"`; omission stores `null`. It defaults description to empty, priority to zero, lists to empty, and attempts from queue configuration. Require a nonblank title, integer priority, positive maximum attempts, and string lists. Deduplicate `depends_on`, `resources`, and `labels` while preserving first occurrence; stored canonical lists must be duplicate-free. Generic tasks may use null workflow and role.
 
-Allow `available_at` only on `pending`. Allow `claim` only on `leased`, `result` only on `completed`, and a blocking error kind only on `blocked`. A completed result is exactly:
+Version-1 tasks omit `git_mode` and `git_recovery` entirely. Version-2 tasks always store both fields, using nulls for generic work.
+
+Allow `available_at` only on `pending`. Allow `claim` only on `leased`, `result` only on `completed`, and a blocking error kind only on `blocked`. Allow `git_recovery` only on pending or failed Git-aware tasks. A schema-v2 generic result is exactly:
 
 ```json
-{"summary": "Applied two findings", "artifacts": ["artifacts/final.diff"]}
+{
+  "summary": "Applied two findings",
+  "artifacts": ["artifacts/final.diff"],
+  "git": null
+}
 ```
+
+A Git-aware result uses the same exact keys and replaces `git` with compact evidence:
+
+```json
+{
+  "summary": "Applied two findings",
+  "artifacts": ["artifacts/final.diff"],
+  "git": {
+    "branch": "refs/heads/queue/T-000004",
+    "base": "0123456789abcdef0123456789abcdef01234567",
+    "head": "89abcdef0123456789abcdef0123456789abcdef",
+    "commit_count": 2,
+    "changed_path_count": 7
+  }
+}
+```
+
+Version-1 results keep only `summary` and `artifacts`. Changed-path lists are never persisted; recompute them from Git only when detailed inspection is necessary.
 
 Limit descriptions, result summaries, failure messages, and block reasons to 16,384 valid UTF-8 bytes. Put large diffs, logs, and reports in artifact files.
 
@@ -111,6 +151,7 @@ Views derive these states with fixed precedence for a pending task:
 - `dependency_failed`: any dependency is `failed`, `blocked`, or `cancelled`.
 - `waiting_dependency`: at least one dependency is not `completed`.
 - `waiting_retry`: `available_at` is later than the current time.
+- `git_recovery`: an expired or retryable Git attempt retains a private binding and requires targeted `--resume-git`.
 - `resource_conflict`: a declared resource belongs to another unexpired `leased` task.
 - `ready`: no preceding condition applies.
 - `leased`: mirrors the stored active state and is also a filterable derived name.
@@ -121,9 +162,26 @@ Non-pending rows display their stored state. A dependency failure does not rewri
 
 Require every dependency to exist, reject self-edges and cycles, and validate batch/workflow additions all-or-nothing. A task becomes dependency-ready only after every dependency is `completed`.
 
-Treat resource strings as exact, case-sensitive exclusive keys. Do not infer path overlap. Coordinators must choose a consistent granularity such as `file:src/api.py`, `crate:runtime`, or `scope:auth`. An unexpired lease reserves all listed resources; expired leases do not block eligibility.
+Generic tasks treat resource strings as exact, case-sensitive exclusive keys. Coordinators must choose consistent keys such as `crate:runtime` or `scope:auth`. An unexpired generic lease reserves all listed resources; expired leases do not block eligibility.
+
+Git-aware tasks require at least one canonical typed path resource. `file:src/api.py` names exactly one repository-relative file. `dir:src/api/` names that directory and all descendants; the trailing slash is required. Reject absolute paths, `.`/`..`, empty segments, backslashes, and noncanonical forms. Within the same repository, typed file/directory equality, containment, and nesting determine overlap; sibling boundaries such as `dir:src/` and `file:src-other/a.py` do not overlap.
 
 `claim` may filter by exact role and a required subset of labels. It excludes exhausted tasks and selects among eligible tasks by priority descending, then numeric task ID ascending. Selection and lease creation share one transaction.
+
+## Git-Aware Ownership
+
+Git-aware work is opt-in. Use `task add --git-commit` or enable the supported writer roles in a built-in workflow. The queue does not create worktrees, commit, merge, reset, or push; it only validates cooperative ownership and completion evidence.
+
+A Git-aware claim requires an attached branch and clean worktree. It privately binds canonical common-directory and worktree paths plus public SHA-256 repository/worktree identities, full branch ref, and full starting object ID under `claim.git`. Same-worktree claims, same-repository/same-branch claims, and same-repository overlapping typed scopes conflict. Git subprocesses run before or after the queue transaction, never while `QueueLock` is held; post-claim drift releases the new lease.
+
+Complete a Git-aware task with exactly one mode:
+
+- `complete ... --commit FULL_COMMIT_ID`: current HEAD must equal the supplied full commit, advance from the claimed base, descend from it, keep the worktree clean, and change only declared `file:`/`dir:` scope. Multiple descendant commits are valid.
+- `complete ... --no-change`: the clean current HEAD must still equal the claimed base.
+
+Diff validation uses NUL-delimited names and disables rename detection so both rename endpoints are checked. Scope errors show at most ten offending relative paths plus an omitted count. Successful results persist only branch, full base/head IDs, `commit_count`, and `changed_path_count`.
+
+On retryable failure or lease expiry, preserve the private binding as `git_recovery` on pending or failed work. Ordinary claim skips it. After retry backoff, resume only with `claim --task T-NNNNNN --resume-git`; require the same clean repository, worktree, and branch, and either original HEAD or scoped descendant commits. Retry preserves recovery. Completion and cancellation clear it. Blocking a recovery task is rejected. A Git-aware `release` requires a clean worktree still at the original base.
 
 ## Leases, Retries, and Transitions
 
@@ -135,13 +193,16 @@ A successful claim increments `attempts` and stores:
   "lease_token": "lq_<random>",
   "claimed_at": "2026-07-10T05:12:30Z",
   "heartbeat_at": "2026-07-10T05:12:30Z",
-  "expires_at": "2026-07-10T05:27:30Z"
+  "expires_at": "2026-07-10T05:27:30Z",
+  "git": null
 }
 ```
 
+Schema-v2 claims always include `git`: `null` for generic tasks and the private binding described above for Git-aware tasks. Version-1 claims retain the five original fields.
+
 Require task ID, matching agent ID, matching token, and an unexpired lease for `heartbeat`, `complete`, `fail`, and `release`. Heartbeat extends expiry from the command time. Completion stores a summary and artifact list. Release returns to immediate `pending` without refunding the attempt.
 
-A retryable failure or swept expiry clears the claim and records the error. When `attempts < max_attempts`, return to `pending` and set `available_at` to current time plus retry backoff; otherwise set `failed`. `fail --terminal` skips remaining attempts. `retry` accepts only `failed`, adds one maximum attempt by default (or `--additional-attempts N`), and returns to immediate `pending` while retaining prior history.
+A retryable failure or swept expiry clears the claim and records the error. When `attempts < max_attempts`, return to `pending` and set `available_at` to current time plus retry backoff; otherwise set `failed`. For Git-aware work, copy the binding into `git_recovery` before clearing the claim. `fail --terminal` skips remaining attempts. `retry` accepts only `failed`, adds one maximum attempt by default (or `--additional-attempts N`), and returns to immediate `pending` while retaining prior history and recovery binding.
 
 `block` accepts only `pending`. `unblock` accepts only `blocked`. `cancel` accepts `pending`, `blocked`, or `failed`; it rejects `leased` and `completed`. Expired leases are swept before normal mutations, claims, and status, or explicitly with `sweep`.
 
@@ -156,7 +217,7 @@ The transaction algorithm is:
 1. Open/create the guard without following symlinks and acquire its exclusive kernel lock with bounded jitter and timeout.
 2. Create the lock directory. Its owner records random token, PID, hostname, acquisition time, and stale-after time.
 3. Under the guard, identify safely stale lock directories, rename them to random orphan paths, and remove them before retrying.
-4. Read and fully validate `queue.json`; copy it; optionally sweep; apply the transition; validate again.
+4. Read and fully validate `queue.json`; copy it; optionally sweep; apply the in-memory transition; validate again. Git observation and validation occur outside this section.
 5. On change, increment one revision, normalize new event revisions, write same-directory temporary JSON, flush and `fsync`, then `os.replace` JSON.
 6. Atomically replace TSV after JSON. On no-op, repair a missing/stale TSV without changing JSON.
 7. Remove the owned lock directory only if its token still matches, then release the kernel guard.
@@ -188,7 +249,7 @@ Escape tabs, CR/LF, backslashes, and unsafe controls so every task remains one r
 
 Each event has exactly `seq`, `at`, `type`, `actor`, `task_id`, `revision`, and `details`. Events are ordered by increasing sequence, nondecreasing timestamp and revision, reference retained tasks when task-scoped, and never persist a future revision.
 
-Creation and transitions emit `task.added`, `workflow.created`, `task.claimed`, `task.heartbeat`, `task.completed`, `task.failed`, `task.released`, `task.lease_expired`, `task.retried`, `task.blocked`, `task.unblocked`, `task.cancelled`, and `queue.compacted` as applicable. Recursively remove every `lease_token` key from event details. `task show`, status, TSV, and events never expose the token; only successful `claim` returns it. Events also omit result bodies and include bounded metadata such as counts and states.
+Creation and transitions emit `task.added`, `workflow.created`, `task.claimed`, `task.heartbeat`, `task.completed`, `task.failed`, `task.released`, `task.lease_expired`, `task.retried`, `task.blocked`, `task.unblocked`, `task.cancelled`, `queue.migrated`, and `queue.compacted` as applicable. Recursively remove every `lease_token` key from event details. `task show`, status, TSV, dashboard, and events never expose tokens or raw common-directory/worktree paths. Only successful `claim` returns its token. Events omit result bodies; Git completion events include only artifact, commit, and changed-path counts.
 
 ## Local Dashboard
 
@@ -207,15 +268,16 @@ Invoke `python3 scripts/agent_queue.py [--queue PATH] COMMAND`. Run `--help` for
 | Command | Contract |
 |---|---|
 | `init` | Create JSON and empty TSV; set ID and optional lease/retry defaults. |
-| `task add` | Add one task from flags or `--from-json`. |
+| `migrate` | Run explicit one-way `migrate --to 2` for a valid version-1 queue. |
+| `task add` | Add one task from flags or `--from-json`; `--git-commit` opts a schema-v2 task into Git validation. |
 | `task add-batch` | Atomically add a nonempty JSON array. |
 | `task show` | Return one redacted task snapshot. |
-| `workflow add` | Add one built-in workflow atomically. |
-| `claim` | Atomically sweep, choose, and lease eligible work. |
+| `workflow add` | Add one built-in workflow atomically; Git opt-in applies only to writer roles. |
+| `claim` | Atomically sweep, choose, and lease eligible work; `--task` targets and `--resume-git` explicitly recovers Git work. |
 | `heartbeat` | Extend a matching live lease. |
-| `complete` | Store concise success summary/artifact paths. |
+| `complete` | Store concise success summary/artifact paths; Git-aware work requires `--commit` or `--no-change`. |
 | `fail` | Retry or terminally fail matching leased work. |
-| `release` | Return matching leased work to pending. |
+| `release` | Return matching leased work to pending; Git-aware work must still be clean at its base. |
 | `retry` | Grant attempts to a failed task. |
 | `block` | Pause pending work with a reason. |
 | `unblock` | Resume blocked work. |

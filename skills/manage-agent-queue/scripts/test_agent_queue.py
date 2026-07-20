@@ -121,6 +121,49 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("scripts/agent_queue.py", templates)
         self.assertIn("--from-json", templates)
 
+    def test_git_aware_contract_is_documented_without_path_list_storage(self):
+        skill = (self.skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        schema = (
+            self.skill_dir / "references" / "queue-schema.md"
+        ).read_text(encoding="utf-8")
+        templates = (
+            self.skill_dir / "references" / "workflow-templates.md"
+        ).read_text(encoding="utf-8")
+        readme = (self.skill_dir.parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+
+        for required in (
+            "--git-commit",
+            "--commit",
+            "--no-change",
+            "--resume-git",
+            "migrate --to 2",
+            "git_recovery",
+            "file:",
+            "dir:",
+            "changed_path_count",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, schema)
+        for required in (
+            "--git-commit",
+            "--commit",
+            "--no-change",
+            "--resume-git",
+            "file:",
+            "dir:",
+        ):
+            self.assertIn(required, skill)
+        self.assertNotIn('"changed_paths"', schema)
+        self.assertNotIn('"changed_paths"', templates)
+        self.assertIn("writer roles only", templates)
+        self.assertIn(
+            "does not create worktrees, commit, merge, reset, or push",
+            templates,
+        )
+        self.assertIn("git_queue.py", readme)
+
     def test_dashboard_requires_consent_fallback_and_cleanup(self):
         skill = (self.skill_dir / "SKILL.md").read_text(encoding="utf-8")
         readme = (self.skill_dir.parent.parent / "README.md").read_text(
