@@ -108,6 +108,16 @@ CLAIM_FIELDS_V1 = frozenset({
     "expires_at",
 })
 CLAIM_FIELDS_V2 = CLAIM_FIELDS_V1 | {"git"}
+GIT_BINDING_FIELDS = frozenset(
+    {
+        "common_dir",
+        "worktree",
+        "repository_id",
+        "worktree_id",
+        "branch",
+        "base",
+    }
+)
 EVENT_FIELDS = {
     "seq",
     "at",
@@ -834,6 +844,21 @@ def validate_task(task, expected_id=None, schema_version=SCHEMA_VERSION):
                 raise InvariantError("generic task claim.git must be null")
             if task["git_mode"] == "commit" and claim["git"] is None:
                 raise InvariantError("Git-aware task claim.git must be an object")
+            if task["git_mode"] == "commit":
+                git_binding = claim["git"]
+                if not isinstance(git_binding, dict) or set(
+                    git_binding
+                ) != GIT_BINDING_FIELDS:
+                    raise InvariantError(
+                        "Git-aware task claim.git fields must match binding schema"
+                    )
+                for field in GIT_BINDING_FIELDS:
+                    if not isinstance(
+                        git_binding[field], str
+                    ) or not git_binding[field]:
+                        raise InvariantError(
+                            f"task claim.git.{field} must be nonempty"
+                        )
     elif claim is not None:
         raise InvariantError("non-leased task claim must be null")
 
@@ -1715,6 +1740,27 @@ def derive_state(state, task, now):
     return _derive_state_with_resources(state, task, now, active_resources)
 
 
+def _has_git_claim_conflict(state, task, observation, now):
+    for active in state["tasks"].values():
+        if active["status"] != "leased" or active["id"] == task["id"]:
+            continue
+        claim = active.get("claim")
+        if not isinstance(claim, dict) or claim["expires_at"] <= now:
+            continue
+        binding = claim.get("git")
+        if not isinstance(binding, dict):
+            continue
+        if binding["worktree_id"] == observation["worktree_id"]:
+            return True
+        if binding["repository_id"] != observation["repository_id"]:
+            continue
+        if binding["branch"] == observation["branch"]:
+            return True
+        if gq.resources_overlap(active["resources"], task["resources"]):
+            return True
+    return False
+
+
 def claim_task(
     state,
     agent_id,
@@ -1722,6 +1768,9 @@ def claim_task(
     role=None,
     labels=None,
     lease_seconds=None,
+    git_observation=None,
+    task_id=None,
+    resume_git=False,
 ):
     """Claim the highest-priority eligible task with an in-memory lease."""
     validate_state(state)
@@ -1733,6 +1782,14 @@ def claim_task(
         not isinstance(role, str) or not role.strip()
     ):
         raise InvariantError("role must be a non-blank string or null")
+    if task_id is not None:
+        _task_id_sequence(task_id)
+        if task_id not in state["tasks"]:
+            raise InvariantError(f"task not found: {task_id}")
+    if not isinstance(resume_git, bool):
+        raise InvariantError("resume_git must be a boolean")
+    if resume_git and task_id is None:
+        raise InvariantError("resume_git requires task_id")
     if labels is None:
         required_labels = set()
     elif isinstance(labels, (list, set)):
@@ -1753,6 +1810,8 @@ def claim_task(
     active_resources = leased_resources(state, now=now)
     eligible = []
     for task in state["tasks"].values():
+        if task_id is not None and task["id"] != task_id:
+            continue
         if role is not None and task["role"] != role:
             continue
         if not required_labels.issubset(task["labels"]):
@@ -1772,6 +1831,21 @@ def claim_task(
             != "ready"
         ):
             continue
+        if task.get("git_mode") == "commit":
+            try:
+                gq.require_claimable(git_observation)
+            except gq.GitContextError as error:
+                if task_id is not None:
+                    raise InvariantError(str(error)) from error
+                continue
+            if task.get("git_recovery") is not None and not resume_git:
+                continue
+            if _has_git_claim_conflict(
+                state, task, git_observation, now
+            ):
+                continue
+        elif resume_git:
+            raise InvariantError("resume_git requires a Git-aware task")
         eligible.append(task)
     if not eligible:
         raise NoTaskAvailable("no task is available")
@@ -1799,7 +1873,11 @@ def claim_task(
         "expires_at": expires_at,
     }
     if candidate["schema_version"] == 2:
-        claimed["claim"]["git"] = None
+        claimed["claim"]["git"] = (
+            gq.claim_binding(git_observation)
+            if claimed["git_mode"] == "commit"
+            else None
+        )
     claimed["updated_at"] = now
     append_event(
         candidate,
@@ -3455,6 +3533,14 @@ def _safe_task(task):
     safe = copy.deepcopy(task)
     if isinstance(safe.get("claim"), dict):
         safe["claim"].pop("lease_token", None)
+        binding = safe["claim"].get("git")
+        if isinstance(binding, dict):
+            binding.pop("common_dir", None)
+            binding.pop("worktree", None)
+    recovery = safe.get("git_recovery")
+    if isinstance(recovery, dict):
+        recovery.pop("common_dir", None)
+        recovery.pop("worktree", None)
     return safe
 
 
@@ -3634,6 +3720,8 @@ def build_parser():
     claim.add_argument("--role")
     claim.add_argument("--label", action="append")
     claim.add_argument("--lease-seconds", type=_positive)
+    claim.add_argument("--task")
+    claim.add_argument("--resume-git", action="store_true")
 
     def lease_parser(name, help_text):
         command = commands.add_parser(name, help=help_text)
@@ -3898,12 +3986,64 @@ def _run_command(args, path):
         return {"ok": True, **workflow_result}
 
     if args.command == "claim":
+        if args.resume_git and args.task is None:
+            raise QueueError("--resume-git requires --task")
+
+        git_observation = None
+        git_observation_error = None
+        try:
+            git_observation = gq.observe(Path.cwd())
+        except gq.GitContextError as error:
+            git_observation_error = error
+
+        if args.task is not None:
+            snapshot = read_queue_snapshot(path)
+            target = _user_operation(
+                lambda: _require_task(snapshot, args.task)
+            )
+            if target.get("git_mode") == "commit":
+                if git_observation is None:
+                    raise QueueError(
+                        f"{git_observation_error.code}: "
+                        f"{git_observation_error}"
+                    )
+                try:
+                    gq.require_claimable(git_observation)
+                except gq.GitContextError as error:
+                    raise QueueError(
+                        f"{error.code}: {error}"
+                    ) from error
+
         claim_result = user_mutation(
             lambda state: claim_task(
                 state, args.agent, role=args.role, labels=args.label,
                 lease_seconds=args.lease_seconds,
+                git_observation=git_observation,
+                task_id=args.task,
+                resume_git=args.resume_git,
             ),
         )
+        binding = claim_result["task"]["claim"].get("git")
+        if isinstance(binding, dict):
+            try:
+                current_observation = gq.observe(Path.cwd())
+                gq.assert_claim_snapshot(binding, current_observation)
+            except gq.GitContextError as error:
+                try:
+                    user_mutation(
+                        lambda state: release_task(
+                            state,
+                            claim_result["task"]["id"],
+                            args.agent,
+                            claim_result["lease_token"],
+                        )
+                    )
+                except QueueError as rollback_error:
+                    raise QueueError(
+                        f"{error.code}: {error}; "
+                        f"claim rollback failed: {rollback_error}"
+                    ) from rollback_error
+                raise QueueError(f"{error.code}: {error}") from error
         return {
             "ok": True,
             "task": _safe_task(claim_result["task"]),

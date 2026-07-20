@@ -156,3 +156,65 @@ def observe(cwd):
         "attached": branch is not None,
         "clean": not dirty,
     }
+
+
+def require_claimable(observation):
+    if not isinstance(observation, dict):
+        raise GitContextError(
+            "git_not_worktree", "Git-aware claim requires a worktree"
+        )
+    if not observation.get("attached") or not observation.get("branch"):
+        raise GitContextError(
+            "git_detached_head", "Git-aware claim requires an attached branch"
+        )
+    if not observation.get("clean"):
+        raise GitContextError(
+            "git_dirty", "Git-aware claim requires a clean worktree"
+        )
+    for field in (
+        "common_dir",
+        "worktree",
+        "repository_id",
+        "worktree_id",
+        "branch",
+        "head",
+    ):
+        if not isinstance(observation.get(field), str) or not observation[field]:
+            raise GitContextError(
+                "git_observation_invalid",
+                f"Git observation field {field} must be nonempty",
+            )
+    return observation
+
+
+def claim_binding(observation):
+    observed = require_claimable(observation)
+    return {
+        "common_dir": observed["common_dir"],
+        "worktree": observed["worktree"],
+        "repository_id": observed["repository_id"],
+        "worktree_id": observed["worktree_id"],
+        "branch": observed["branch"],
+        "base": observed["head"],
+    }
+
+
+def assert_claim_snapshot(binding, observation):
+    observed = require_claimable(observation)
+    expected = {
+        "repository_id": binding.get("repository_id"),
+        "worktree_id": binding.get("worktree_id"),
+        "branch": binding.get("branch"),
+        "head": binding.get("base"),
+    }
+    actual = {
+        "repository_id": observed["repository_id"],
+        "worktree_id": observed["worktree_id"],
+        "branch": observed["branch"],
+        "head": observed["head"],
+    }
+    if actual != expected:
+        raise GitContextError(
+            "git_claim_drift", "Git state changed while claiming the task"
+        )
+    return observed

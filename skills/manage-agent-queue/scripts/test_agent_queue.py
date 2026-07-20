@@ -227,6 +227,26 @@ def canonical_result(summary="done", artifacts=None, git=None):
     }
 
 
+def git_snapshot(
+    repository_id="repo-1",
+    worktree_id="wt-1",
+    branch="refs/heads/feature-a",
+    head="base-a",
+    clean=True,
+    attached=True,
+):
+    return {
+        "common_dir": "/private/repository/.git",
+        "worktree": f"/private/worktrees/{worktree_id}",
+        "repository_id": repository_id,
+        "worktree_id": worktree_id,
+        "branch": branch if attached else None,
+        "head": head,
+        "attached": attached,
+        "clean": clean,
+    }
+
+
 class QueueStateTests(unittest.TestCase):
     def test_new_state_has_versioned_monotonic_counters(self):
         state = aq.new_state("demo", aq.fixed_config())
@@ -1533,6 +1553,125 @@ class ClaimTaskTests(unittest.TestCase):
         self.assertEqual("leased", self.state["tasks"][holder["id"]]["status"])
         with self.assertRaises(aq.NoTaskAvailable):
             aq.claim_task(self.state, "worker-2", now=self.NOW)
+
+    def test_git_claim_requires_clean_attached_observation_and_stores_binding(self):
+        task = self.add(
+            "Git task",
+            git_mode="commit",
+            resources=["file:src/api.py"],
+        )
+
+        for observation, message in (
+            (git_snapshot(clean=False), "clean"),
+            (git_snapshot(attached=False), "attached"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(aq.InvariantError, message):
+                    aq.claim_task(
+                        self.state,
+                        "worker",
+                        now=self.NOW,
+                        git_observation=observation,
+                        task_id=task["id"],
+                    )
+
+        claimed = aq.claim_task(
+            self.state,
+            "worker",
+            now=self.NOW,
+            git_observation=git_snapshot(),
+            task_id=task["id"],
+        )
+        binding = claimed["task"]["claim"]["git"]
+        self.assertEqual("base-a", binding["base"])
+        self.assertEqual("repo-1", binding["repository_id"])
+        safe = aq._safe_task(claimed["task"])
+        serialized = json.dumps(safe)
+        self.assertNotIn("/private/repository", serialized)
+        self.assertNotIn("/private/worktrees", serialized)
+        self.assertNotIn(claimed["lease_token"], serialized)
+
+    def test_git_claim_blocks_derived_ownership_and_allows_disjoint_worktrees(self):
+        holder = self.add(
+            "Holder",
+            priority=100,
+            git_mode="commit",
+            resources=["dir:src/"],
+        )
+        aq.claim_task(
+            self.state,
+            "holder",
+            now=self.NOW,
+            git_observation=git_snapshot(),
+            task_id=holder["id"],
+        )
+
+        cases = (
+            (
+                "same worktree",
+                ["file:other.txt"],
+                git_snapshot(worktree_id="wt-1", branch="refs/heads/other"),
+            ),
+            (
+                "same branch",
+                ["file:other.txt"],
+                git_snapshot(worktree_id="wt-2"),
+            ),
+            (
+                "overlapping scope",
+                ["file:src/api.py"],
+                git_snapshot(
+                    worktree_id="wt-3",
+                    branch="refs/heads/feature-c",
+                ),
+            ),
+        )
+        for title, resources, observation in cases:
+            task = self.add(
+                title,
+                git_mode="commit",
+                resources=resources,
+            )
+            with self.subTest(title=title):
+                with self.assertRaises(aq.NoTaskAvailable):
+                    aq.claim_task(
+                        self.state,
+                        title,
+                        now=self.NOW,
+                        git_observation=observation,
+                        task_id=task["id"],
+                    )
+
+        disjoint = self.add(
+            "Disjoint",
+            git_mode="commit",
+            resources=["file:tests/api.py"],
+        )
+        claimed = aq.claim_task(
+            self.state,
+            "disjoint",
+            now=self.NOW,
+            git_observation=git_snapshot(
+                worktree_id="wt-4",
+                branch="refs/heads/feature-d",
+            ),
+            task_id=disjoint["id"],
+        )
+        self.assertEqual(disjoint["id"], claimed["task"]["id"])
+
+    def test_generic_claim_does_not_require_git_observation(self):
+        task = self.add("Generic")
+
+        claimed = aq.claim_task(
+            self.state,
+            "worker",
+            now=self.NOW,
+            git_observation=None,
+            task_id=task["id"],
+        )
+
+        self.assertEqual(task["id"], claimed["task"]["id"])
+        self.assertIsNone(claimed["task"]["claim"]["git"])
 
     def test_claim_eligibility_uses_boolean_resource_conflict_probe(self):
         self.add("Holder", priority=100, resources=["repo"])
@@ -4380,6 +4519,40 @@ class QueueCliTests(unittest.TestCase):
     def add(self, title="work", *extra):
         return self.json_output(self.cli("task", "add", "--title", title, *extra))
 
+    def make_git_repo(self):
+        root = Path(self.temporary.name) / "repo"
+        root.mkdir()
+        subprocess.run(
+            ["git", "-C", str(root), "init", "-b", "main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for key, value in (
+            ("user.name", "Queue CLI Tests"),
+            ("user.email", "queue-cli@example.test"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(root), "config", key, value],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        (root / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(root), "add", "base.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-m", "base"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return root
+
     def test_cli_init_creates_both_files_and_second_is_code_two_unchanged(self):
         output = self.init(lease_seconds=10, max_attempts=4, retry_backoff=2)
         self.assertTrue(output["ok"])
@@ -4711,6 +4884,75 @@ class QueueCliTests(unittest.TestCase):
         self.assertEqual("completed", complete["task"]["status"])
         none = self.cli("claim", "--agent", "b")
         self.assertEqual(3, none.returncode)
+
+    def test_cli_claim_binds_current_git_worktree_and_redacts_private_paths(self):
+        root = self.make_git_repo()
+        self.init()
+        task = self.add(
+            "Git claim",
+            "--git-commit",
+            "--resource",
+            "file:scoped.txt",
+        )["task"]
+
+        result = run_cli(
+            "--queue",
+            self.queue,
+            "claim",
+            "--agent",
+            "git-worker",
+            "--task",
+            task["id"],
+            cwd=root,
+        )
+        output = self.json_output(result)
+
+        self.assertEqual(task["id"], output["task"]["id"])
+        self.assertNotIn(str(root), result.stdout)
+        self.assertNotIn(str(root / ".git"), result.stdout)
+        self.assertEqual(
+            "refs/heads/main",
+            output["task"]["claim"]["git"]["branch"],
+        )
+        stored = aq.load_state(self.queue)["tasks"][task["id"]]
+        self.assertEqual(str(root.resolve()), stored["claim"]["git"]["worktree"])
+
+    def test_cli_claim_releases_lease_when_git_snapshot_drifts(self):
+        self.init()
+        task = self.add(
+            "Git claim drift",
+            "--git-commit",
+            "--resource",
+            "file:scoped.txt",
+        )["task"]
+        before = git_snapshot()
+        after = git_snapshot(head="changed-after-claim")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            aq.gq, "observe", side_effect=(before, after)
+        ), mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value="PRIVATE-LEASE-TOKEN"
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = aq.main([
+                "--queue",
+                str(self.queue),
+                "claim",
+                "--agent",
+                "git-worker",
+                "--task",
+                task["id"],
+            ])
+
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("git_claim_drift", stderr.getvalue())
+        self.assertNotIn("PRIVATE-LEASE-TOKEN", stderr.getvalue())
+        self.assertNotIn("/private/", stderr.getvalue())
+        stored = aq.load_state(self.queue)["tasks"][task["id"]]
+        self.assertEqual("pending", stored["status"])
+        self.assertIsNone(stored["claim"])
 
     def test_generated_dash_token_round_trips_as_separate_cli_argument(self):
         self.init()

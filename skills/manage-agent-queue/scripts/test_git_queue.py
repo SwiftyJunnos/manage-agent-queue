@@ -106,6 +106,39 @@ class GitObservationTests(GitRepositoryTestCase):
         self.assertFalse(detached["attached"])
         self.assertIsNone(detached["branch"])
 
+    def test_claim_binding_requires_clean_attached_state_and_tracks_base(self):
+        observed = gq.observe(self.root)
+
+        binding = gq.claim_binding(observed)
+
+        self.assertEqual(observed["head"], binding["base"])
+        self.assertNotIn("clean", binding)
+        self.assertNotIn("attached", binding)
+
+        for field, value, code in (
+            ("clean", False, "git_dirty"),
+            ("attached", False, "git_detached_head"),
+        ):
+            with self.subTest(field=field):
+                invalid = dict(observed)
+                invalid[field] = value
+                with self.assertRaises(gq.GitContextError) as raised:
+                    gq.claim_binding(invalid)
+                self.assertEqual(code, raised.exception.code)
+
+    def test_claim_snapshot_comparison_detects_head_and_identity_drift(self):
+        observed = gq.observe(self.root)
+        binding = gq.claim_binding(observed)
+        gq.assert_claim_snapshot(binding, observed)
+
+        for field in ("repository_id", "worktree_id", "branch", "head"):
+            with self.subTest(field=field):
+                changed = dict(observed)
+                changed[field] = "changed"
+                with self.assertRaises(gq.GitContextError) as raised:
+                    gq.assert_claim_snapshot(binding, changed)
+                self.assertEqual("git_claim_drift", raised.exception.code)
+
 
 if __name__ == "__main__":
     unittest.main()
