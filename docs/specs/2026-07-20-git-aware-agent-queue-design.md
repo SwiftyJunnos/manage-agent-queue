@@ -187,9 +187,9 @@ The no-change form stores identical base and head with zero commit and path coun
 
 ## Lease Expiry and Recovery
 
-Git is an external side effect, so lease expiry cannot assume that no commit occurred. When a Git-aware lease expires or is swept, the task returns to pending under the existing attempt and backoff rules and retains a private recovery binding containing the prior repository, worktree, branch, and base.
+Git is an external side effect, so lease expiry cannot assume that no commit occurred. When a Git-aware lease expires or is swept, the task follows the existing attempt and backoff rules and retains a private recovery binding containing the prior repository, worktree, branch, and base. The binding is preserved on both retryable `pending` tasks and attempt-exhausted `failed` tasks.
 
-After retry backoff, the task derives as `git_recovery` instead of `ready`. Ordinary `claim` skips it. A worker resumes it explicitly:
+After retry backoff, a pending task derives as `git_recovery` instead of `ready`. Ordinary `claim` skips it. If the task exhausted its attempts, the operator first uses the existing `retry` command; retry returns it to pending without clearing the recovery binding. A worker then resumes it explicitly:
 
 ```bash
 python3 scripts/agent_queue.py --queue "$QUEUE" claim \
@@ -211,7 +211,7 @@ Schema version 2 adds:
 
 - Task `git_mode`, either `null` or `"commit"`.
 - Optional private `git_binding` inside a live claim.
-- Optional private `git_recovery` on a pending task.
+- Optional private `git_recovery` on a pending or failed task; `retry` preserves it and terminal cancellation clears it.
 - Optional compact `git` evidence inside a completed result.
 - The derived `git_recovery` display state.
 
