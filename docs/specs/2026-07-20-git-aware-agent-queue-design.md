@@ -1,6 +1,6 @@
 # Git-Aware Agent Queue Design
 
-**Status:** Approved in conversation; awaiting review of this written specification  
+**Status:** Approved in conversation; awaiting review of this written specification
 **Date:** 2026-07-20
 
 ## Summary
@@ -210,7 +210,7 @@ A worker may not complete or publish using an expired token. Push remains outsid
 Schema version 2 adds:
 
 - Task `git_mode`, either `null` or `"commit"`.
-- Optional private `git_binding` inside a live claim.
+- Optional private `git` field inside a live claim.
 - Optional private `git_recovery` on a pending or failed task; `retry` preserves it and terminal cancellation clears it.
 - Required nullable `git` field inside every version-2 completed result: `null` for generic tasks and compact evidence for Git-aware tasks. Version-1 results retain their original two-field shape.
 - The derived `git_recovery` display state.

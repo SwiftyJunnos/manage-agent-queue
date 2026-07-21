@@ -148,15 +148,21 @@ With `"git_commit": true`, only each `shard` and `integrate` task becomes Git-aw
 
 Do not use overlapping resource names to force parallelism. Redesign the shards or use explicit dependencies when actual write scopes overlap. Generic resource keys protect exact matches. Git-aware resources additionally enforce `file:`/`dir:` boundaries and containment.
 
-Example shard completion:
+Example Git-aware shard completion after capturing `TASK_ID` and `TOKEN` from
+the workflow and claim outputs, then committing within the declared scope:
 
 ```bash
+RESULT_HEAD="$(git rev-parse HEAD)"
 python3 scripts/agent_queue.py --queue "$QUEUE" complete \
-  --task T-000001 --agent shard-http --token "$TOKEN" \
+  --task "$TASK_ID" --agent shard-http --token "$TOKEN" \
+  --commit "$RESULT_HEAD" \
   --summary "HTTP shard complete" \
   --artifact artifacts/http.diff \
   --artifact artifacts/http-tests.txt
 ```
+
+If the Git-aware shard made no changes and `HEAD` remains at the claimed base,
+use `--no-change` instead of `--commit "$RESULT_HEAD"`.
 
 ## Completion Checks
 
