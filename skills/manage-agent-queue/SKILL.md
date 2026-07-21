@@ -36,6 +36,18 @@ The dashboard is a read-only loopback view. Continue all queue mutations through
 6. Change decomposition, guidance, or review rules when the same failure pattern repeats.
 7. Finish only when required verification succeeds and no required task is failed or dependency-failed. Stop any dashboard server started by this session and verify it exited.
 
+## Use Git-Aware Ownership When Commits Are Required
+
+Opt in only for writer tasks that must produce commits. Add `--git-commit` and declare every writable path as canonical `file:path/to/file` or `dir:path/to/tree/` resources. Typed paths are the single scope source for both claim conflicts and completion validation.
+
+Claim a Git-aware task from its intended clean, attached worktree, preferably with `claim --task T-NNNNNN`. The queue binds repository, worktree, branch, and starting HEAD; it rejects the same worktree, same branch, or overlapping typed scope already held in that repository. Heartbeat before committing when the lease is near expiry. The queue does not create worktrees, make commits, merge, reset, or push.
+
+Complete with exactly one Git outcome: `complete ... --commit FULL_COMMIT_ID` after one or more scoped descendant commits, or `complete ... --no-change` while clean at the original HEAD. Persist only full base/head IDs and `commit_count`/`changed_path_count`; never store a changed-path list.
+
+If a Git lease expires, ordinary claim skips its `git_recovery` state. Inspect the surviving worktree and use `claim --task T-NNNNNN --resume-git`; this succeeds only for the same clean repository, worktree, and branch with unchanged or scoped descendant HEAD. A Git `release` is valid only before HEAD advances. Cancel and replace unrecoverable work without resetting Git through the queue.
+
+Version-1 queues remain generic. Run `migrate --to 2` explicitly before adding Git-aware work.
+
 ## Work a Claimed Task
 
 Follow `claim -> inspect scope -> work -> heartbeat -> complete/fail`. Refuse work outside the claimed task and declared exclusive resources. Claim before side effects; heartbeat before expiry; `release` abandoned work. Never publish after expiry. Store large outputs as artifacts; record concise summaries and paths.
@@ -49,9 +61,9 @@ Forbid self-review. Give reviewers the diff and acceptance criteria, not impleme
 | Need | Command |
 |---|---|
 | Create queue | `init` |
-| Add work | `task add`, `task add-batch`, `workflow add` |
-| Acquire work | `claim` |
-| Maintain/finish lease | `heartbeat`, `complete`, `fail`, `release` |
+| Add work | `task add`, `task add-batch`, `workflow add`; add `--git-commit` only for commit-producing writers |
+| Acquire work | `claim`; targeted recovery uses `--resume-git` |
+| Maintain/finish lease | `heartbeat`, `complete --commit`, `complete --no-change`, `fail`, `release` |
 | Observe live (after consent) | `serve --open` |
 | Observe in terminal | `status`, `events`, `export --format tsv` |
 | Recover/operate | `sweep`, `retry`, `block`, `unblock`, `cancel`, `doctor`, `compact` |
@@ -70,5 +82,8 @@ Run `python3 scripts/agent_queue.py --help` for flags.
 | Assign work only in coordinator notes | Make the worker atomically claim it. |
 | Edit JSON/TSV or maintain a manual table | Mutate through one CLI; read regenerated TSV. |
 | Use relative paths across worktrees | Pass the same explicit absolute queue path. |
+| Mark Git work without typed scope | Declare canonical `file:` or trailing-slash `dir:` resources. |
+| Treat a Git claim as a commit tool | Commit in the bound worktree; let the queue validate ownership and evidence. |
+| Reclaim expired Git work normally | Inspect it, then target it with `--resume-git`. |
 | Copy reviewer context between roles | Preserve the isolation boundaries above. |
 | Treat a lease as exactly-once execution | Make side effects idempotent and reject expired results. |

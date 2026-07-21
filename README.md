@@ -60,6 +60,8 @@ You do not need to invent a coordination format before using the skill.
 - **Atomic ownership** — workers claim before side effects and prove ownership with opaque lease tokens.
 - **Dependency order** — blocked tasks do not become eligible until their prerequisites finish successfully.
 - **Resource isolation** — exact resource keys prevent active workers from claiming overlapping scope.
+- **Git-aware ownership** — opt-in writer tasks bind a clean worktree, branch, starting HEAD, and typed `file:`/`dir:` scope.
+- **Compact commit evidence** — completion validates descendant commits and scope while persisting counts instead of changed-path lists.
 - **Lease discipline** — heartbeats extend live work; expired results are rejected instead of silently published.
 - **Role independence** — implementers, reviewers, appliers, and verifiers receive only the context their role needs.
 - **Observable recovery** — status, events, generated TSV, and diagnostics preserve a trail after interruption.
@@ -89,6 +91,36 @@ and continue only the tasks that are still eligible.
 
 When the skill offers live observation, approve it to open the read-only local dashboard. Decline it to keep progress in terminal `status` and `events` views.
 
+Git-aware CLI quick start:
+
+```bash
+QUEUE=/absolute/path/queue.json
+CLI="python3 skills/manage-agent-queue/scripts/agent_queue.py --queue $QUEUE"
+
+# New queues already use v2. Run this line only for an existing v1 queue.
+$CLI migrate --to 2
+
+TASK_ID="$(
+  $CLI task add --title "HTTP shard" --git-commit \
+    --resource file:src/http.py --resource dir:tests/http/ |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["task"]["id"])'
+)"
+TOKEN="$(
+  $CLI claim --agent shard-http --task "$TASK_ID" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["lease_token"])'
+)"
+
+# After committing within the declared scope:
+RESULT_HEAD="$(git rev-parse HEAD)"
+$CLI complete --task "$TASK_ID" --agent shard-http \
+  --token "$TOKEN" --commit "$RESULT_HEAD" --summary "HTTP shard complete"
+
+# Optional manual dashboard launch, only after approving the local browser view:
+$CLI serve --open
+```
+
+Git-aware work is explicit: add `--git-commit` with canonical `file:path` or `dir:path/` resources, claim from the intended clean worktree, then complete with `--commit FULL_COMMIT_ID` or `--no-change`. Expired Git work requires targeted `--resume-git`; the queue validates ownership but does not create worktrees, commit, merge, reset, or push.
+
 ## Outputs
 
 The skill maintains a compact local coordination record:
@@ -96,6 +128,7 @@ The skill maintains a compact local coordination record:
 - `queue.json` as the authoritative state;
 - `queue.tsv` as a generated human-readable projection;
 - sanitized events for progress and recovery history;
+- compact Git base/head and commit/path counts for opted-in writer tasks;
 - task artifacts referenced by path instead of embedded as large queue payloads;
 - explicit completion, failure, blocking, retry, and cancellation states.
 
@@ -111,6 +144,7 @@ skills/manage-agent-queue/
 │   └── workflow-templates.md
 └── scripts/
     ├── agent_queue.py
+    ├── git_queue.py
     ├── queue_dashboard.py
     └── dashboard/
 ```
@@ -126,7 +160,7 @@ skills/manage-agent-queue/
 | Live dashboard | Optional browser access to a loopback-only read-only view |
 | Agent execution | A separate agent runtime that can dispatch and supervise workers |
 
-Version 1 is designed for one machine and a local filesystem. It is not a distributed lock service, and assignment remains at-least-once—external side effects must be idempotent.
+Schema version 2 adds opt-in Git-aware tasks while retaining version-1 generic queues through explicit migration. The runtime is designed for one machine and a local filesystem. It is not a distributed lock service, and assignment remains at-least-once—external side effects must be idempotent.
 
 ## Install and update
 

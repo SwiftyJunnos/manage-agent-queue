@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import git_queue as gq
+
 try:
     import fcntl as _fcntl
 except ImportError:  # pragma: no cover - exercised by isolated import test
@@ -39,7 +41,8 @@ else:
     LOCK_BACKEND = None
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
 MAX_ID_SEQUENCE = 999_999
 MAX_JSON_METADATA_DEPTH = 64
 MAX_TEXT_BYTES = 16 * 1024
@@ -56,6 +59,7 @@ DERIVED_STATUSES = {
     "waiting_dependency",
     "dependency_failed",
     "waiting_retry",
+    "git_recovery",
     "resource_conflict",
     "leased",
 }
@@ -63,7 +67,10 @@ STATUS_FILTER_STATES = tuple(sorted(STORED_STATUSES | DERIVED_STATUSES))
 GUARD_MARKER = b"LQG1"
 TASK_ID_PATTERN = re.compile(r"T-(\d{6})", flags=re.ASCII)
 WORKFLOW_ID_PATTERN = re.compile(r"W-(\d{6})", flags=re.ASCII)
-TASK_FIELDS = {
+GIT_OBJECT_ID_PATTERN = re.compile(
+    r"(?:[0-9a-f]{40}|[0-9a-f]{64})", flags=re.ASCII
+)
+TASK_FIELDS_V1 = frozenset({
     "id",
     "workflow_id",
     "role",
@@ -82,8 +89,9 @@ TASK_FIELDS = {
     "last_error",
     "created_at",
     "updated_at",
-}
-TASK_CREATION_FIELDS = {
+})
+TASK_FIELDS_V2 = TASK_FIELDS_V1 | {"git_mode", "git_recovery"}
+TASK_CREATION_FIELDS_V1 = frozenset({
     "id",
     "workflow_id",
     "role",
@@ -94,14 +102,29 @@ TASK_CREATION_FIELDS = {
     "resources",
     "labels",
     "max_attempts",
-}
-CLAIM_FIELDS = {
+})
+TASK_CREATION_FIELDS_V2 = TASK_CREATION_FIELDS_V1 | {"git_mode"}
+CLAIM_FIELDS_V1 = frozenset({
     "agent_id",
     "lease_token",
     "claimed_at",
     "heartbeat_at",
     "expires_at",
-}
+})
+CLAIM_FIELDS_V2 = CLAIM_FIELDS_V1 | {"git"}
+GIT_BINDING_FIELDS = frozenset(
+    {
+        "common_dir",
+        "worktree",
+        "repository_id",
+        "worktree_id",
+        "branch",
+        "base",
+    }
+)
+GIT_EVIDENCE_FIELDS = frozenset(
+    {"branch", "base", "head", "commit_count", "changed_path_count"}
+)
 EVENT_FIELDS = {
     "seq",
     "at",
@@ -551,13 +574,63 @@ def _validate_bounded_text(value, field, *, nonempty=False):
     return value
 
 
+def _validate_git_evidence(evidence, field="Git evidence"):
+    if not isinstance(evidence, dict) or set(evidence) != GIT_EVIDENCE_FIELDS:
+        raise InvariantError(f"{field} keys must match the compact schema")
+    branch = evidence["branch"]
+    if not isinstance(branch, str) or not branch.startswith("refs/heads/"):
+        raise InvariantError(f"{field}.branch must name an attached branch")
+    for name in ("base", "head"):
+        value = evidence[name]
+        if (
+            not isinstance(value, str)
+            or GIT_OBJECT_ID_PATTERN.fullmatch(value) is None
+        ):
+            raise InvariantError(
+                f"{field}.{name} must be a full Git object ID"
+            )
+    for name in ("commit_count", "changed_path_count"):
+        value = evidence[name]
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise InvariantError(f"{field}.{name} must be nonnegative")
+    if evidence["base"] == evidence["head"]:
+        if evidence["commit_count"] != 0 or evidence["changed_path_count"] != 0:
+            raise InvariantError(
+                f"{field} no-change counts must both be zero"
+            )
+    elif evidence["commit_count"] < 1:
+        raise InvariantError(
+            f"{field}.commit_count must be positive when HEAD advances"
+        )
+    return evidence
+
+
+def _validate_git_binding(binding, field="Git binding"):
+    if not isinstance(binding, dict) or set(binding) != GIT_BINDING_FIELDS:
+        raise InvariantError(f"{field} fields must match the binding schema")
+    for name in GIT_BINDING_FIELDS:
+        if not isinstance(binding[name], str) or not binding[name]:
+            raise InvariantError(f"{field}.{name} must be nonempty")
+    return binding
+
+
 def normalize_task(state, raw):
     """Create a canonical pending task from generic task input."""
     if not isinstance(raw, dict):
         raise InvariantError("task must be an object")
     if any(not isinstance(field, str) for field in raw):
         raise InvariantError("task creation input must use string field names")
-    unknown_fields = sorted(set(raw).difference(TASK_CREATION_FIELDS))
+    schema_version = state["schema_version"]
+    creation_fields = (
+        TASK_CREATION_FIELDS_V1
+        if schema_version == 1
+        else TASK_CREATION_FIELDS_V2
+    )
+    unknown_fields = sorted(set(raw).difference(creation_fields))
     if unknown_fields:
         raise InvariantError(
             f"unknown task creation fields: {', '.join(unknown_fields)}"
@@ -604,6 +677,18 @@ def normalize_task(state, raw):
     resources = _deduplicated_string_list(
         raw.get("resources", []), "task resources"
     )
+    git_mode = raw.get("git_mode") if schema_version == 2 else None
+    if git_mode not in (None, "commit"):
+        raise InvariantError("task git_mode must be commit or null")
+    if git_mode == "commit":
+        try:
+            scopes = gq.path_scopes(resources)
+        except gq.GitContextError as error:
+            raise InvariantError(str(error)) from error
+        if not scopes:
+            raise InvariantError(
+                "Git-aware task requires a file: or dir: resource"
+            )
     labels = _deduplicated_string_list(raw.get("labels", []), "task labels")
     task_id = reserve_task_id(state, raw.get("id"))
     now = utc_now()
@@ -627,7 +712,14 @@ def normalize_task(state, raw):
         "created_at": now,
         "updated_at": now,
     }
-    validate_task(task, expected_id=task_id)
+    if schema_version == 2:
+        task["git_mode"] = git_mode
+        task["git_recovery"] = None
+    validate_task(
+        task,
+        expected_id=task_id,
+        schema_version=schema_version,
+    )
     return task
 
 
@@ -670,14 +762,18 @@ def _json_validation_error(value):
     return None
 
 
-def validate_task(task, expected_id=None):
+def validate_task(task, expected_id=None, schema_version=SCHEMA_VERSION):
     """Validate one stored task's exact canonical schema."""
     if not isinstance(task, dict):
         raise InvariantError("task must be an object")
     if any(not isinstance(field, str) for field in task):
         raise InvariantError("task field names must be strings")
-    missing_fields = sorted(TASK_FIELDS.difference(task))
-    extra_fields = sorted(set(task).difference(TASK_FIELDS))
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise InvariantError(f"unsupported task schema version: {schema_version}")
+    task_fields = TASK_FIELDS_V1 if schema_version == 1 else TASK_FIELDS_V2
+    claim_fields = CLAIM_FIELDS_V1 if schema_version == 1 else CLAIM_FIELDS_V2
+    missing_fields = sorted(task_fields.difference(task))
+    extra_fields = sorted(set(task).difference(task_fields))
     if missing_fields or extra_fields:
         details = []
         if missing_fields:
@@ -719,6 +815,21 @@ def validate_task(task, expected_id=None):
     if not isinstance(task["priority"], int) or isinstance(task["priority"], bool):
         raise InvariantError("task priority must be an integer")
 
+    if schema_version == 2:
+        if task["git_mode"] not in (None, "commit"):
+            raise InvariantError("task git_mode must be commit or null")
+        recovery = task["git_recovery"]
+        if recovery is not None:
+            if task["git_mode"] != "commit":
+                raise InvariantError(
+                    "task git_recovery requires git_mode commit"
+                )
+            if task["status"] not in {"pending", "failed"}:
+                raise InvariantError(
+                    "task git_recovery requires pending or failed status"
+                )
+            _validate_git_binding(recovery, "task git_recovery")
+
     for field in ("depends_on", "resources", "labels"):
         values = task[field]
         canonical = _deduplicated_string_list(values, f"task {field}")
@@ -757,8 +868,8 @@ def validate_task(task, expected_id=None):
     if task["status"] == "leased":
         if claim is None:
             raise InvariantError("leased task claim must be an object")
-        missing_claim_fields = sorted(CLAIM_FIELDS.difference(claim))
-        extra_claim_fields = sorted(set(claim).difference(CLAIM_FIELDS))
+        missing_claim_fields = sorted(claim_fields.difference(claim))
+        extra_claim_fields = sorted(set(claim).difference(claim_fields))
         if missing_claim_fields or extra_claim_fields:
             raise InvariantError("task claim keys must match the lease schema")
         for field in ("agent_id", "lease_token"):
@@ -778,6 +889,14 @@ def validate_task(task, expected_id=None):
             )
         if attempts < 1:
             raise InvariantError("leased task attempts must be at least 1")
+        if schema_version == 2:
+            if task["git_mode"] is None and claim["git"] is not None:
+                raise InvariantError("generic task claim.git must be null")
+            if task["git_mode"] == "commit" and claim["git"] is None:
+                raise InvariantError("Git-aware task claim.git must be an object")
+            if task["git_mode"] == "commit":
+                git_binding = claim["git"]
+                _validate_git_binding(git_binding, "task claim.git")
     elif claim is not None:
         raise InvariantError("non-leased task claim must be null")
 
@@ -788,8 +907,15 @@ def validate_task(task, expected_id=None):
     elif result is not None:
         raise InvariantError("task result must be null unless status is completed")
     if result is not None:
-        if set(result) != {"summary", "artifacts"}:
-            raise InvariantError("task result keys must be summary and artifacts")
+        result_fields = (
+            {"summary", "artifacts"}
+            if schema_version == 1
+            else {"summary", "artifacts", "git"}
+        )
+        if set(result) != result_fields:
+            raise InvariantError(
+                "task result keys must match the schema version"
+            )
         if not isinstance(result["summary"], str) or not result["summary"]:
             raise InvariantError("task result.summary must be a nonempty string")
         _validate_bounded_text(
@@ -803,6 +929,20 @@ def validate_task(task, expected_id=None):
             raise InvariantError(
                 "task result.artifacts must be a list of nonempty strings"
             )
+        if schema_version == 2:
+            git_result = result["git"]
+            if task["git_mode"] is None and git_result is not None:
+                raise InvariantError("generic task result.git must be null")
+            if task["git_mode"] == "commit" and not isinstance(
+                git_result, dict
+            ):
+                raise InvariantError(
+                    "Git-aware task result.git must be an object"
+                )
+            if task["git_mode"] == "commit":
+                _validate_git_evidence(
+                    git_result, "task result.git"
+                )
 
     last_error = task["last_error"]
     if last_error is not None:
@@ -986,7 +1126,13 @@ def _commit_workflow(state, raw_tasks, template, details, now):
 
 
 def add_adversarial_review(
-    state, title, priority, resources, reviewer_count, now=None
+    state,
+    title,
+    priority,
+    resources,
+    reviewer_count,
+    git_commit=False,
+    now=None,
 ):
     """Atomically add an implement-review-apply-verify workflow."""
     validate_state(state)
@@ -1005,6 +1151,8 @@ def add_adversarial_review(
         or reviewer_count <= 0
     ):
         raise InvariantError("reviewer_count must be a positive integer")
+    if not isinstance(git_commit, bool):
+        raise InvariantError("git_commit must be a boolean")
 
     task_count = reviewer_count + 3
     workflow_id, task_ids = _workflow_ids(state, task_count)
@@ -1021,6 +1169,7 @@ def add_adversarial_review(
         "priority": priority,
         "depends_on": [],
         "resources": list(resources),
+        **({"git_mode": "commit"} if git_commit else {}),
     }]
     raw_tasks.extend({
         "id": review_id,
@@ -1046,6 +1195,7 @@ def add_adversarial_review(
             "priority": priority - 20,
             "depends_on": review_ids,
             "resources": list(resources),
+            **({"git_mode": "commit"} if git_commit else {}),
         },
         {
             "id": task_ids[-1],
@@ -1062,17 +1212,29 @@ def add_adversarial_review(
         state,
         raw_tasks,
         "adversarial-review",
-        {"reviewer_count": reviewer_count},
+        {
+            "reviewer_count": reviewer_count,
+            **({"git_commit": True} if git_commit else {}),
+        },
         now,
     )
 
 
-def add_parallel_shards(state, title, priority, shard_resources, now=None):
+def add_parallel_shards(
+    state,
+    title,
+    priority,
+    shard_resources,
+    git_commit=False,
+    now=None,
+):
     """Atomically add parallel resource shards followed by integration."""
     validate_state(state)
     title = _workflow_title_priority(title, priority)
     if not isinstance(shard_resources, list) or not shard_resources:
         raise InvariantError("shard_resources must be a nonempty list")
+    if not isinstance(git_commit, bool):
+        raise InvariantError("git_commit must be a boolean")
     normalized_shards = []
     seen_resources = set()
     for shard in shard_resources:
@@ -1091,6 +1253,19 @@ def add_parallel_shards(state, title, priority, shard_resources, now=None):
             raise InvariantError(
                 f"resource appears in more than one shard: {duplicate}"
             )
+        if git_commit:
+            overlapping = next(
+                (
+                    prior
+                    for prior in normalized_shards
+                    if gq.resources_overlap(prior, normalized)
+                ),
+                None,
+            )
+            if overlapping is not None:
+                raise InvariantError(
+                    "Git-aware shard path resources overlap"
+                )
         seen_resources.update(normalized)
         normalized_shards.append(normalized)
 
@@ -1110,6 +1285,7 @@ def add_parallel_shards(state, title, priority, shard_resources, now=None):
         "priority": priority,
         "depends_on": [],
         "resources": shard,
+        **({"git_mode": "commit"} if git_commit else {}),
     } for index, (task_id, shard) in enumerate(
         zip(shard_ids, normalized_shards), start=1
     )]
@@ -1123,6 +1299,7 @@ def add_parallel_shards(state, title, priority, shard_resources, now=None):
             "priority": priority - 10,
             "depends_on": shard_ids,
             "resources": flattened_resources,
+            **({"git_mode": "commit"} if git_commit else {}),
         },
         {
             "id": task_ids[-1],
@@ -1139,7 +1316,10 @@ def add_parallel_shards(state, title, priority, shard_resources, now=None):
         state,
         raw_tasks,
         "parallel-shards",
-        {"shard_count": shard_count},
+        {
+            "shard_count": shard_count,
+            **({"git_commit": True} if git_commit else {}),
+        },
         now,
     )
 
@@ -1164,6 +1344,35 @@ def new_state(queue_id, config):
         "events": [],
     }
     return validate_state(state)
+
+
+def migrate_state(state, target_version, now=None):
+    """Atomically transform a valid version-1 candidate into version 2."""
+    validate_state(state)
+    if state["schema_version"] != 1 or target_version != 2:
+        raise InvariantError("only schema version 1 can migrate to 2")
+    now = _canonical_now(now)
+    candidate = copy.deepcopy(state)
+    for task in candidate["tasks"].values():
+        task["git_mode"] = None
+        task["git_recovery"] = None
+        if task["status"] == "leased":
+            task["claim"]["git"] = None
+        if task["status"] == "completed":
+            task["result"]["git"] = None
+    candidate["schema_version"] = 2
+    _append_event_to_candidate(
+        candidate,
+        "queue.migrated",
+        "operator",
+        None,
+        {"from": 1, "to": 2},
+        now,
+    )
+    validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+    return {"from": 1, "to": 2}
 
 
 def validate_state(state):
@@ -1197,10 +1406,12 @@ def validate_state(state):
     if (
         not isinstance(state["schema_version"], int)
         or isinstance(state["schema_version"], bool)
-        or state["schema_version"] != SCHEMA_VERSION
+        or state["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS
     ):
         raise InvariantError(
-            f"schema_version must be {SCHEMA_VERSION}, got {state['schema_version']!r}"
+            "schema_version must be one of "
+            f"{sorted(SUPPORTED_SCHEMA_VERSIONS)}, "
+            f"got {state['schema_version']!r}"
         )
     if not isinstance(state["queue_id"], str) or not state["queue_id"].strip():
         raise InvariantError("queue_id must be a non-blank string")
@@ -1273,7 +1484,11 @@ def validate_state(state):
     maximum_task_id = None
     maximum_workflow_id = None
     for task_id, task in state["tasks"].items():
-        validate_task(task, expected_id=task_id)
+        validate_task(
+            task,
+            expected_id=task_id,
+            schema_version=state["schema_version"],
+        )
         task_sequence = int(TASK_ID_PATTERN.fullmatch(task_id).group(1))
         if task_sequence > maximum_task_sequence:
             maximum_task_sequence = task_sequence
@@ -1554,6 +1769,8 @@ def _derive_state_with_resources(
         return "waiting_dependency"
     if task["available_at"] is not None and task["available_at"] > now:
         return "waiting_retry"
+    if task.get("git_recovery") is not None:
+        return "git_recovery"
     if resource_conflict_probe is None:
         resource_conflict_probe = _resource_conflicts
     if resource_conflict_probe(task, active_resources):
@@ -1567,6 +1784,27 @@ def derive_state(state, task, now):
     return _derive_state_with_resources(state, task, now, active_resources)
 
 
+def _has_git_claim_conflict(state, task, observation, now):
+    for active in state["tasks"].values():
+        if active["status"] != "leased" or active["id"] == task["id"]:
+            continue
+        claim = active.get("claim")
+        if not isinstance(claim, dict) or claim["expires_at"] <= now:
+            continue
+        binding = claim.get("git")
+        if not isinstance(binding, dict):
+            continue
+        if binding["worktree_id"] == observation["worktree_id"]:
+            return True
+        if binding["repository_id"] != observation["repository_id"]:
+            continue
+        if binding["branch"] == observation["branch"]:
+            return True
+        if gq.resources_overlap(active["resources"], task["resources"]):
+            return True
+    return False
+
+
 def claim_task(
     state,
     agent_id,
@@ -1574,6 +1812,10 @@ def claim_task(
     role=None,
     labels=None,
     lease_seconds=None,
+    git_observation=None,
+    task_id=None,
+    resume_git=False,
+    git_resume=None,
 ):
     """Claim the highest-priority eligible task with an in-memory lease."""
     validate_state(state)
@@ -1585,6 +1827,22 @@ def claim_task(
         not isinstance(role, str) or not role.strip()
     ):
         raise InvariantError("role must be a non-blank string or null")
+    if task_id is not None:
+        _task_id_sequence(task_id)
+        if task_id not in state["tasks"]:
+            raise InvariantError(f"task not found: {task_id}")
+    if not isinstance(resume_git, bool):
+        raise InvariantError("resume_git must be a boolean")
+    if resume_git and task_id is None:
+        raise InvariantError("resume_git requires task_id")
+    if git_resume is not None and not resume_git:
+        raise InvariantError("git_resume requires resume_git")
+    if resume_git:
+        target = state["tasks"][task_id]
+        if target.get("git_mode") != "commit":
+            raise InvariantError("resume_git requires a Git-aware task")
+        if not isinstance(target.get("git_recovery"), dict):
+            raise InvariantError("Git recovery binding is required")
     if labels is None:
         required_labels = set()
     elif isinstance(labels, (list, set)):
@@ -1605,6 +1863,8 @@ def claim_task(
     active_resources = leased_resources(state, now=now)
     eligible = []
     for task in state["tasks"].values():
+        if task_id is not None and task["id"] != task_id:
+            continue
         if role is not None and task["role"] != role:
             continue
         if not required_labels.issubset(task["labels"]):
@@ -1613,17 +1873,44 @@ def claim_task(
             continue
         if task["updated_at"] > now:
             continue
-        if (
-            _derive_state_with_resources(
-                state,
-                task,
-                now,
-                active_resources,
-                resource_conflict_probe=_has_resource_conflict,
-            )
-            != "ready"
-        ):
+        derived = _derive_state_with_resources(
+            state,
+            task,
+            now,
+            active_resources,
+            resource_conflict_probe=_has_resource_conflict,
+        )
+        expected_state = "git_recovery" if resume_git else "ready"
+        if derived != expected_state:
             continue
+        if task.get("git_mode") == "commit":
+            try:
+                gq.require_claimable(git_observation)
+            except gq.GitContextError as error:
+                if task_id is not None:
+                    raise InvariantError(str(error)) from error
+                continue
+            if resume_git:
+                recovery = task["git_recovery"]
+                if (
+                    not isinstance(git_resume, dict)
+                    or set(git_resume) != {"binding", "head"}
+                    or git_resume["binding"] != recovery
+                    or git_resume["head"] != git_observation.get("head")
+                ):
+                    raise InvariantError(
+                        "Git recovery validation does not match current state"
+                    )
+                try:
+                    gq.assert_same_binding(recovery, git_observation)
+                except gq.GitContextError as error:
+                    raise InvariantError(str(error)) from error
+            if _has_git_claim_conflict(
+                state, task, git_observation, now
+            ):
+                continue
+        elif resume_git:
+            raise InvariantError("resume_git requires a Git-aware task")
         eligible.append(task)
     if not eligible:
         raise NoTaskAvailable("no task is available")
@@ -1650,13 +1937,29 @@ def claim_task(
         "heartbeat_at": now,
         "expires_at": expires_at,
     }
+    if candidate["schema_version"] == 2:
+        if claimed["git_mode"] == "commit":
+            claimed["claim"]["git"] = (
+                copy.deepcopy(claimed["git_recovery"])
+                if resume_git
+                else gq.claim_binding(git_observation)
+            )
+            claimed["git_recovery"] = None
+        else:
+            claimed["claim"]["git"] = None
     claimed["updated_at"] = now
+    event_details = {
+        "lease_seconds": lease_seconds,
+        "attempt": claimed["attempts"],
+    }
+    if resume_git:
+        event_details["resumed_git"] = True
     append_event(
         candidate,
         "task.claimed",
         agent_id,
         claimed["id"],
-        {"lease_seconds": lease_seconds, "attempt": claimed["attempts"]},
+        event_details,
         now,
     )
     validate_state(candidate)
@@ -1801,12 +2104,25 @@ def complete_task(
     token,
     summary,
     artifacts,
+    git_evidence=None,
     now=None,
 ):
     """Complete a live leased task with an exact result payload."""
     validate_state(state)
     _validate_text(summary, "summary")
     _validate_artifacts(artifacts)
+    task = state["tasks"].get(task_id)
+    if task is not None:
+        if task.get("git_mode") == "commit":
+            if git_evidence is None:
+                raise InvariantError(
+                    "Git-aware completion requires Git evidence"
+                )
+            _validate_git_evidence(git_evidence)
+        elif git_evidence is not None:
+            raise InvariantError(
+                "generic task completion must not include Git evidence"
+            )
     now = _canonical_now(now)
     _require_lease_live(state, task_id, agent_id, token, now)
 
@@ -1817,22 +2133,41 @@ def complete_task(
         "summary": summary,
         "artifacts": copy.deepcopy(artifacts),
     }
+    if candidate["schema_version"] == 2:
+        task["result"]["git"] = copy.deepcopy(git_evidence)
+        task["git_recovery"] = None
     task["claim"] = None
     task["available_at"] = None
     task["updated_at"] = now
+    event_details = {"artifact_count": len(artifacts)}
+    if git_evidence is not None:
+        event_details.update(
+            {
+                "commit_count": git_evidence["commit_count"],
+                "changed_path_count": git_evidence["changed_path_count"],
+            }
+        )
     append_event(
         candidate,
         "task.completed",
         agent_id,
         task_id,
-        {"artifact_count": len(artifacts)},
+        event_details,
         now,
     )
     return _commit_transition(state, candidate, task_id)
 
 
+def _preserve_git_recovery(task):
+    claim = task.get("claim")
+    binding = claim.get("git") if isinstance(claim, dict) else None
+    if task.get("git_mode") == "commit" and isinstance(binding, dict):
+        task["git_recovery"] = copy.deepcopy(binding)
+
+
 def apply_retry_rule(state, task, message, now):
     """Apply the queue's retry policy to a failed leased attempt."""
+    _preserve_git_recovery(task)
     task["claim"] = None
     task["last_error"] = {"message": message, "at": now}
     if task["attempts"] < task["max_attempts"]:
@@ -1976,6 +2311,8 @@ def block_task(state, task_id, reason, now=None):
     task = _require_task(state, task_id)
     if task["status"] != "pending":
         raise InvariantError("only a pending task can be blocked")
+    if task.get("git_recovery") is not None:
+        raise InvariantError("Git recovery task cannot be blocked")
     _require_monotonic_task_time(task, now)
 
     candidate = copy.deepcopy(state)
@@ -2174,6 +2511,8 @@ def cancel_task(state, task_id, now=None):
     task["status"] = "cancelled"
     task["available_at"] = None
     task["claim"] = None
+    if candidate["schema_version"] == 2:
+        task["git_recovery"] = None
     task["updated_at"] = now
     append_event(
         candidate, "task.cancelled", "operator", task_id, {}, now
@@ -3303,6 +3642,14 @@ def _safe_task(task):
     safe = copy.deepcopy(task)
     if isinstance(safe.get("claim"), dict):
         safe["claim"].pop("lease_token", None)
+        binding = safe["claim"].get("git")
+        if isinstance(binding, dict):
+            binding.pop("common_dir", None)
+            binding.pop("worktree", None)
+    recovery = safe.get("git_recovery")
+    if isinstance(recovery, dict):
+        recovery.pop("common_dir", None)
+        recovery.pop("worktree", None)
     return safe
 
 
@@ -3376,6 +3723,7 @@ def _task_input_from_args(args):
             args.resource,
             args.label,
             args.max_attempts,
+            args.git_commit,
         )
         if any(value not in (None, []) for value in direct_values):
             raise QueueError("--from-json cannot be combined with task fields")
@@ -3395,6 +3743,7 @@ def _task_input_from_args(args):
         "resources": args.resource,
         "labels": args.label,
         "max_attempts": args.max_attempts,
+        "git_mode": "commit" if args.git_commit else None,
     }
     raw.update({key: value for key, value in mappings.items() if value is not None})
     return raw
@@ -3405,7 +3754,7 @@ def _parallel_workflow_input(path):
     if not isinstance(raw, dict):
         raise QueueError("parallel-shards JSON input must be an object")
     required = {"title", "shards"}
-    allowed = required | {"priority"}
+    allowed = required | {"priority", "git_commit"}
     missing = sorted(required.difference(raw))
     unknown = sorted(set(raw).difference(allowed))
     if missing:
@@ -3416,6 +3765,8 @@ def _parallel_workflow_input(path):
         raise QueueError(
             f"parallel-shards JSON input has unknown keys: {', '.join(unknown)}"
         )
+    if "git_commit" in raw and not isinstance(raw["git_commit"], bool):
+        raise QueueError("parallel-shards git_commit must be a boolean")
     return raw
 
 
@@ -3430,6 +3781,9 @@ def build_parser():
     init.add_argument("--max-attempts", type=_positive)
     init.add_argument("--retry-backoff", type=_positive)
 
+    migrate = commands.add_parser("migrate", help="migrate queue schema")
+    migrate.add_argument("--to", type=int, choices=(2,), required=True)
+
     task = commands.add_parser("task", help="manage tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True)
     add = task_commands.add_parser("add", help="add one task")
@@ -3442,6 +3796,7 @@ def build_parser():
     add.add_argument("--resource", action="append")
     add.add_argument("--label", action="append")
     add.add_argument("--max-attempts", type=_positive)
+    add.add_argument("--git-commit", action="store_const", const=True)
     add.add_argument("--from-json")
     add_batch_parser = task_commands.add_parser(
         "add-batch", help="add a JSON task batch"
@@ -3466,6 +3821,7 @@ def build_parser():
     workflow_add.add_argument("--priority", type=int)
     workflow_add.add_argument("--resource", action="append")
     workflow_add.add_argument("--reviewers", type=_positive)
+    workflow_add.add_argument("--git-commit", action="store_const", const=True)
     workflow_add.add_argument("--from-json")
 
     claim = commands.add_parser("claim", help="claim eligible work")
@@ -3473,6 +3829,8 @@ def build_parser():
     claim.add_argument("--role")
     claim.add_argument("--label", action="append")
     claim.add_argument("--lease-seconds", type=_positive)
+    claim.add_argument("--task")
+    claim.add_argument("--resume-git", action="store_true")
 
     def lease_parser(name, help_text):
         command = commands.add_parser(name, help=help_text)
@@ -3486,6 +3844,9 @@ def build_parser():
     complete = lease_parser("complete", "complete a task")
     complete.add_argument("--summary", required=True)
     complete.add_argument("--artifact", action="append", default=[])
+    completion = complete.add_mutually_exclusive_group()
+    completion.add_argument("--commit")
+    completion.add_argument("--no-change", action="store_true")
     fail = lease_parser("fail", "fail a task")
     fail.add_argument("--error", required=True)
     fail.add_argument("--terminal", action="store_true")
@@ -3626,6 +3987,15 @@ def _run_command(args, path):
             "next_actions": ["serve --open", "status"],
         }
 
+    if args.command == "migrate":
+        summary = mutate_queue(
+            path,
+            lambda state: migrate_state(state, args.to),
+            auto_sweep=False,
+            user_input_errors=True,
+        )
+        return {"ok": True, **summary}
+
     if args.command == "doctor":
         return doctor(path, repair=args.repair)
 
@@ -3696,6 +4066,7 @@ def _run_command(args, path):
                     0 if args.priority is None else args.priority,
                     [] if args.resource is None else args.resource,
                     2 if args.reviewers is None else args.reviewers,
+                    git_commit=bool(args.git_commit),
                     now=utc_now(),
                 )
             )
@@ -3703,7 +4074,11 @@ def _run_command(args, path):
             if args.from_json is None:
                 raise QueueError("parallel-shards requires --from-json")
             if any(value is not None for value in (
-                args.title, args.priority, args.resource, args.reviewers
+                args.title,
+                args.priority,
+                args.resource,
+                args.reviewers,
+                args.git_commit,
             )):
                 raise QueueError(
                     "parallel-shards --from-json cannot be combined with "
@@ -3716,18 +4091,113 @@ def _run_command(args, path):
                     raw["title"],
                     raw.get("priority", 0),
                     raw["shards"],
+                    git_commit=raw.get("git_commit", False),
                     now=utc_now(),
                 )
             )
         return {"ok": True, **workflow_result}
 
     if args.command == "claim":
+        if args.resume_git and args.task is None:
+            raise QueueError("--resume-git requires --task")
+
+        git_observation = None
+        git_observation_error = None
+        try:
+            git_observation = gq.observe(Path.cwd())
+        except gq.GitContextError as error:
+            git_observation_error = error
+
+        git_resume = None
+        if args.task is not None:
+            snapshot = read_queue_snapshot(path)
+            target = _user_operation(
+                lambda: _require_task(snapshot, args.task)
+            )
+            if args.resume_git and target.get("git_mode") != "commit":
+                raise QueueError(
+                    "--resume-git requires a Git-aware task"
+                )
+            if target.get("git_mode") == "commit":
+                if git_observation is None:
+                    raise QueueError(
+                        f"{git_observation_error.code}: "
+                        f"{git_observation_error}"
+                    )
+                try:
+                    gq.require_claimable(git_observation)
+                except gq.GitContextError as error:
+                    raise QueueError(
+                        f"{error.code}: {error}"
+                    ) from error
+                recovery = target.get("git_recovery")
+                if args.resume_git:
+                    if not isinstance(recovery, dict):
+                        raise QueueError(
+                            "git_recovery_required: task has no Git recovery binding"
+                        )
+                    try:
+                        git_resume = gq.validate_recovery(
+                            recovery,
+                            target["resources"],
+                            git_observation,
+                        )
+                    except gq.GitContextError as error:
+                        raise QueueError(
+                            f"{error.code}: {error}"
+                        ) from error
+                elif recovery is not None:
+                    raise QueueError(
+                        "git_recovery_required: use --resume-git for this task"
+                    )
+
         claim_result = user_mutation(
             lambda state: claim_task(
                 state, args.agent, role=args.role, labels=args.label,
                 lease_seconds=args.lease_seconds,
+                git_observation=git_observation,
+                task_id=args.task,
+                resume_git=args.resume_git,
+                git_resume=git_resume,
             ),
         )
+        binding = claim_result["task"]["claim"].get("git")
+        if isinstance(binding, dict):
+            try:
+                current_observation = gq.observe(Path.cwd())
+                gq.assert_claim_snapshot(
+                    binding,
+                    current_observation,
+                    expected_head=(
+                        git_resume["head"]
+                        if git_resume is not None
+                        else None
+                    ),
+                )
+            except gq.GitContextError as error:
+                try:
+                    def rollback_claim(state):
+                        released = release_task(
+                            state,
+                            claim_result["task"]["id"],
+                            args.agent,
+                            claim_result["lease_token"],
+                        )
+                        if git_resume is not None:
+                            state["tasks"][released["id"]]["git_recovery"] = (
+                                copy.deepcopy(binding)
+                            )
+                        return released
+
+                    user_mutation(
+                        rollback_claim
+                    )
+                except QueueError as rollback_error:
+                    raise QueueError(
+                        f"{error.code}: {error}; "
+                        f"claim rollback failed: {rollback_error}"
+                    ) from rollback_error
+                raise QueueError(f"{error.code}: {error}") from error
         return {
             "ok": True,
             "task": _safe_task(claim_result["task"]),
@@ -3735,6 +4205,7 @@ def _run_command(args, path):
             "expires_at": claim_result["expires_at"],
         }
 
+    completion_warning = None
     if args.command == "heartbeat":
         task_result = user_mutation(
             lambda state: heartbeat_task(
@@ -3743,12 +4214,48 @@ def _run_command(args, path):
             )
         )
     elif args.command == "complete":
+        snapshot = read_queue_snapshot(path)
+        leased = require_lease(
+            snapshot,
+            args.task,
+            args.agent,
+            args.token,
+            utc_now(),
+        )
+        git_evidence = None
+        binding = leased["claim"].get("git")
+        if leased.get("git_mode") == "commit":
+            try:
+                git_evidence = gq.validate_completion(
+                    binding,
+                    leased["resources"],
+                    commit=args.commit,
+                    no_change=args.no_change,
+                )
+            except gq.GitContextError as error:
+                raise QueueError(f"{error.code}: {error}") from error
+        elif args.commit is not None or args.no_change:
+            raise QueueError(
+                "--commit and --no-change require a Git-aware task"
+            )
         task_result = user_mutation(
             lambda state: complete_task(
                 state, args.task, args.agent, args.token,
                 args.summary, args.artifact,
+                git_evidence=git_evidence,
             )
         )
+        if git_evidence is not None:
+            try:
+                current_observation = gq.observe(Path.cwd())
+                gq.assert_completion_snapshot(
+                    binding, git_evidence, current_observation
+                )
+            except gq.GitContextError as error:
+                completion_warning = {
+                    "code": error.code,
+                    "message": str(error),
+                }
     elif args.command == "fail":
         task_result = user_mutation(
             lambda state: fail_task(
@@ -3757,6 +4264,20 @@ def _run_command(args, path):
             )
         )
     elif args.command == "release":
+        snapshot = read_queue_snapshot(path)
+        leased = require_lease(
+            snapshot,
+            args.task,
+            args.agent,
+            args.token,
+            utc_now(),
+        )
+        binding = leased["claim"].get("git")
+        if isinstance(binding, dict):
+            try:
+                gq.validate_release(binding)
+            except gq.GitContextError as error:
+                raise QueueError(f"{error.code}: {error}") from error
         task_result = user_mutation(
             lambda state: release_task(
                 state, args.task, args.agent, args.token
@@ -3783,7 +4304,10 @@ def _run_command(args, path):
     else:
         task_result = None
     if task_result is not None:
-        return {"ok": True, "task": _safe_task(task_result)}
+        result = {"ok": True, "task": _safe_task(task_result)}
+        if completion_warning is not None:
+            result["warning"] = completion_warning
+        return result
 
     if args.command == "sweep":
         changed = mutate_queue(

@@ -121,6 +121,57 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("scripts/agent_queue.py", templates)
         self.assertIn("--from-json", templates)
 
+    def test_git_aware_contract_is_documented_without_path_list_storage(self):
+        skill = (self.skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        schema = (
+            self.skill_dir / "references" / "queue-schema.md"
+        ).read_text(encoding="utf-8")
+        templates = (
+            self.skill_dir / "references" / "workflow-templates.md"
+        ).read_text(encoding="utf-8")
+        readme = (self.skill_dir.parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+
+        for required in (
+            "--git-commit",
+            "--commit",
+            "--no-change",
+            "--resume-git",
+            "migrate --to 2",
+            "git_recovery",
+            "file:",
+            "dir:",
+            "changed_path_count",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, schema)
+        for required in (
+            "--git-commit",
+            "--commit",
+            "--no-change",
+            "--resume-git",
+            "file:",
+            "dir:",
+        ):
+            self.assertIn(required, skill)
+        self.assertNotIn('"changed_paths"', schema)
+        self.assertNotIn('"changed_paths"', templates)
+        self.assertIn("writer roles only", templates)
+        self.assertIn(
+            "does not create worktrees, commit, merge, reset, or push",
+            templates,
+        )
+        self.assertIn("git_queue.py", readme)
+        for command in (
+            "$CLI migrate --to 2",
+            "$CLI task add",
+            "$CLI claim",
+            "$CLI complete",
+            "$CLI serve --open",
+        ):
+            self.assertIn(command, readme)
+
     def test_dashboard_requires_consent_fallback_and_cleanup(self):
         skill = (self.skill_dir / "SKILL.md").read_text(encoding="utf-8")
         readme = (self.skill_dir.parent.parent / "README.md").read_text(
@@ -207,6 +258,7 @@ def canonical_claim(
     claimed_at="2026-07-10T05:00:00Z",
     heartbeat_at="2026-07-10T05:00:00Z",
     expires_at="2026-07-10T07:00:00Z",
+    git=None,
 ):
     return {
         "agent_id": agent_id,
@@ -214,6 +266,35 @@ def canonical_claim(
         "claimed_at": claimed_at,
         "heartbeat_at": heartbeat_at,
         "expires_at": expires_at,
+        "git": git,
+    }
+
+
+def canonical_result(summary="done", artifacts=None, git=None):
+    return {
+        "summary": summary,
+        "artifacts": [] if artifacts is None else artifacts,
+        "git": git,
+    }
+
+
+def git_snapshot(
+    repository_id="repo-1",
+    worktree_id="wt-1",
+    branch="refs/heads/feature-a",
+    head="base-a",
+    clean=True,
+    attached=True,
+):
+    return {
+        "common_dir": "/private/repository/.git",
+        "worktree": f"/private/worktrees/{worktree_id}",
+        "repository_id": repository_id,
+        "worktree_id": worktree_id,
+        "branch": branch if attached else None,
+        "head": head,
+        "attached": attached,
+        "clean": clean,
     }
 
 
@@ -221,7 +302,7 @@ class QueueStateTests(unittest.TestCase):
     def test_new_state_has_versioned_monotonic_counters(self):
         state = aq.new_state("demo", aq.fixed_config())
 
-        self.assertEqual(1, state["schema_version"])
+        self.assertEqual(2, state["schema_version"])
         self.assertEqual("demo", state["queue_id"])
         self.assertEqual(0, state["revision"])
         self.assertEqual(1, state["next_task_sequence"])
@@ -233,7 +314,7 @@ class QueueStateTests(unittest.TestCase):
     def test_validate_state_rejects_unknown_schema(self):
         state = aq.new_state("demo", aq.fixed_config())
 
-        for unknown_schema in (2, True):
+        for unknown_schema in (3, True):
             with self.subTest(schema_version=unknown_schema):
                 state["schema_version"] = unknown_schema
                 with self.assertRaisesRegex(aq.InvariantError, "schema_version"):
@@ -241,7 +322,7 @@ class QueueStateTests(unittest.TestCase):
 
     def test_validate_state_rejects_unknown_top_level_field(self):
         state = aq.new_state("demo", aq.fixed_config())
-        state["future_field"] = "not supported by schema version 1"
+        state["future_field"] = "not supported by schema version 2"
 
         with self.assertRaisesRegex(aq.InvariantError, "state.*future_field"):
             aq.validate_state(state)
@@ -385,6 +466,8 @@ class TaskGraphTests(unittest.TestCase):
                 "claim": None,
                 "result": None,
                 "last_error": None,
+                "git_mode": None,
+                "git_recovery": None,
                 "created_at": "2026-07-10T06:00:00Z",
                 "updated_at": "2026-07-10T06:00:00Z",
             },
@@ -393,6 +476,39 @@ class TaskGraphTests(unittest.TestCase):
         self.assertIsNot(task, self.state["tasks"]["T-000001"])
         self.assertEqual(task, self.state["tasks"]["T-000001"])
         self.assertEqual(2, self.state["next_task_sequence"])
+
+    def test_git_task_requires_version_two_and_typed_path_resource(self):
+        with self.assertRaisesRegex(aq.InvariantError, "file: or dir:"):
+            aq.add_task(
+                self.state,
+                {
+                    "title": "Git task",
+                    "git_mode": "commit",
+                    "resources": ["scope:auth"],
+                },
+            )
+
+        valid = aq.add_task(
+            self.state,
+            {
+                "title": "Scoped Git task",
+                "git_mode": "commit",
+                "resources": ["file:src/api.py", "dir:tests/api/"],
+            },
+        )
+        self.assertEqual("commit", valid["git_mode"])
+
+        legacy = aq.new_state("legacy", aq.fixed_config())
+        legacy["schema_version"] = 1
+        with self.assertRaisesRegex(aq.InvariantError, "Git-aware|unknown"):
+            aq.add_task(
+                legacy,
+                {
+                    "title": "Legacy Git task",
+                    "git_mode": "commit",
+                    "resources": ["file:src/api.py"],
+                },
+            )
 
     def test_second_task_has_monotonic_id_timestamp_priority_and_dependency(self):
         with mock.patch.object(
@@ -867,7 +983,7 @@ class TaskGraphTests(unittest.TestCase):
         created = aq.add_task(self.state, {"title": "Stored"})
         task = self.state["tasks"][created["id"]]
         task["status"] = "completed"
-        task["result"] = {"summary": "done", "artifacts": ["report.txt"]}
+        task["result"] = canonical_result(artifacts=["report.txt"])
         task["last_error"] = {
             "message": "earlier retry",
             "at": "2026-07-10T06:00:00Z",
@@ -878,26 +994,35 @@ class TaskGraphTests(unittest.TestCase):
     def test_validate_state_rejects_malformed_lifecycle_combinations(self):
         created = aq.add_task(self.state, {"title": "Stored"})
         cases = (
-            ({"result": {"summary": "done", "artifacts": []}}, "result.*completed"),
+            ({"result": canonical_result()}, "result.*completed"),
             ({"status": "completed", "result": None}, "completed.*result"),
             (
                 {
                     "status": "completed",
-                    "result": {"summary": "done", "artifacts": [], "extra": 1},
+                    "result": {
+                        "summary": "done",
+                        "artifacts": [],
+                        "git": None,
+                        "extra": 1,
+                    },
                 },
                 "result.*keys",
             ),
             (
                 {
                     "status": "completed",
-                    "result": {"summary": 1, "artifacts": []},
+                    "result": {"summary": 1, "artifacts": [], "git": None},
                 },
                 "result.*summary",
             ),
             (
                 {
                     "status": "completed",
-                    "result": {"summary": "done", "artifacts": [""]},
+                    "result": {
+                        "summary": "done",
+                        "artifacts": [""],
+                        "git": None,
+                    },
                 },
                 "result.*artifacts",
             ),
@@ -996,6 +1121,67 @@ class TaskGraphTests(unittest.TestCase):
             aq.validate_state(self.state)
 
 
+class SchemaMigrationTests(unittest.TestCase):
+    NOW = "2026-07-20T00:00:00Z"
+
+    def legacy_state(self):
+        state = aq.new_state("legacy", aq.fixed_config())
+        state["schema_version"] = 1
+        for task in state["tasks"].values():
+            task.pop("git_mode", None)
+            task.pop("git_recovery", None)
+            if isinstance(task.get("claim"), dict):
+                task["claim"].pop("git", None)
+            if isinstance(task.get("result"), dict):
+                task["result"].pop("git", None)
+        aq.validate_state(state)
+        return state
+
+    def test_new_queues_use_schema_two_with_git_defaults(self):
+        state = aq.new_state("demo", aq.fixed_config())
+        task = aq.add_task(state, {"title": "generic"})
+
+        self.assertEqual(2, state["schema_version"])
+        self.assertIsNone(task["git_mode"])
+        self.assertIsNone(task["git_recovery"])
+
+    def test_version_one_queue_keeps_generic_mutation_semantics(self):
+        state = self.legacy_state()
+
+        task = aq.add_task(state, {"title": "legacy generic"})
+
+        self.assertEqual(1, state["schema_version"])
+        self.assertNotIn("git_mode", task)
+        self.assertNotIn("git_recovery", task)
+        aq.validate_state(state)
+
+    def test_migrate_to_two_adds_defaults_and_one_event_atomically(self):
+        state = self.legacy_state()
+        task = aq.add_task(state, {"title": "legacy generic"})
+
+        result = aq.migrate_state(state, 2, now=self.NOW)
+
+        self.assertEqual({"from": 1, "to": 2}, result)
+        self.assertEqual(2, state["schema_version"])
+        self.assertIsNone(state["tasks"][task["id"]]["git_mode"])
+        self.assertIsNone(state["tasks"][task["id"]]["git_recovery"])
+        self.assertEqual("queue.migrated", state["events"][-1]["type"])
+        self.assertEqual(
+            {"from": 1, "to": 2},
+            state["events"][-1]["details"],
+        )
+
+    def test_failed_migration_leaves_source_unchanged(self):
+        state = self.legacy_state()
+        state["tasks"]["bad"] = {}
+        before = copy.deepcopy(state)
+
+        with self.assertRaises(aq.InvariantError):
+            aq.migrate_state(state, 2, now=self.NOW)
+
+        self.assertEqual(before, state)
+
+
 class WorkflowTemplateTests(unittest.TestCase):
     def setUp(self):
         self.state = aq.new_state("demo", aq.fixed_config())
@@ -1058,6 +1244,27 @@ class WorkflowTemplateTests(unittest.TestCase):
                     "reviewer_count": reviewer_count,
                 }, state["events"][0]["details"])
 
+    def test_git_enabled_adversarial_review_marks_only_writer_roles(self):
+        result = aq.add_adversarial_review(
+            self.state,
+            "Change",
+            20,
+            ["dir:src/"],
+            2,
+            git_commit=True,
+            now=self.now,
+        )
+        tasks = [
+            self.state["tasks"][task_id]
+            for task_id in result["task_ids"]
+        ]
+
+        self.assertEqual(
+            ["commit", None, None, "commit", None],
+            [task["git_mode"] for task in tasks],
+        )
+        self.assertTrue(self.state["events"][0]["details"]["git_commit"])
+
     def test_adversarial_review_readiness_isolated_by_graph_and_resources(self):
         result = aq.add_adversarial_review(
             self.state, "Change", 0, ["shared"], 3, now=self.now
@@ -1066,9 +1273,7 @@ class WorkflowTemplateTests(unittest.TestCase):
         review_ids = review_and_tail[:3]
         apply_id, verify_id = review_and_tail[3:]
         self.state["tasks"][implement_id]["status"] = "completed"
-        self.state["tasks"][implement_id]["result"] = {
-            "summary": "done", "artifacts": []
-        }
+        self.state["tasks"][implement_id]["result"] = canonical_result()
         rows = {row["id"]: row for row in aq.status_rows(self.state, self.now)}
         self.assertEqual(["ready"] * 3, [rows[task_id]["state"] for task_id in review_ids])
         self.assertEqual([[]] * 3, [self.state["tasks"][task_id]["resources"] for task_id in review_ids])
@@ -1076,9 +1281,7 @@ class WorkflowTemplateTests(unittest.TestCase):
         self.assertEqual("waiting_dependency", rows[verify_id]["state"])
         for task_id in review_ids:
             self.state["tasks"][task_id]["status"] = "completed"
-            self.state["tasks"][task_id]["result"] = {
-                "summary": "done", "artifacts": []
-            }
+            self.state["tasks"][task_id]["result"] = canonical_result()
         rows = {row["id"]: row for row in aq.status_rows(self.state, self.now)}
         self.assertEqual("ready", rows[apply_id]["state"])
         self.assertEqual("waiting_dependency", rows[verify_id]["state"])
@@ -1128,6 +1331,36 @@ class WorkflowTemplateTests(unittest.TestCase):
                     "task_count": shard_count + 2,
                     "shard_count": shard_count,
                 }, state["events"][0]["details"])
+
+    def test_git_enabled_parallel_shards_marks_writers_and_rejects_overlap(self):
+        result = aq.add_parallel_shards(
+            self.state,
+            "Build",
+            20,
+            [["file:src/a.py"], ["dir:src/b/"]],
+            git_commit=True,
+            now=self.now,
+        )
+        tasks = [
+            self.state["tasks"][task_id]
+            for task_id in result["task_ids"]
+        ]
+        self.assertEqual(
+            ["commit", "commit", "commit", None],
+            [task["git_mode"] for task in tasks],
+        )
+        self.assertTrue(self.state["events"][0]["details"]["git_commit"])
+
+        other = aq.new_state("overlap", aq.fixed_config())
+        with self.assertRaisesRegex(aq.InvariantError, "overlap"):
+            aq.add_parallel_shards(
+                other,
+                "Unsafe",
+                20,
+                [["dir:src/"], ["file:src/a.py"]],
+                git_commit=True,
+                now=self.now,
+            )
 
     def test_workflow_api_copies_once_and_validates_source_and_candidate_once(self):
         real_deepcopy = aq.copy.deepcopy
@@ -1372,6 +1605,125 @@ class ClaimTaskTests(unittest.TestCase):
         with self.assertRaises(aq.NoTaskAvailable):
             aq.claim_task(self.state, "worker-2", now=self.NOW)
 
+    def test_git_claim_requires_clean_attached_observation_and_stores_binding(self):
+        task = self.add(
+            "Git task",
+            git_mode="commit",
+            resources=["file:src/api.py"],
+        )
+
+        for observation, message in (
+            (git_snapshot(clean=False), "clean"),
+            (git_snapshot(attached=False), "attached"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(aq.InvariantError, message):
+                    aq.claim_task(
+                        self.state,
+                        "worker",
+                        now=self.NOW,
+                        git_observation=observation,
+                        task_id=task["id"],
+                    )
+
+        claimed = aq.claim_task(
+            self.state,
+            "worker",
+            now=self.NOW,
+            git_observation=git_snapshot(),
+            task_id=task["id"],
+        )
+        binding = claimed["task"]["claim"]["git"]
+        self.assertEqual("base-a", binding["base"])
+        self.assertEqual("repo-1", binding["repository_id"])
+        safe = aq._safe_task(claimed["task"])
+        serialized = json.dumps(safe)
+        self.assertNotIn("/private/repository", serialized)
+        self.assertNotIn("/private/worktrees", serialized)
+        self.assertNotIn(claimed["lease_token"], serialized)
+
+    def test_git_claim_blocks_derived_ownership_and_allows_disjoint_worktrees(self):
+        holder = self.add(
+            "Holder",
+            priority=100,
+            git_mode="commit",
+            resources=["dir:src/"],
+        )
+        aq.claim_task(
+            self.state,
+            "holder",
+            now=self.NOW,
+            git_observation=git_snapshot(),
+            task_id=holder["id"],
+        )
+
+        cases = (
+            (
+                "same worktree",
+                ["file:other.txt"],
+                git_snapshot(worktree_id="wt-1", branch="refs/heads/other"),
+            ),
+            (
+                "same branch",
+                ["file:other.txt"],
+                git_snapshot(worktree_id="wt-2"),
+            ),
+            (
+                "overlapping scope",
+                ["file:src/api.py"],
+                git_snapshot(
+                    worktree_id="wt-3",
+                    branch="refs/heads/feature-c",
+                ),
+            ),
+        )
+        for title, resources, observation in cases:
+            task = self.add(
+                title,
+                git_mode="commit",
+                resources=resources,
+            )
+            with self.subTest(title=title):
+                with self.assertRaises(aq.NoTaskAvailable):
+                    aq.claim_task(
+                        self.state,
+                        title,
+                        now=self.NOW,
+                        git_observation=observation,
+                        task_id=task["id"],
+                    )
+
+        disjoint = self.add(
+            "Disjoint",
+            git_mode="commit",
+            resources=["file:tests/api.py"],
+        )
+        claimed = aq.claim_task(
+            self.state,
+            "disjoint",
+            now=self.NOW,
+            git_observation=git_snapshot(
+                worktree_id="wt-4",
+                branch="refs/heads/feature-d",
+            ),
+            task_id=disjoint["id"],
+        )
+        self.assertEqual(disjoint["id"], claimed["task"]["id"])
+
+    def test_generic_claim_does_not_require_git_observation(self):
+        task = self.add("Generic")
+
+        claimed = aq.claim_task(
+            self.state,
+            "worker",
+            now=self.NOW,
+            git_observation=None,
+            task_id=task["id"],
+        )
+
+        self.assertEqual(task["id"], claimed["task"]["id"])
+        self.assertIsNone(claimed["task"]["claim"]["git"])
+
     def test_claim_eligibility_uses_boolean_resource_conflict_probe(self):
         self.add("Holder", priority=100, resources=["repo"])
         aq.claim_task(self.state, "holder", now=self.NOW)
@@ -1419,6 +1771,7 @@ class ClaimTaskTests(unittest.TestCase):
                 "claimed_at": self.NOW,
                 "heartbeat_at": self.NOW,
                 "expires_at": "2026-07-10T06:00:30Z",
+                "git": None,
             },
             stored["claim"],
         )
@@ -1954,7 +2307,11 @@ class LifecycleTransitionTests(unittest.TestCase):
         stored = self.state["tasks"][task["id"]]
         self.assertEqual("completed", stored["status"])
         self.assertEqual(
-            {"summary": "Finished", "artifacts": ["a.txt", "b.json"]},
+            {
+                "summary": "Finished",
+                "artifacts": ["a.txt", "b.json"],
+                "git": None,
+            },
             stored["result"],
         )
         self.assertIsNone(stored["claim"])
@@ -1964,6 +2321,110 @@ class LifecycleTransitionTests(unittest.TestCase):
             {"artifact_count": 2}, self.state["events"][-1]["details"]
         )
         self.assertNotIn(token, repr(self.state["events"][-1]))
+
+    def test_git_complete_persists_exact_compact_evidence_and_counts(self):
+        task = self.add(
+            title="Git task",
+            priority=1000,
+            git_mode="commit",
+            resources=["dir:src/"],
+        )
+        observation = git_snapshot(head="a" * 40)
+        with mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value="SECRET"
+        ):
+            claimed = aq.claim_task(
+                self.state,
+                "agent-1",
+                now=self.NOW,
+                git_observation=observation,
+                task_id=task["id"],
+            )
+        evidence = {
+            "branch": observation["branch"],
+            "base": "a" * 40,
+            "head": "b" * 40,
+            "commit_count": 2,
+            "changed_path_count": 27,
+        }
+
+        returned = aq.complete_task(
+            self.state,
+            task["id"],
+            "agent-1",
+            claimed["lease_token"],
+            summary="Finished",
+            artifacts=["report.txt"],
+            git_evidence=evidence,
+            now="2026-07-10T06:00:30Z",
+        )
+
+        self.assertEqual(evidence, returned["result"]["git"])
+        self.assertEqual(
+            {
+                "artifact_count": 1,
+                "commit_count": 2,
+                "changed_path_count": 27,
+            },
+            self.state["events"][-1]["details"],
+        )
+        evidence["changed_path_count"] = 999
+        self.assertEqual(27, returned["result"]["git"]["changed_path_count"])
+        self.assertNotIn("changed_paths", json.dumps(returned))
+
+    def test_complete_requires_evidence_only_for_git_tasks_atomically(self):
+        generic, generic_token = self.claim(title="Generic")
+        evidence = {
+            "branch": "refs/heads/main",
+            "base": "a" * 40,
+            "head": "b" * 40,
+            "commit_count": 1,
+            "changed_path_count": 1,
+        }
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "generic.*Git evidence",
+            lambda: aq.complete_task(
+                self.state,
+                generic["id"],
+                "agent-1",
+                generic_token,
+                "done",
+                [],
+                git_evidence=evidence,
+                now=self.NOW,
+            ),
+        )
+
+        git_task = self.add(
+            title="Git",
+            priority=2000,
+            git_mode="commit",
+            resources=["file:src/a.py"],
+        )
+        with mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value="GIT-SECRET"
+        ):
+            git_claim = aq.claim_task(
+                self.state,
+                "git-agent",
+                now=self.NOW,
+                git_observation=git_snapshot(head="a" * 40),
+                task_id=git_task["id"],
+            )
+        self.assert_atomic_error(
+            aq.InvariantError,
+            "Git-aware.*evidence",
+            lambda: aq.complete_task(
+                self.state,
+                git_task["id"],
+                "git-agent",
+                git_claim["lease_token"],
+                "done",
+                [],
+                now=self.NOW,
+            ),
+        )
 
     def test_complete_validates_payload_before_lease_and_is_atomic(self):
         task, _ = self.claim()
@@ -2377,6 +2838,150 @@ class LifecycleTransitionTests(unittest.TestCase):
         self.assertNotIn(token, repr(rows) + tsv)
 
 
+class GitRecoveryTests(unittest.TestCase):
+    CREATED = "2026-07-10T05:00:00Z"
+    NOW = "2026-07-10T06:00:00Z"
+    EXPIRES = "2026-07-10T06:01:00Z"
+    LATER = "2026-07-10T06:01:31Z"
+
+    def setUp(self):
+        self.clock = mock.patch.object(aq, "utc_now", return_value=self.CREATED)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.state = aq.new_state("demo", aq.fixed_config())
+        self.observation = git_snapshot(head="a" * 40)
+
+    def add_git(self, max_attempts=2):
+        created = aq.add_task(
+            self.state,
+            {
+                "title": "Git task",
+                "git_mode": "commit",
+                "resources": ["dir:src/"],
+                "max_attempts": max_attempts,
+            },
+        )
+        return self.state["tasks"][created["id"]]
+
+    def claim_git(self, task, agent="worker", now=None, **extra):
+        with mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value=f"SECRET-{agent}"
+        ):
+            return aq.claim_task(
+                self.state,
+                agent,
+                now=now or self.NOW,
+                lease_seconds=60,
+                git_observation=self.observation,
+                task_id=task["id"],
+                **extra,
+            )
+
+    def expire(self, task):
+        self.claim_git(task)
+        aq.sweep_expired(self.state, now=self.EXPIRES)
+        return self.state["tasks"][task["id"]]
+
+    def test_expired_git_lease_preserves_private_recovery_binding(self):
+        task = self.add_git(max_attempts=2)
+
+        stored = self.expire(task)
+
+        self.assertEqual("pending", stored["status"])
+        self.assertIsNone(stored["claim"])
+        self.assertEqual(
+            self.observation["head"], stored["git_recovery"]["base"]
+        )
+        self.assertEqual(
+            "git_recovery",
+            aq.derive_state(self.state, stored, self.LATER),
+        )
+        safe = json.dumps(aq._safe_task(stored))
+        self.assertNotIn("/private/repository", safe)
+        self.assertNotIn("/private/worktrees", safe)
+
+    def test_exhausted_git_attempt_keeps_recovery_across_retry(self):
+        task = self.add_git(max_attempts=1)
+        stored = self.expire(task)
+        self.assertEqual("failed", stored["status"])
+        recovery = copy.deepcopy(stored["git_recovery"])
+        self.assertIsNotNone(recovery)
+
+        aq.retry_task(self.state, task["id"], now=self.LATER)
+
+        self.assertEqual(
+            recovery, self.state["tasks"][task["id"]]["git_recovery"]
+        )
+
+    def test_retryable_failure_preserves_recovery(self):
+        task = self.add_git(max_attempts=2)
+        claimed = self.claim_git(task)
+
+        failed = aq.fail_task(
+            self.state,
+            task["id"],
+            "worker",
+            claimed["lease_token"],
+            "retry",
+            now="2026-07-10T06:00:30Z",
+        )
+
+        self.assertEqual("pending", failed["status"])
+        self.assertEqual(
+            self.observation["head"], failed["git_recovery"]["base"]
+        )
+
+    def test_ordinary_claim_skips_recovery_and_explicit_resume_keeps_base(self):
+        task = self.add_git(max_attempts=3)
+        stored = self.expire(task)
+        recovery = copy.deepcopy(stored["git_recovery"])
+        with self.assertRaises(aq.NoTaskAvailable):
+            self.claim_git(task, agent="ordinary", now=self.LATER)
+
+        context = {"binding": recovery, "head": self.observation["head"]}
+        resumed = self.claim_git(
+            task,
+            agent="resumer",
+            now=self.LATER,
+            resume_git=True,
+            git_resume=context,
+        )
+
+        self.assertEqual(recovery, resumed["task"]["claim"]["git"])
+        self.assertIsNone(resumed["task"]["git_recovery"])
+        self.assertEqual(2, resumed["task"]["attempts"])
+        self.assertTrue(self.state["events"][-1]["details"]["resumed_git"])
+
+    def test_invalid_resume_context_is_atomic(self):
+        task = self.add_git(max_attempts=3)
+        stored = self.expire(task)
+        before = copy.deepcopy(self.state)
+        invalid = {
+            "binding": copy.deepcopy(stored["git_recovery"]),
+            "head": "b" * 40,
+        }
+
+        with self.assertRaisesRegex(aq.InvariantError, "recovery"):
+            self.claim_git(
+                task,
+                agent="resumer",
+                now=self.LATER,
+                resume_git=True,
+                git_resume=invalid,
+            )
+
+        self.assertEqual(before, self.state)
+
+    def test_cancel_clears_recovery_binding(self):
+        task = self.add_git(max_attempts=2)
+        self.expire(task)
+
+        cancelled = aq.cancel_task(self.state, task["id"], now=self.LATER)
+
+        self.assertEqual("cancelled", cancelled["status"])
+        self.assertIsNone(cancelled["git_recovery"])
+
+
 class StatusProjectionTests(unittest.TestCase):
     NOW = "2026-07-10T06:00:00Z"
 
@@ -2390,7 +2995,7 @@ class StatusProjectionTests(unittest.TestCase):
     def test_completed_dependency_makes_pending_task_ready(self):
         dependency = self.add("Dependency")
         dependency["status"] = "completed"
-        dependency["result"] = {"summary": "done", "artifacts": []}
+        dependency["result"] = canonical_result()
         task = self.add("Ready", depends_on=[dependency["id"]])
 
         self.assertEqual([], aq.dependency_blockers(self.state, task))
@@ -2400,7 +3005,7 @@ class StatusProjectionTests(unittest.TestCase):
         first = self.add("First")
         completed = self.add("Completed")
         completed["status"] = "completed"
-        completed["result"] = {"summary": "done", "artifacts": []}
+        completed["result"] = canonical_result()
         third = self.add("Third")
         third["status"] = "leased"
         third["attempts"] = 1
@@ -2446,7 +3051,7 @@ class StatusProjectionTests(unittest.TestCase):
     def test_future_availability_waits_after_dependencies_complete(self):
         dependency = self.add("Dependency")
         dependency["status"] = "completed"
-        dependency["result"] = {"summary": "done", "artifacts": []}
+        dependency["result"] = canonical_result()
         task = self.add("Retry", depends_on=[dependency["id"]])
         task["available_at"] = "2026-07-10T06:00:01Z"
 
@@ -2501,7 +3106,7 @@ class StatusProjectionTests(unittest.TestCase):
                 task = self.add(status)
                 task["status"] = status
                 if status == "completed":
-                    task["result"] = {"summary": "done", "artifacts": []}
+                    task["result"] = canonical_result()
                 elif status == "failed":
                     task["last_error"] = {
                         "message": "failed",
@@ -2661,6 +3266,7 @@ class StatusProjectionTests(unittest.TestCase):
         completed["result"] = {
             "summary": "RESULT-SECRET",
             "artifacts": [],
+            "git": None,
         }
 
         rows = aq.status_rows(self.state, self.NOW)
@@ -3190,7 +3796,7 @@ class TextLimitTests(unittest.TestCase):
                     task["description"] = oversized
                 elif field == "summary":
                     task["status"] = "completed"
-                    task["result"] = {"summary": oversized, "artifacts": []}
+                    task["result"] = canonical_result(summary=oversized)
                 else:
                     task["status"] = "failed" if field == "error" else "blocked"
                     task["last_error"] = {
@@ -3288,7 +3894,9 @@ class TextLimitTests(unittest.TestCase):
                         task["description"] = lone_surrogate
                     elif field == "summary":
                         task["status"] = "completed"
-                        task["result"] = {"summary": lone_surrogate, "artifacts": []}
+                        task["result"] = canonical_result(
+                            summary=lone_surrogate
+                        )
                     else:
                         task["status"] = "failed" if field == "error" else "blocked"
                         task["last_error"] = {
@@ -3380,7 +3988,7 @@ class DoctorTests(unittest.TestCase):
     def test_corrupt_source_is_reported_and_never_repaired(self):
         cases = {
             "json": b'{"schema_version": NaN}\n',
-            "schema": json.dumps({**self.state, "schema_version": 2}).encode(),
+            "schema": json.dumps({**self.state, "schema_version": 3}).encode(),
             "graph": None,
             "counter": json.dumps({**self.state, "next_task_sequence": 0}).encode(),
             "event": None,
@@ -3796,7 +4404,7 @@ class CompactionTests(unittest.TestCase):
         task["updated_at"] = updated_at or self.OLD
         task["status"] = status
         if status == "completed":
-            task["result"] = {"summary": "done", "artifacts": []}
+            task["result"] = canonical_result()
         elif status == "failed":
             task["last_error"] = {"message": "bad", "at": task["updated_at"]}
         elif status == "blocked":
@@ -4036,7 +4644,8 @@ class QueueLockTests(unittest.TestCase):
 
     def test_module_loads_without_fcntl_and_has_no_unsafe_fallback(self):
         source = "\n".join((
-            "import builtins, runpy, sys",
+            "import builtins, pathlib, runpy, sys",
+            "sys.path.insert(0, str(pathlib.Path(sys.argv[1]).resolve().parent))",
             "real_import = builtins.__import__",
             "def guarded_import(name, *args, **kwargs):",
             "    if name == 'fcntl':",
@@ -4210,6 +4819,40 @@ class QueueCliTests(unittest.TestCase):
     def add(self, title="work", *extra):
         return self.json_output(self.cli("task", "add", "--title", title, *extra))
 
+    def make_git_repo(self):
+        root = Path(self.temporary.name) / "repo"
+        root.mkdir()
+        subprocess.run(
+            ["git", "-C", str(root), "init", "-b", "main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for key, value in (
+            ("user.name", "Queue CLI Tests"),
+            ("user.email", "queue-cli@example.test"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(root), "config", key, value],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        (root / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(root), "add", "base.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-m", "base"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return root
+
     def test_cli_init_creates_both_files_and_second_is_code_two_unchanged(self):
         output = self.init(lease_seconds=10, max_attempts=4, retry_backoff=2)
         self.assertTrue(output["ok"])
@@ -4221,6 +4864,33 @@ class QueueCliTests(unittest.TestCase):
         self.assertEqual("", result.stdout)
         self.assertNotEqual("", result.stderr)
         self.assertEqual(before, self.queue.read_bytes())
+
+    def test_cli_migrates_version_one_queue_atomically(self):
+        state = aq.new_state("legacy", aq.fixed_config())
+        state["schema_version"] = 1
+        aq.write_json(self.queue, state)
+        aq.atomic_write_text(
+            self.queue.with_suffix(".tsv"),
+            aq.render_tsv(state, state["updated_at"]),
+        )
+        added = self.add("legacy generic")
+        self.assertNotIn("git_mode", added["task"])
+        before_revision = aq.load_state(self.queue)["revision"]
+
+        migrated = self.json_output(self.cli("migrate", "--to", "2"))
+
+        self.assertEqual(
+            {"ok": True, "from": 1, "to": 2},
+            migrated,
+        )
+        stored = aq.load_state(self.queue)
+        self.assertEqual(2, stored["schema_version"])
+        self.assertEqual(before_revision + 1, stored["revision"])
+        self.assertEqual("queue.migrated", stored["events"][-1]["type"])
+        self.assertEqual(
+            stored["revision"],
+            aq.tsv_revision(self.queue.with_suffix(".tsv")),
+        )
 
     def test_init_and_machine_status_discover_dashboard_safely(self):
         output = self.init()
@@ -4431,6 +5101,68 @@ class QueueCliTests(unittest.TestCase):
         self.assertEqual(2, invalid.returncode)
         self.assertEqual("", invalid.stdout)
 
+    def test_cli_accepts_git_task_and_workflow_opt_in(self):
+        self.init()
+        task = self.add(
+            "Git task",
+            "--git-commit",
+            "--resource",
+            "file:src/api.py",
+        )["task"]
+        self.assertEqual("commit", task["git_mode"])
+
+        adversarial = self.json_output(
+            self.cli(
+                "workflow",
+                "add",
+                "--template",
+                "adversarial-review",
+                "--title",
+                "Review Git",
+                "--resource",
+                "dir:src/review/",
+                "--git-commit",
+            )
+        )
+        state = aq.load_state(self.queue)
+        self.assertEqual(
+            ["commit", None, None, "commit", None],
+            [
+                state["tasks"][task_id]["git_mode"]
+                for task_id in adversarial["task_ids"]
+            ],
+        )
+
+        input_path = Path(self.temporary.name) / "git-shards.json"
+        input_path.write_text(
+            json.dumps(
+                {
+                    "title": "Git shards",
+                    "shards": [["file:src/a.py"], ["file:src/b.py"]],
+                    "git_commit": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        parallel = self.json_output(
+            self.cli(
+                "workflow",
+                "add",
+                "--template",
+                "parallel-shards",
+                "--from-json",
+                input_path,
+            )
+        )
+        state = aq.load_state(self.queue)
+        self.assertEqual(
+            ["commit", "commit", "commit", None],
+            [
+                state["tasks"][task_id]["git_mode"]
+                for task_id in parallel["task_ids"]
+            ],
+        )
+
     def test_lifecycle_commands_and_token_redaction(self):
         self.init(retry_backoff=1)
         self.add("work")
@@ -4452,6 +5184,470 @@ class QueueCliTests(unittest.TestCase):
         self.assertEqual("completed", complete["task"]["status"])
         none = self.cli("claim", "--agent", "b")
         self.assertEqual(3, none.returncode)
+
+    def test_cli_claim_binds_current_git_worktree_and_redacts_private_paths(self):
+        root = self.make_git_repo()
+        self.init()
+        task = self.add(
+            "Git claim",
+            "--git-commit",
+            "--resource",
+            "file:scoped.txt",
+        )["task"]
+
+        result = run_cli(
+            "--queue",
+            self.queue,
+            "claim",
+            "--agent",
+            "git-worker",
+            "--task",
+            task["id"],
+            cwd=root,
+        )
+        output = self.json_output(result)
+
+        self.assertEqual(task["id"], output["task"]["id"])
+        self.assertNotIn(str(root), result.stdout)
+        self.assertNotIn(str(root / ".git"), result.stdout)
+        self.assertEqual(
+            "refs/heads/main",
+            output["task"]["claim"]["git"]["branch"],
+        )
+        stored = aq.load_state(self.queue)["tasks"][task["id"]]
+        self.assertEqual(str(root.resolve()), stored["claim"]["git"]["worktree"])
+
+    def test_cli_claim_releases_lease_when_git_snapshot_drifts(self):
+        self.init()
+        task = self.add(
+            "Git claim drift",
+            "--git-commit",
+            "--resource",
+            "file:scoped.txt",
+        )["task"]
+        before = git_snapshot()
+        after = git_snapshot(head="changed-after-claim")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            aq.gq, "observe", side_effect=(before, after)
+        ), mock.patch.object(
+            aq.secrets, "token_urlsafe", return_value="PRIVATE-LEASE-TOKEN"
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = aq.main([
+                "--queue",
+                str(self.queue),
+                "claim",
+                "--agent",
+                "git-worker",
+                "--task",
+                task["id"],
+            ])
+
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("git_claim_drift", stderr.getvalue())
+        self.assertNotIn("PRIVATE-LEASE-TOKEN", stderr.getvalue())
+        self.assertNotIn("/private/", stderr.getvalue())
+        stored = aq.load_state(self.queue)["tasks"][task["id"]]
+        self.assertEqual("pending", stored["status"])
+        self.assertIsNone(stored["claim"])
+
+    def test_cli_requires_explicit_resume_and_restores_original_base(self):
+        self.init(retry_backoff=1)
+        task = self.add(
+            "Git recovery",
+            "--git-commit",
+            "--resource",
+            "dir:src/",
+        )["task"]
+        observation = git_snapshot(head="a" * 40)
+        started_at = aq.load_state(self.queue)["tasks"][task["id"]][
+            "updated_at"
+        ]
+        expires_at = aq.add_seconds(started_at, 60)
+        resume_at = aq.add_seconds(expires_at, 2)
+
+        def claim_then_expire(state):
+            claimed = aq.claim_task(
+                state,
+                "first-worker",
+                now=started_at,
+                lease_seconds=60,
+                git_observation=observation,
+                task_id=task["id"],
+            )
+            aq.sweep_expired(
+                state, now=claimed["expires_at"]
+            )
+
+        aq.mutate_queue(
+            self.queue,
+            claim_then_expire,
+            auto_sweep=False,
+        )
+
+        def invoke(*arguments):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                aq.gq, "observe", return_value=observation
+            ), mock.patch.object(
+                aq, "utc_now", return_value=resume_at
+            ), redirect_stdout(stdout), redirect_stderr(stderr):
+                code = aq.main([
+                    "--queue", str(self.queue), "claim", *arguments
+                ])
+            return code, stdout.getvalue(), stderr.getvalue()
+
+        code, stdout, stderr = invoke(
+            "--agent", "ordinary", "--task", task["id"]
+        )
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout)
+        self.assertIn("git_recovery_required", stderr)
+
+        code, stdout, stderr = invoke(
+            "--agent", "resumer", "--task", task["id"], "--resume-git"
+        )
+        self.assertEqual(0, code, stderr)
+        output = json.loads(stdout)
+        self.assertEqual(
+            observation["head"], output["task"]["claim"]["git"]["base"]
+        )
+        self.assertIsNone(output["task"]["git_recovery"])
+        stored = aq.load_state(self.queue)["tasks"][task["id"]]
+        self.assertEqual(
+            observation["head"], stored["claim"]["git"]["base"]
+        )
+
+    def test_cli_resume_drift_restores_recovery_binding(self):
+        self.init(retry_backoff=1)
+        task = self.add(
+            "Git recovery drift",
+            "--git-commit",
+            "--resource",
+            "dir:src/",
+        )["task"]
+        observation = git_snapshot(head="a" * 40)
+        started_at = aq.load_state(self.queue)["tasks"][task["id"]][
+            "updated_at"
+        ]
+        expires_at = aq.add_seconds(started_at, 60)
+        resume_at = aq.add_seconds(expires_at, 2)
+
+        def claim_then_expire(state):
+            claimed = aq.claim_task(
+                state,
+                "first-worker",
+                now=started_at,
+                lease_seconds=60,
+                git_observation=observation,
+                task_id=task["id"],
+            )
+            aq.sweep_expired(state, now=claimed["expires_at"])
+
+        aq.mutate_queue(
+            self.queue,
+            claim_then_expire,
+            auto_sweep=False,
+        )
+        recovery = copy.deepcopy(
+            aq.load_state(self.queue)["tasks"][task["id"]]["git_recovery"]
+        )
+        drifted = dict(observation, head="b" * 40)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            aq.gq, "observe", side_effect=(observation, drifted)
+        ), mock.patch.object(
+            aq, "utc_now", return_value=resume_at
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = aq.main([
+                "--queue",
+                str(self.queue),
+                "claim",
+                "--agent",
+                "resumer",
+                "--task",
+                task["id"],
+                "--resume-git",
+            ])
+
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("git_claim_drift", stderr.getvalue())
+        stored = aq.load_state(self.queue)["tasks"][task["id"]]
+        self.assertEqual("pending", stored["status"])
+        self.assertIsNone(stored["claim"])
+        self.assertEqual(recovery, stored["git_recovery"])
+
+    def test_cli_git_release_rejects_advanced_head(self):
+        root = self.make_git_repo()
+        self.init()
+        task = self.add(
+            "Git release",
+            "--git-commit",
+            "--resource",
+            "file:scoped.txt",
+        )["task"]
+        claim = self.json_output(run_cli(
+            "--queue",
+            self.queue,
+            "claim",
+            "--agent",
+            "git-worker",
+            "--task",
+            task["id"],
+            cwd=root,
+        ))
+        base = claim["task"]["claim"]["git"]["base"]
+        (root / "scoped.txt").write_text("committed\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(root), "add", "scoped.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-m", "advance"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        release_args = (
+            "--queue", self.queue,
+            "release",
+            "--task", task["id"],
+            "--agent", "git-worker",
+            "--token", claim["lease_token"],
+        )
+
+        rejected = run_cli(*release_args, cwd=root)
+        self.assertEqual(2, rejected.returncode)
+        self.assertIn("git_head_mismatch", rejected.stderr)
+        self.assertEqual(
+            "leased",
+            aq.load_state(self.queue)["tasks"][task["id"]]["status"],
+        )
+
+        subprocess.run(
+            ["git", "-C", str(root), "reset", "--hard", base],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        released = self.json_output(run_cli(*release_args, cwd=root))
+        self.assertEqual("pending", released["task"]["status"])
+        self.assertIsNone(released["task"]["git_recovery"])
+
+    def test_cli_complete_validates_commit_and_persists_counts_only(self):
+        root = self.make_git_repo()
+        self.init()
+        task = self.add(
+            "Git complete",
+            "--git-commit",
+            "--resource",
+            "file:scoped.txt",
+        )["task"]
+        claim = self.json_output(run_cli(
+            "--queue",
+            self.queue,
+            "claim",
+            "--agent",
+            "git-worker",
+            "--task",
+            task["id"],
+            cwd=root,
+        ))
+        (root / "scoped.txt").write_text("done\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(root), "add", "scoped.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-m", "complete"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        result = run_cli(
+            "--queue",
+            self.queue,
+            "complete",
+            "--task",
+            task["id"],
+            "--agent",
+            "git-worker",
+            "--token",
+            claim["lease_token"],
+            "--summary",
+            "done",
+            "--commit",
+            head,
+            cwd=root,
+        )
+        output = self.json_output(result)
+
+        self.assertEqual(1, output["task"]["result"]["git"]["commit_count"])
+        self.assertEqual(
+            1, output["task"]["result"]["git"]["changed_path_count"]
+        )
+        self.assertNotIn('"changed_paths"', result.stdout)
+        stored = aq.load_state(self.queue)["tasks"][task["id"]]
+        self.assertNotIn("changed_paths", stored["result"]["git"])
+
+    def test_cli_complete_rejects_git_flags_for_generic_tasks(self):
+        self.init()
+        self.add("Generic")
+        claim = self.json_output(self.cli("claim", "--agent", "worker"))
+
+        result = self.cli(
+            "complete",
+            "--task",
+            "T-000001",
+            "--agent",
+            "worker",
+            "--token",
+            claim["lease_token"],
+            "--summary",
+            "done",
+            "--no-change",
+        )
+
+        self.assertEqual(2, result.returncode)
+        stored = aq.load_state(self.queue)["tasks"]["T-000001"]
+        self.assertEqual("leased", stored["status"])
+
+    def test_cli_git_complete_requires_mode_and_accepts_no_change(self):
+        root = self.make_git_repo()
+        self.init()
+        task = self.add(
+            "Git no change",
+            "--git-commit",
+            "--resource",
+            "file:base.txt",
+        )["task"]
+        claim = self.json_output(run_cli(
+            "--queue",
+            self.queue,
+            "claim",
+            "--agent",
+            "git-worker",
+            "--task",
+            task["id"],
+            cwd=root,
+        ))
+        common = (
+            "--task", task["id"],
+            "--agent", "git-worker",
+            "--token", claim["lease_token"],
+            "--summary", "done",
+        )
+
+        missing = run_cli(
+            "--queue", self.queue, "complete", *common, cwd=root
+        )
+        self.assertEqual(2, missing.returncode)
+        self.assertIn("git_commit_required", missing.stderr)
+        self.assertEqual(
+            "leased",
+            aq.load_state(self.queue)["tasks"][task["id"]]["status"],
+        )
+
+        completed = self.json_output(run_cli(
+            "--queue",
+            self.queue,
+            "complete",
+            *common,
+            "--no-change",
+            cwd=root,
+        ))
+        evidence = completed["task"]["result"]["git"]
+        self.assertEqual(0, evidence["commit_count"])
+        self.assertEqual(0, evidence["changed_path_count"])
+
+    def test_cli_completion_drift_warns_without_reopening_task(self):
+        root = self.make_git_repo()
+        self.init()
+        task = self.add(
+            "Git warning",
+            "--git-commit",
+            "--resource",
+            "file:base.txt",
+        )["task"]
+        claim = self.json_output(run_cli(
+            "--queue",
+            self.queue,
+            "claim",
+            "--agent",
+            "git-worker",
+            "--task",
+            task["id"],
+            cwd=root,
+        ))
+        binding = aq.load_state(self.queue)["tasks"][task["id"]]["claim"]["git"]
+        evidence = {
+            "branch": binding["branch"],
+            "base": binding["base"],
+            "head": binding["base"],
+            "commit_count": 0,
+            "changed_path_count": 0,
+        }
+        drifted = {
+            "common_dir": binding["common_dir"],
+            "worktree": binding["worktree"],
+            "repository_id": binding["repository_id"],
+            "worktree_id": binding["worktree_id"],
+            "branch": binding["branch"],
+            "head": "f" * 40,
+            "attached": True,
+            "clean": True,
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            aq.gq, "validate_completion", return_value=evidence
+        ), mock.patch.object(
+            aq.gq, "observe", return_value=drifted
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = aq.main([
+                "--queue",
+                str(self.queue),
+                "complete",
+                "--task",
+                task["id"],
+                "--agent",
+                "git-worker",
+                "--token",
+                claim["lease_token"],
+                "--summary",
+                "done",
+                "--no-change",
+            ])
+
+        self.assertEqual(0, code, stderr.getvalue())
+        output = json.loads(stdout.getvalue())
+        self.assertEqual("git_completion_drift", output["warning"]["code"])
+        self.assertEqual("completed", output["task"]["status"])
+        self.assertEqual(
+            "completed",
+            aq.load_state(self.queue)["tasks"][task["id"]]["status"],
+        )
+        self.assertNotIn(claim["lease_token"], stdout.getvalue())
+        self.assertNotIn(str(root), stdout.getvalue())
 
     def test_generated_dash_token_round_trips_as_separate_cli_argument(self):
         self.init()
@@ -4704,7 +5900,7 @@ class QueueCliTests(unittest.TestCase):
         task = state["tasks"][created["id"]]
         task["created_at"] = task["updated_at"] = "2020-01-01T00:00:00Z"
         task["status"] = "completed"
-        task["result"] = {"summary": "done", "artifacts": []}
+        task["result"] = canonical_result()
         aq.write_json(self.queue, state)
         aq.atomic_write_text(
             self.queue.with_suffix(".tsv"), aq.render_tsv(state, state["updated_at"])

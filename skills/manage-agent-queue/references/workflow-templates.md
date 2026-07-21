@@ -1,6 +1,6 @@
 # Built-in Workflow Templates
 
-Use this reference before creating or interpreting the two version-1 templates. The CLI creates the graphs and queue metadata atomically; agents must still produce the acceptance and artifact content described here.
+Use this reference before creating or interpreting the two built-in templates. The CLI creates the graphs and queue metadata atomically; agents must still produce the acceptance and artifact content described here.
 
 ## Contents
 
@@ -31,6 +31,8 @@ python3 scripts/agent_queue.py --queue "$QUEUE" claim \
 
 Use the lease token only in that worker's later `heartbeat`, `complete`, `fail`, or `release` calls.
 
+Git validation is schema-v2 opt-in for writer roles only. Use canonical repository-relative `file:path` and trailing-slash `dir:path/` resources, then enable `--git-commit` for `adversarial-review` or `"git_commit": true` for `parallel-shards`. The queue does not create worktrees, commit, merge, reset, or push. Dispatch each Git writer into its prepared clean worktree and complete it with `--commit FULL_COMMIT_ID` or `--no-change`. Review and verify roles remain generic/read-only.
+
 ## Adversarial Review
 
 Use `adversarial-review` to create an implement–independent review–apply–verify graph:
@@ -41,10 +43,11 @@ python3 scripts/agent_queue.py --queue "$QUEUE" workflow add \
   --title "Port HTTP module" \
   --priority 50 \
   --resource file:src/http.py \
-  --reviewers 2
+  --reviewers 2 \
+  --git-commit
 ```
 
-Omit `--priority` for zero. Omit `--reviewers` for two. Supply a positive reviewer count and repeat `--resource` for each unique, nonblank exclusive writer key. This template does not accept `--from-json`.
+Omit `--priority` for zero. Omit `--reviewers` for two. Supply a positive reviewer count and repeat `--resource` for each unique, nonblank exclusive writer key. Omit `--git-commit` for the unchanged generic workflow. This template does not accept `--from-json`.
 
 For base priority `P` and `R` reviewers, create `R + 3` tasks:
 
@@ -65,6 +68,8 @@ The exact roles and dependencies are:
 | `verify` | 1 | apply task | none | `P - 30` |
 
 Review descriptions name target resources for inspection but do not reserve them. This permits independent read-only reviews to run concurrently after the implementer's lease is complete. Only implement and apply reserve the write scope.
+
+With `--git-commit`, only `implement` and `apply` become Git-aware because they are the writer roles. Each requires typed resources and Git completion evidence. `review` and `verify` do not claim Git ownership.
 
 ### Adversarial Review Context and Artifacts
 
@@ -90,12 +95,13 @@ Treat the workflow as successful only when `verify` is `completed`, every requir
 
 ## Parallel Shards
 
-Use `parallel-shards` with JSON containing exactly `title`, `shards`, and optional `priority`:
+Use `parallel-shards` with JSON containing exactly `title`, `shards`, and optional `priority` and `git_commit`:
 
 ```json
 {
   "title": "Port runtime modules",
   "priority": 40,
+  "git_commit": true,
   "shards": [
     ["file:src/http.py"],
     ["file:src/fs.py", "file:src/path.py"],
@@ -112,7 +118,7 @@ python3 scripts/agent_queue.py --queue "$QUEUE" workflow add \
   --from-json /absolute/path/parallel-shards.json
 ```
 
-Do not combine `--from-json` with title, priority, resource, or reviewers flags. Require a nonempty shard list and a nonempty resource list in each shard. The CLI deduplicates repeated keys within one shard but rejects any resource appearing in more than one shard.
+Do not combine `--from-json` with title, priority, resource, reviewers, or Git flags. Require a nonempty shard list and a nonempty resource list in each shard. The CLI deduplicates repeated keys within one shard. Generic workflows reject an exact resource repeated across shards; Git-enabled workflows also reject overlapping typed file/directory scopes.
 
 For `S` shards and base priority `P`, create `S + 2` tasks:
 
@@ -132,23 +138,31 @@ The exact roles and dependencies are:
 
 Distinct resource sets allow shards to be leased concurrently. Integration becomes dependency-ready only after every shard completes and then reserves the combined write scope. Verification is modeled as read-only.
 
+With `"git_commit": true`, only each `shard` and `integrate` task becomes Git-aware. `verify` remains generic. Prepare distinct worktrees and branches for concurrent shards; the queue validates them but never creates or merges them.
+
 ### Parallel Shards Context and Artifacts
 
 - Give each `shard` only its requirements, shared acceptance contract, and declared write resources. Require a shard diff/commit and any shard-specific test report paths.
 - Give `integrate` all shard artifacts, the combined acceptance contract, and the intended reconciliation scope. Require the integrated diff/commit and integration notes.
 - Give `verify` the final integrated diff, acceptance criteria, and exact verification commands. Require the final verification report.
 
-Do not use overlapping resource names to force parallelism. Redesign the shards or use explicit dependencies when the actual write scopes overlap. Resource keys protect only exact matches; coordinators must declare a common granularity.
+Do not use overlapping resource names to force parallelism. Redesign the shards or use explicit dependencies when actual write scopes overlap. Generic resource keys protect exact matches. Git-aware resources additionally enforce `file:`/`dir:` boundaries and containment.
 
-Example shard completion:
+Example Git-aware shard completion after capturing `TASK_ID` and `TOKEN` from
+the workflow and claim outputs, then committing within the declared scope:
 
 ```bash
+RESULT_HEAD="$(git rev-parse HEAD)"
 python3 scripts/agent_queue.py --queue "$QUEUE" complete \
-  --task T-000001 --agent shard-http --token "$TOKEN" \
+  --task "$TASK_ID" --agent shard-http --token "$TOKEN" \
+  --commit "$RESULT_HEAD" \
   --summary "HTTP shard complete" \
   --artifact artifacts/http.diff \
   --artifact artifacts/http-tests.txt
 ```
+
+If the Git-aware shard made no changes and `HEAD` remains at the claimed base,
+use `--no-change` instead of `--commit "$RESULT_HEAD"`.
 
 ## Completion Checks
 
@@ -159,3 +173,4 @@ Before declaring either workflow complete:
 3. Confirm no required row is `failed`, `dependency_failed`, `blocked`, or still leased/waiting.
 4. Confirm every role's promised artifact path exists and contains its independently required evidence.
 5. Inspect sanitized `events --task T-NNNNNN` when retry, lease expiry, or unexpected ownership affected trust in the result.
+6. For Git-aware writers, confirm compact base/head and commit/path counts; recompute detailed changed paths from Git when review needs them rather than storing a path list in queue state.
